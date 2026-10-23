@@ -19,8 +19,6 @@ class LogSource(Protocol):
 
     async def entries(self, start: int, end: int) -> list[tuple[int, bytes, bytes]]: ...
 
-    async def index_at(self, ts_ms: int) -> int: ...
-
 
 def make_source(info: LogInfo, client: httpx.AsyncClient) -> LogSource:
     # Imported here: both client modules import base_url from this module.

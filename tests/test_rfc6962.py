@@ -14,10 +14,6 @@ def b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def leaf(ts: int) -> bytes:
-    return b"\x00\x00" + ts.to_bytes(8, "big") + b"\x00\x00" + b"rest"
-
-
 TWO_ENTRIES = {
     "entries": [
         {"leaf_input": b64(b"leaf-a"), "extra_data": b64(b"extra-a")},
@@ -95,26 +91,3 @@ async def test_get_entries_retries_on_429(respx_mock, log, no_sleep):
     out = await log.entries(0, 1)
     assert len(out) == 2 and route.call_count == 2
     assert no_sleep == [1]
-
-
-async def test_index_at_bisects(respx_mock, log):
-    respx_mock.get(BASE + "ct/v1/get-sth").mock(
-        return_value=httpx.Response(200, json={"tree_size": 1000})
-    )
-    probes: list[int] = []
-
-    def entries_side_effect(request: httpx.Request) -> httpx.Response:
-        start = int(request.url.params["start"])
-        assert request.url.params["end"] == str(start)
-        probes.append(start)
-        return httpx.Response(
-            200,
-            json={"entries": [{"leaf_input": b64(leaf(1000 * start)), "extra_data": ""}]},
-        )
-
-    respx_mock.get(url__regex=r".*get-entries.*").mock(side_effect=entries_side_effect)
-    assert await log.index_at(500_000) == 500
-    assert len(probes) <= 11
-    assert await log.index_at(499_999) == 500
-    assert await log.index_at(0) == 0
-    assert await log.index_at(10**12) == 1000

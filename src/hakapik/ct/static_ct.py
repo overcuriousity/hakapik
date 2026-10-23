@@ -80,20 +80,3 @@ class StaticCtLog:
                 if start <= i <= end:
                     out.append((i, leaf, b""))
         return out
-
-    async def index_at(self, ts_ms: int) -> int:
-        """First index whose timestamp is >= ts_ms, or tree_size if none."""
-        size = await self.tree_size()
-        cached: tuple[int, list[bytes]] | None = None
-        lo, hi = 0, size
-        while lo < hi:
-            mid = (lo + hi) // 2
-            n = mid // TILE_WIDTH
-            if cached is None or cached[0] != n:
-                cached = (n, await self._tile(n, size))
-            leaf = cached[1][mid - TILE_WIDTH * n]
-            if int.from_bytes(leaf[:8], "big") >= ts_ms:
-                hi = mid
-            else:
-                lo = mid + 1
-        return lo

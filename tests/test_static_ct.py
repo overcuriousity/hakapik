@@ -108,17 +108,6 @@ async def test_truncated_tile_raises(respx_mock, tlog):
         await tlog.entries(0, 255)
 
 
-async def test_index_at_bisects(respx_mock, tlog):
-    t, leaves = make_tile(8)
-    stamps = [parse_tile_leaf(memoryview(b), 0)[0].timestamp_ms for b in leaves]
-    assert stamps == sorted(stamps)
-    respx_mock.get(MON + "checkpoint").respond(text=checkpoint(8))
-    respx_mock.get(MON + "tile/data/000.p/8").respond(content=t)
-    assert await tlog.index_at(stamps[3]) == stamps.index(stamps[3])
-    assert await tlog.index_at(stamps[-1] + 1) == 8
-    assert await tlog.index_at(0) == 0
-
-
 def test_make_source_dispatch():
     c = httpx.AsyncClient()
     assert isinstance(make_source(_info("tiled"), c), StaticCtLog)

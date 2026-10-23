@@ -9,11 +9,6 @@ from hakapik.ct.loglist import LogInfo
 from hakapik.ct.source import base_url
 
 
-def _leaf_timestamp_ms(leaf_input: bytes) -> int:
-    # version (1 byte), leaf_type (1 byte), then 8-byte big-endian timestamp
-    return int.from_bytes(leaf_input[2:10], "big")
-
-
 class Rfc6962Log:
     def __init__(self, info: LogInfo, client: httpx.AsyncClient):
         self.info = info
@@ -39,17 +34,3 @@ class Rfc6962Log:
             )
             for i, e in enumerate(resp.json()["entries"])
         ]
-
-    async def index_at(self, ts_ms: int) -> int:
-        """First index whose timestamp is >= ts_ms, or tree_size if none."""
-        lo, hi = 0, await self.tree_size()
-        while lo < hi:
-            mid = (lo + hi) // 2
-            got = await self.entries(mid, mid)
-            if not got:
-                raise RuntimeError(f"log returned no entry for index {mid}")
-            if _leaf_timestamp_ms(got[0][1]) >= ts_ms:
-                hi = mid
-            else:
-                lo = mid + 1
-        return lo
