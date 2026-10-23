@@ -39,6 +39,10 @@ class Suppressor:
         public = _private_suffixes() | {p.strip().lower() for p in public_apexes}
         return cls(frozenset(tranco), frozenset(public))
 
+    def top_listed(self, registrable: str) -> bool:
+        """True if the registrable domain is in the Tranco top set."""
+        return registrable in self._tranco
+
     def reason(self, rec: NameRecord) -> str | None:
         fqdn = rec.fqdn
         # normalize() marks a bare public suffix (e.g. pages.dev) invalid because

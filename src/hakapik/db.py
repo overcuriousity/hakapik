@@ -65,6 +65,7 @@ _SCHEMA = [
     "ALTER TABLE candidate ALTER COLUMN log_index DROP NOT NULL",
     "ALTER TABLE candidate ALTER COLUMN cert_key DROP NOT NULL",
     "ALTER TABLE candidate ALTER COLUMN first_seen_ms DROP NOT NULL",
+    "ALTER TABLE ingest_stat ADD COLUMN IF NOT EXISTS candidates_recheck bigint NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)",
     """CREATE TABLE IF NOT EXISTS fetch_job (
         id bigserial PRIMARY KEY,
@@ -151,6 +152,7 @@ STAT_COLUMNS = (
     "supp_public_apex",
     "supp_wildcard",
     "candidates",
+    "candidates_recheck",
 )
 
 
