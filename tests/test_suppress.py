@@ -49,3 +49,8 @@ def test_snapshot_private_suffixes_included_without_config():
 
 def test_ordinary_name_is_candidate(sup):
     assert sup.reason(normalize("new-site.example.net")) is None
+
+
+@pytest.mark.parametrize("name", ["*.pages.dev", "*.github.io"])
+def test_wildcard_over_public_apex_is_wildcard(sup, name):
+    assert sup.reason(normalize(name)) == "wildcard"

@@ -43,12 +43,12 @@ class Suppressor:
         fqdn = rec.fqdn
         # normalize() marks a bare public suffix (e.g. pages.dev) invalid because
         # it has no registrable part, so this check must precede the validity one.
-        if not rec.wildcard and fqdn in self._public:
+        if rec.wildcard:
+            return "wildcard"
+        if fqdn in self._public:
             return "public_apex"
         if not rec.valid:
             return "invalid"
-        if rec.wildcard:
-            return "wildcard"
         if fqdn in self._tranco or (
             fqdn.startswith("www.") and fqdn[4:] in self._tranco
         ):
