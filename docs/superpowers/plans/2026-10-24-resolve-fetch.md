@@ -554,8 +554,7 @@ async def test_ip_spacer_waits(): ...                         # interval 0.2: se
 async def register_node(conn, node_id: str, public_key: bytes) -> None   # insert; same key again is a no-op;
                                                                           # a different key for a known id raises ValueError
 class ResultRejected(Exception)
-async def store_result(conn, bs: BlobStore, envelope: bytes, ladder: tuple[int, ...],
-                       asn_db: AsnDb | None = None) -> int | None   # asn_db used from Task 10 on
+async def store_result(conn, bs: BlobStore, envelope: bytes, ladder: tuple[int, ...]) -> int | None
 async def write_manifest(conn, bs: BlobStore, candidate_id: int) -> str  # returns the new manifest's sha256
 ```
 
@@ -623,7 +622,7 @@ class AsnDb:
     build_epoch: int                         # from the file's metadata, logged at load
     def lookup(self, ip: str) -> AsnHit | None   # None for unknown, private or malformed addresses
 ```
-- `store_result(..., asn_db)`: the looked-up address is the mobile page's `server_ip`, or failing that the first address from `addresses(result.dns, fqdn)`. The attempt row gets `asn`, `asn_org`, and `asn_db_sha256` (`asn_db.sha256`; `blob` row inserted). With no `asn_db` or no address, the three columns are null.
+- `store_result` gains a keyword `asn_db: AsnDb | None = None`: the looked-up address is the mobile page's `server_ip`, or failing that the first address from `addresses(result.dns, fqdn)`. The attempt row gets `asn`, `asn_org`, and `asn_db_sha256` (`asn_db.sha256`; `blob` row inserted). With no `asn_db` or no address, the three columns are null.
 
 The ASN is head-side enrichment, not part of the signed worker result: it derives from the IP, not from the vantage, and keeping the database on the head means workers need no data file.
 
