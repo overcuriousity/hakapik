@@ -104,7 +104,7 @@ async def test_truncated_tile_raises(respx_mock, tlog):
     t, _ = make_tile(256)
     respx_mock.get(MON + "checkpoint").respond(text=checkpoint(256))
     respx_mock.get(MON + "tile/data/000").respond(content=t[:-5])
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="cannot delimit"):
         await tlog.entries(0, 255)
 
 
@@ -123,3 +123,15 @@ def test_make_source_dispatch():
     c = httpx.AsyncClient()
     assert isinstance(make_source(_info("tiled"), c), StaticCtLog)
     assert isinstance(make_source(_info("rfc6962", mon=None), c), Rfc6962Log)
+
+
+async def test_undecodable_last_leaf_does_not_block_tile(respx_mock, tlog):
+    t, leaves = make_tile(3)
+    bad = bytearray(leaves[2])
+    bad[40:56] = b"\xff" * 16
+    data = leaves[0] + leaves[1] + bytes(bad)
+    respx_mock.get(MON + "checkpoint").respond(text=checkpoint(3))
+    respx_mock.get(MON + "tile/data/000.p/3").respond(content=data)
+    out = await tlog.entries(0, 2)
+    assert [i for i, *_ in out] == [0, 1, 2]
+    assert out[2][1] == bytes(bad)

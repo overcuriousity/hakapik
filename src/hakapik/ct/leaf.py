@@ -117,7 +117,9 @@ def parse_tile_leaf(
 ) -> tuple[ParsedLeaf | LeafError, int]:
     """Parse one TileLeaf at offset; return it and the offset just past it.
 
-    If the structure cannot be delimited, the returned offset is len(buf).
+    If the structure cannot be delimited, the returned offset is -1. A
+    structurally valid leaf whose certificate fails to decode yields a
+    LeafError together with its true next offset.
     """
     r = _Reader(buf, offset)
     ts: int | None = None
@@ -128,7 +130,7 @@ def parse_tile_leaf(
             r.take(r.uint(3))  # pre_certificate
         r.take(r.uint(2))  # fingerprints
     except _Truncated as exc:
-        return LeafError(_ts_of(exc) or ts, str(exc.args[0])), len(buf)
+        return LeafError(_ts_of(exc) or ts, str(exc.args[0])), -1
     except ValueError as exc:
-        return LeafError(exc.args[0], exc.args[1]), len(buf)
+        return LeafError(exc.args[0], exc.args[1]), -1
     return _decode(ts, kind, der, r.pos - offset), r.pos

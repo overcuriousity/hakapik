@@ -128,8 +128,17 @@ def test_unknown_entry_type_is_error(leaf_x509):
 
 def test_tile_truncated_returns_error_not_raise():
     buf = load("tileleaf_x509.bin")[:200]
-    r, _ = parse_tile_leaf(memoryview(buf), 0)
+    r, off = parse_tile_leaf(memoryview(buf), 0)
     assert isinstance(r, LeafError)
+    assert off == -1
+
+
+def test_tile_corrupt_cert_keeps_true_offset():
+    buf = bytearray(load("tileleaf_x509.bin"))
+    buf[40:56] = b"\xff" * 16
+    r, off = parse_tile_leaf(memoryview(bytes(buf)), 0)
+    assert isinstance(r, LeafError)
+    assert off == len(buf)
 
 
 def test_ip_only_san_gives_empty_tuple():

@@ -37,8 +37,11 @@ def _split_tile(data: bytes) -> list[bytes]:
     leaves, off = [], 0
     while off < len(buf):
         rec, nxt = parse_tile_leaf(buf, off)
-        if isinstance(rec, LeafError) and nxt == len(buf):
-            raise RuntimeError(f"cannot delimit tile leaf at offset {off}: {rec.reason}")
+        if nxt < 0:
+            reason = rec.reason if isinstance(rec, LeafError) else "unknown"
+            raise RuntimeError(f"cannot delimit tile leaf at offset {off}: {reason}")
+        if nxt <= off:
+            raise RuntimeError(f"tile parser did not advance at offset {off}")
         leaves.append(data[off:nxt])
         off = nxt
     return leaves
