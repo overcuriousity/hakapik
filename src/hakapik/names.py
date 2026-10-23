@@ -21,6 +21,15 @@ class NameRecord:
     idn: bool
     valid: bool
 
+    @property
+    def key(self) -> str:
+        """First-seen index key: ``*.`` + fqdn for a wildcard, else the fqdn.
+
+        A wildcard and its apex share ``fqdn`` but are distinct sightings, so
+        ``*.x.com`` must not mark ``x.com`` as already seen.
+        """
+        return "*." + self.fqdn if self.wildcard else self.fqdn
+
 
 def _registrable(fqdn: str) -> str:
     ext = _EXTRACT(fqdn)

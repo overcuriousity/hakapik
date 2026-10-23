@@ -175,7 +175,7 @@ async def _process_batch(
         batch = StatCounter(entries=len(entries))
         rows: list[CandidateRow] = []
         new_certs: set[bytes] = set()
-        new_fqdns: dict[str, tuple[int, int]] = {}  # fqdn -> (ts_ms, index)
+        new_fqdns: dict[str, tuple[int, int]] = {}  # NameRecord.key -> (ts_ms, index)
         for index, leaf, extra in entries:
             batch.bytes += len(leaf) + len(extra)
             parsed = _parse(src.info.kind, leaf)
@@ -191,9 +191,9 @@ async def _process_batch(
                 rec = normalize(san)
                 if not rec.valid:
                     continue  # never indexed or emitted
-                if rec.fqdn in new_fqdns or ix.get(rec.fqdn) is not None:
+                if rec.key in new_fqdns or ix.get(rec.key) is not None:
                     continue
-                new_fqdns[rec.fqdn] = (parsed.timestamp_ms, index)
+                new_fqdns[rec.key] = (parsed.timestamp_ms, index)
                 batch.fqdns_new += 1
                 if sup.reason(rec) is not None:
                     batch.suppressed += 1

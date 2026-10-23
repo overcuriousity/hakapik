@@ -363,3 +363,51 @@ async def test_bootstrap_advances_by_last_returned_index(ix, sup, bs, conn, tmp_
     # 0..2 returns indices 0 and 2 -> next is 3 (not 0 + 2); 3..4 returns 3 only.
     assert src.calls == [(0, 2), (3, 4), (4, 4)]
     assert await get_cursor(conn, INFO.log_id) == (5, True)
+
+
+# --- wildcard vs apex (synthetic leaves) ------------------------------------
+
+from hakapik.ct.leaf import ParsedLeaf
+
+_DT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+def _synth(serial: str, *sans: str) -> bytes:
+    return f"{serial}|{','.join(sans)}".encode()
+
+
+@pytest.fixture
+def synth(monkeypatch):
+    """Make _parse decode b"serial|san1,san2" leaves into ParsedLeaf records."""
+
+    def parse(kind, leaf):
+        serial, sans = leaf.decode().split("|")
+        return ParsedLeaf(
+            1000, "x509", b"issuer", serial.encode(), tuple(sans.split(",")), _DT, _DT, len(leaf)
+        )
+
+    monkeypatch.setattr(ingest, "_parse", parse)
+
+
+async def _candidates(conn) -> set[str]:
+    cur = await conn.execute("SELECT fqdn FROM candidate")
+    return {r[0] for r in await cur.fetchall()}
+
+
+async def test_wildcard_first_does_not_hide_apex(synth, ix, sup, bs, conn):
+    await bootstrapped(conn)
+    src = FakeSource([_synth("1", "*.a.com", "a.com")])
+    stats = StatCounter()
+    await process_batch(src, 0, 0, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    assert await _candidates(conn) == {"a.com"}
+    assert (stats.fqdns_new, stats.suppressed, stats.candidates) == (2, 1, 1)
+    assert ix.get("*.a.com") is not None and ix.get("a.com") is not None
+
+
+async def test_wildcard_only_cert_then_apex_cert_emits_apex(synth, ix, sup, bs, conn):
+    await bootstrapped(conn)
+    src = FakeSource([_synth("1", "*.b.com"), _synth("2", "b.com")])
+    await process_batch(src, 0, 0, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    assert await _candidates(conn) == set()
+    await process_batch(src, 1, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    assert await _candidates(conn) == {"b.com"}

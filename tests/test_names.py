@@ -45,3 +45,9 @@ def test_empty_labels_invalid():
 def test_single_trailing_dot_stays_valid():
     r = normalize("example.com.")
     assert r.valid and r.fqdn == "example.com"
+
+
+def test_index_key_separates_wildcard_from_apex():
+    w, a = normalize("*.Example.com."), normalize("example.com")
+    assert w.fqdn == a.fqdn == "example.com"
+    assert w.key == "*.example.com" and a.key == "example.com"
