@@ -451,8 +451,8 @@ spike's code is not kept unless it comes back through review.
 
 ## 13. Literature, as read for this design
 
-Full-text extracts with page references are in the session scratchpad and
-will be moved into `docs/literature/` by the builder.
+Reading notes with the numbers used in this design are in
+`docs/literature/README.md`.
 
 Core:
 
