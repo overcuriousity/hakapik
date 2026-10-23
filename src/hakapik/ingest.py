@@ -2,18 +2,27 @@
 
 Transaction boundary: one Postgres transaction per batch. Candidates, the
 raw_batch row, the stats increments and the cursor advance commit together,
-or not at all. The first-seen index (RocksDB) and the blob store are written
-*before* that commit and are not transactional. If the process dies between
-those writes and the commit, the cursor did not move and the batch is
-re-processed on restart; the certs and FQDNs are then already in the index,
-so no duplicate candidates are emitted. The price is that the candidates of
-an interrupted live batch are lost (accepted for the PoC), and the blob may be
-an orphan (harmless: content-addressed, reclaimed by pruning).
+or not at all. The batch decides novelty by *reading* the first-seen index
+(RocksDB) plus per-batch sets; the index writes are collected in memory and
+applied only after the commit succeeds. Consequences:
+
+- A failure before or during the commit rolls back the DB and leaves the
+  index untouched, so the retry re-emits the same candidates (none lost).
+- A crash between the commit and the index writes leaves those FQDNs absent
+  from the index although their candidates are committed. The next
+  certificate naming such an FQDN can then emit a duplicate candidate; a
+  candidate is never lost. Later stages dedup candidates by fqdn.
+- Re-running an already committed and indexed batch emits nothing new.
+
+The raw blob is written before the commit; after a failure it may be an
+orphan (harmless: content-addressed, reclaimed by pruning).
 
 Concurrency: one in-flight batch per log. ``Config.per_log_concurrency`` is
-accepted but not yet used. All index work in ``process_batch`` runs without
-an ``await`` between ``seen_cert``/``first_seen`` calls, so log tasks sharing
-one ``FirstSeenIndex`` on one event loop do not interleave inside a check.
+accepted but not yet used. Log tasks share one ``FirstSeenIndex`` on one
+event loop. Two logs can both read an FQDN as new before either applies its
+post-commit writes (a batch awaits the DB in between); that too yields at
+most a duplicate candidate, and ``first_seen`` keeps the first writer's
+sighting.
 """
 
 from __future__ import annotations
@@ -143,6 +152,8 @@ async def process_batch(
         emit = mode == "live" and bootstrap_done
         batch = StatCounter(entries=len(entries))
         rows: list[CandidateRow] = []
+        new_certs: set[bytes] = set()
+        new_fqdns: dict[str, tuple[int, int]] = {}  # fqdn -> (ts_ms, index)
         for index, leaf, extra in entries:
             batch.bytes += len(leaf) + len(extra)
             parsed = _parse(src.info.kind, leaf)
@@ -150,15 +161,17 @@ async def process_batch(
                 batch.parse_failed += 1
                 continue
             key = cert_key(parsed.issuer_dn_der, parsed.serial)
-            if ix.seen_cert(key):
+            if key in new_certs or ix.has_cert(key):
                 continue
+            new_certs.add(key)
             batch.certs_unique += 1
             for san in parsed.san_dns:
                 rec = normalize(san)
                 if not rec.valid:
                     continue  # never indexed or emitted
-                if not ix.first_seen(rec.fqdn, parsed.timestamp_ms, log_id, index):
+                if rec.fqdn in new_fqdns or ix.get(rec.fqdn) is not None:
                     continue
+                new_fqdns[rec.fqdn] = (parsed.timestamp_ms, index)
                 batch.fqdns_new += 1
                 if sup.reason(rec) is not None:
                     batch.suppressed += 1
@@ -182,6 +195,11 @@ async def process_batch(
     except BaseException:
         await conn.rollback()
         raise
+    # Committed: now record what this batch saw (see the module docstring).
+    for key in new_certs:
+        ix.seen_cert(key)
+    for fqdn, (ts_ms, index) in new_fqdns.items():
+        ix.first_seen(fqdn, ts_ms, log_id, index)
     stats.add(batch)
     return len(entries)
 

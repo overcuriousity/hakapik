@@ -170,6 +170,34 @@ async def test_cursor_advances_only_after_batch_commit(fake, ix, sup, tmp_path, 
     assert await count(conn, "candidate") == 0
     assert await count(conn, "raw_batch") == 0
     assert (await read_stat(conn, INFO.log_id, today()))["entries"] == 0
+    # The index is only written after the commit, so a retry re-emits them.
+    for fqdn in EXPECTED_NEW_FQDNS:
+        assert ix.get(fqdn) is None
+    assert await tail_log_once(fake, cfg, ix, sup, BlobStore(tmp_path / "blobs"), conn) == 2
+    cur = await conn.execute("SELECT fqdn FROM candidate")
+    assert {r[0] for r in await cur.fetchall()} == EXPECTED_NEW_FQDNS
+
+
+async def test_rerun_of_committed_batch_emits_no_new_candidates(fake, ix, sup, bs, conn):
+    await bootstrapped(conn)
+    await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    # Simulate a restart that re-processes the same range (e.g. cursor rewound).
+    await set_cursor(conn, INFO.log_id, 0, True)
+    await conn.commit()
+    await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
+    assert await get_cursor(conn, INFO.log_id) == (2, True)
+
+
+async def test_duplicates_within_one_batch_count_once(fake, ix, sup, bs, conn):
+    await bootstrapped(conn)
+    stats = StatCounter()
+    await process_batch(fake, 0, 3, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
+    assert (stats.certs_unique, stats.fqdns_new) == (2, 3)
+    cur = await conn.execute("SELECT DISTINCT log_index FROM candidate")
+    assert {r[0] for r in await cur.fetchall()} == {0, 1}
+    assert ix.get(EXPECTED_FQDN)[2] == 0
 
 
 async def test_live_skips_candidates_until_bootstrap_done(ix, sup, bs, conn):

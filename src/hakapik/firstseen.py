@@ -52,6 +52,10 @@ class FirstSeenIndex:
         self._fqdn: ColumnFamily = self._db.get_column_family(_FQDN)
         self._cert: ColumnFamily = self._db.get_column_family(_CERT)
 
+    def has_cert(self, key: bytes) -> bool:
+        """Return whether ``key`` was marked seen, without marking it."""
+        return key in self._cert
+
     def seen_cert(self, key: bytes) -> bool:
         """Return whether ``key`` was seen before, and mark it seen."""
         if key in self._cert:

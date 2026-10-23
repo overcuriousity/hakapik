@@ -17,6 +17,14 @@ def test_seen_cert_marks(tmp_path):
         assert ix.seen_cert(k) is False and ix.seen_cert(k) is True
 
 
+def test_has_cert_reads_without_marking(tmp_path):
+    with FirstSeenIndex(tmp_path / "idx") as ix:
+        k = b"\x03" * 32
+        assert ix.has_cert(k) is False and ix.has_cert(k) is False
+        ix.seen_cert(k)
+        assert ix.has_cert(k) is True
+
+
 def test_persists_across_reopen(tmp_path):
     path = tmp_path / "idx"
     ix = FirstSeenIndex(path)
