@@ -46,6 +46,7 @@ from hakapik.config import Config
 from hakapik.ct.leaf import LeafError, parse_rfc6962_leaf, parse_tile_leaf
 from hakapik.ct.loglist import fetch_log_lists
 from hakapik.ct.source import LogSource, make_source
+from hakapik.ct.static_ct import TILE_WIDTH
 from hakapik.db import (
     CandidateRow,
     add_candidates,
@@ -117,6 +118,17 @@ def unpack_entries(data: bytes) -> list[tuple[int, bytes, bytes]]:
         pos += extra_len
         out.append((index, leaf, extra))
     return out
+
+
+def _batch_end(src: LogSource, pos: int, size: int, batch_size: int) -> int:
+    """Inclusive end index of the batch starting at ``pos``.
+
+    Tiled logs serve whole 256-entry tiles, so their batches end at the next
+    tile boundary (each tile is fetched once); other logs use ``batch_size``.
+    """
+    if src.info.kind == "tiled":
+        return min((pos // TILE_WIDTH + 1) * TILE_WIDTH, size) - 1
+    return min(pos + batch_size, size) - 1
 
 
 def _parse(kind: str, leaf: bytes):
@@ -242,7 +254,7 @@ async def bootstrap_log(
     log.info("bootstrap from %d to %d", pos, size)
     stats = StatCounter()
     while pos < size:
-        end = min(pos + cfg.batch_size, size) - 1
+        end = _batch_end(src, pos, size, cfg.batch_size)
         n, pos_next = await _process_batch(
             src, pos, end, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
         )
@@ -267,7 +279,7 @@ async def tail_log_once(
     size = await src.tree_size()
     if next_index >= size:
         return 0
-    end = min(next_index + cfg.batch_size, size) - 1
+    end = _batch_end(src, next_index, size, cfg.batch_size)
     return await process_batch(
         src, next_index, end, mode="live", ix=ix, sup=sup, bs=bs, conn=conn,
         stats=StatCounter(),

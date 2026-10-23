@@ -411,3 +411,51 @@ async def test_wildcard_only_cert_then_apex_cert_emits_apex(synth, ix, sup, bs, 
     assert await _candidates(conn) == set()
     await process_batch(src, 1, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     assert await _candidates(conn) == {"b.com"}
+
+
+# --- tiled logs: batches end on tile boundaries -----------------------------
+
+from hakapik.ct.leaf import parse_tile_leaf
+
+TILE_FIX = FIX / "tile_data_small.bin"
+TILED_INFO = dataclasses.replace(INFO, log_id="tiledlog", kind="tiled", monitoring_url="https://t.invalid/")
+
+
+def _tile_leaves(n: int) -> list[bytes]:
+    buf = memoryview(TILE_FIX.read_bytes())
+    pool, off = [], 0
+    while off < len(buf):
+        _, nxt = parse_tile_leaf(buf, off)
+        pool.append(bytes(buf[off:nxt]))
+        off = nxt
+    return [pool[i % len(pool)] for i in range(n)]
+
+
+class TiledFakeSource(FakeSource):
+    def __init__(self, n: int):
+        super().__init__(_tile_leaves(n), TILED_INFO)
+        self._entries = [(i, leaf, b"") for i, leaf, _ in self._entries]
+
+    async def index_at(self, ts_ms: int) -> int:
+        return 0
+
+
+async def test_bootstrap_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
+    src = TiledFakeSource(600)
+    await set_cursor(conn, TILED_INFO.log_id, 100, False)
+    await conn.commit()
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=256)
+    await bootstrap_log(src, cfg, ix, sup, bs, conn)
+    assert src.calls == [(100, 255), (256, 511), (512, 599)]
+    assert await get_cursor(conn, TILED_INFO.log_id) == (600, True)
+
+
+async def test_tail_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
+    src = TiledFakeSource(600)
+    await bootstrapped(conn, TILED_INFO.log_id, 100)
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=256)
+    while await tail_log_once(src, cfg, ix, sup, bs, conn):
+        pass
+    assert src.calls == [(100, 255), (256, 511), (512, 599)]
+    assert await get_cursor(conn, TILED_INFO.log_id) == (600, True)
+    assert await count(conn, "raw_batch") == 3
