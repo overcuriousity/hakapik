@@ -195,7 +195,10 @@ async def prune_raw(
     A batch is kept if any candidate on the same log has a log_index inside
     its [start_index, end_index]. Blob files are unlinked unless another
     remaining batch still references the same (content-addressed) blob.
-    The caller commits.
+
+    This is the one db function that commits: file deletion must follow a
+    durable delete, so the DELETE is committed before any blob is unlinked.
+    If the commit fails, the exception propagates and no file is touched.
     """
     cur = await conn.execute(
         """DELETE FROM raw_batch rb
@@ -209,6 +212,7 @@ async def prune_raw(
     )
     shas = {r[0] for r in await cur.fetchall()}
     count = cur.rowcount
+    await conn.commit()
     for sha in shas:
         cur = await conn.execute(
             "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)

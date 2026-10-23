@@ -60,12 +60,13 @@ async def _run_ingest(cfg: Config, mode: str) -> None:
             await asyncio.gather(lag, return_exceptions=True)
 
 
-async def _with_conn(cfg: Config, fn):
+async def _with_conn(cfg: Config, fn, commit: bool = True):
     conn = await connect(cfg.database_url)
     try:
         await migrate(conn)
         result = await fn(conn)
-        await conn.commit()
+        if commit:
+            await conn.commit()
         return result
     finally:
         await conn.close()
@@ -105,7 +106,7 @@ def _cmd_prune(cfg: Config, args) -> int:
         datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
     ).date()
     bs = BlobStore(cfg.data_dir / "blobs")
-    n = asyncio.run(_with_conn(cfg, lambda c: prune_raw(c, bs, cutoff)))
+    n = asyncio.run(_with_conn(cfg, lambda c: prune_raw(c, bs, cutoff), commit=False))
     print(n)
     return 0
 

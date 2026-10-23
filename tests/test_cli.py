@@ -8,7 +8,7 @@ import pytest
 from hakapik import cli
 from hakapik.blobstore import BlobStore
 from hakapik.cli import main
-from hakapik.db import CandidateRow, add_candidates, add_raw_batch, bump_stat
+from hakapik.db import CandidateRow, add_candidates, add_raw_batch, bump_stat, prune_raw
 
 needs_db = pytest.mark.skipif(
     not os.getenv("HAKAPIK_TEST_DB"), reason="needs postgres"
@@ -120,3 +120,23 @@ def test_bootstrap_tail_dispatch(mode, cfg_path, monkeypatch):
     monkeypatch.setattr(cli, "_lag_loop", fake_lag)
     assert main(["--config", cfg_path, mode]) == 0
     assert calls == [mode]
+
+
+@needs_db
+async def test_prune_commit_failure_keeps_blob_and_row(tmp_path, conn, monkeypatch):
+    bs = BlobStore(tmp_path / "blobs")
+    sha = await _batch(conn, bs, "L", 0, 9, b"old", 30)
+    await conn.commit()
+
+    async def boom():
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(conn, "commit", boom)
+    cutoff = date.today() - timedelta(days=7)
+    with pytest.raises(RuntimeError, match="commit failed"):
+        await prune_raw(conn, bs, cutoff)
+    monkeypatch.undo()
+    await conn.rollback()
+    assert bs.path(sha).exists()
+    cur = await conn.execute("SELECT count(*) FROM raw_batch")
+    assert (await cur.fetchone())[0] == 1
