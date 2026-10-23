@@ -203,7 +203,7 @@ requires-dist = [
     { name = "idna", specifier = ">=3.20" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6" },
     { name = "rocksdict", specifier = ">=0.3.29" },
-    { name = "tldextract", specifier = ">=5.4.0" },
+    { name = "tldextract", specifier = ">=5.4,<6" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 

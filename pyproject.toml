@@ -10,7 +10,7 @@ dependencies = [
     "idna>=3.20",
     "psycopg[binary]>=3.3.6",
     "rocksdict>=0.3.29",
-    "tldextract>=5.4.0",
+    "tldextract>=5.4,<6",
     "zstandard>=0.25.0",
 ]
 
