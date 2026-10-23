@@ -124,3 +124,43 @@ async def test_last_fetched_and_attempts_today(conn):
     assert isinstance(got["a.example.com"], datetime)
     assert abs(datetime.now(timezone.utc) - got["a.example.com"]) < timedelta(minutes=1)
     assert await attempts_today(conn) == 1
+
+
+async def test_sweep_spares_leased_jobs(conn):
+    leased = await _add(conn, "leased.example.com", 7200)
+    await claim_jobs(conn, 1, 600)
+    assert await sweep(conn, 1, None) == 0
+    assert (await _job(conn, leased))[1] == "open"
+    # leased jobs do not count toward the cap either
+    await _add(conn, "a.example.com", 20)
+    await _add(conn, "b.example.com", 10)
+    assert await sweep(conn, 1, 2) == 0
+    assert await sweep(conn, 1, 1) == 1
+
+
+async def test_advance_is_noop_on_closed_jobs(conn):
+    aged = await _add(conn, "a.example.com", 7200)
+    await sweep(conn, 1, None)
+    await advance_job(conn, aged, 0, (0, 120))
+    assert (await _job(conn, aged))[:2] == (0, "aged_out")
+    done = await _add(conn, "b.example.com")
+    await advance_job(conn, done, 0, (0,))
+    await advance_job(conn, done, 0, (0, 120))
+    assert (await _job(conn, done))[:2] == (0, "done")
+
+
+async def test_manual_lost_race_leaves_no_orphan(conn, monkeypatch):
+    # Simulate by making the pre-check blind: open job exists but SELECT says no.
+    await _add(conn, "race.example.com")
+    orig = conn.execute
+
+    async def blind(sql, *a, **k):
+        if sql.startswith("SELECT 1 FROM fetch_job"):
+            return await orig("SELECT 1 WHERE false")
+        return await orig(sql, *a, **k)
+
+    monkeypatch.setattr(conn, "execute", blind, raising=False)
+    assert await enqueue_manual(conn, ["race.example.com"]) == [("race.example.com", "already_open")]
+    monkeypatch.undo()
+    assert await _count(conn, "candidate") == 1
+    assert await _count(conn, "fetch_job") == 1

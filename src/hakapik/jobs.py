@@ -1,16 +1,21 @@
 """The fetch queue: claim, advance, age out and enqueue fetch jobs.
 
 All time comparisons use the database clock (now()). No function here
-commits; the caller owns the transaction.
+commits; the caller owns the transaction. Time comparisons use Postgres
+now(), which is fixed per transaction, so callers keep claim/sweep
+transactions short.
 """
 
 from datetime import datetime
 
 import psycopg
 
-from hakapik.db import CandidateRow, add_candidates
 from hakapik.names import normalize
 from hakapik.protocol import Job
+
+
+class _LostRace(Exception):
+    pass
 
 
 async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> list[Job]:
@@ -57,6 +62,7 @@ async def sweep(
     cur = await conn.execute(
         """UPDATE fetch_job SET state = 'aged_out'
            WHERE state = 'open' AND step = 0
+             AND (claimed_until IS NULL OR claimed_until <= now())
              AND created_at < now() - make_interval(hours => %s)""",
         (ageout_hours,),
     )
@@ -67,10 +73,12 @@ async def sweep(
                WHERE id IN (
                  SELECT id FROM fetch_job
                  WHERE state = 'open' AND step = 0
-                 ORDER BY priority ASC, created_at ASC
+                   AND (claimed_until IS NULL OR claimed_until <= now())
+                 ORDER BY priority ASC, created_at ASC, id ASC
                  LIMIT (
                    SELECT greatest(count(*) - %s, 0) FROM fetch_job
-                   WHERE state = 'open' AND step = 0)
+                   WHERE state = 'open' AND step = 0
+                     AND (claimed_until IS NULL OR claimed_until <= now()))
                  )""",
             (queue_cap,),
         )
@@ -120,9 +128,28 @@ async def enqueue_manual(
         if await cur.fetchone():
             out.append((name, "already_open"))
             continue
-        await add_candidates(
-            conn,
-            [CandidateRow(rec.fqdn, rec.registrable, None, None, None, None, "manual")],
-        )
+        # The SELECT above is only a fast path. A concurrent enqueue can still win
+        # the unique open-job index, so the job insert reports whether it created a
+        # row; if not, the savepoint rolls the candidate back (no orphan).
+        try:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    """INSERT INTO candidate (fqdn, registrable, reason)
+                       VALUES (%s, %s, 'manual') RETURNING id""",
+                    (rec.fqdn, rec.registrable),
+                )
+                cid = (await cur.fetchone())[0]
+                cur = await conn.execute(
+                    """INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
+                       VALUES (%s, %s, %s, now())
+                       ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING
+                       RETURNING id""",
+                    (cid, rec.fqdn, rec.registrable),
+                )
+                if await cur.fetchone() is None:
+                    raise _LostRace
+        except _LostRace:
+            out.append((name, "already_open"))
+            continue
         out.append((name, "queued"))
     return out
