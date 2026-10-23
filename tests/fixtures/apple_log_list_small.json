@@ -1,0 +1,96 @@
+{
+  "$schema": "https://valid.apple.com/ct/log_list/schema_versions/log_list_schema_v5.json",
+  "assetVersion": 33,
+  "assetVersionV2": 1014,
+  "version": "525",
+  "operators": [
+    {
+      "email": [
+        "google-ct-logs@googlegroups.com"
+      ],
+      "name": "Google",
+      "logs": [
+        {
+          "description": "Google 'Argon 2026H2' log",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEKjpni/66DIYrSlGK6Rf+e6F2c/28ZUvDJ79N81+gyimAESAyeNZ++TRgjHWg9TVQnKHTSU0T1TtqDupFnSQTIg==",
+          "log_id": "1219ENGn9XfCx+lf1wC/+YLJM1pl4dCzAXMXwMjFaXc=",
+          "mmd": 86400,
+          "state": {
+            "usable": {
+              "timestamp": "2024-11-26T18:08:20Z",
+              "version": "310"
+            }
+          },
+          "temporal_interval": {
+            "end_exclusive": "2027-01-01T00:00:00Z",
+            "start_inclusive": "2026-07-01T00:00:00Z"
+          },
+          "url": "https://ct.googleapis.com/logs/us1/argon2026h2/"
+        },
+        {
+          "description": "Google 'Argon 2017' log",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEVG18id3qnfC6X/RtYHo3TwIlvxz2b4WurxXfaW7t26maKZfymXYe5jNGHif0vnDdWde6z/7Qco6wVw+dN4liow==",
+          "log_id": "+tTJfMSe4vishcXqXOoJ0CINu/TknGtQZi/4aPhrjCg=",
+          "mmd": 86400,
+          "state": {
+            "rejected": {
+              "timestamp": "2022-04-29T19:11:36Z",
+              "version": "127"
+            }
+          },
+          "temporal_interval": {
+            "end_exclusive": "2018-01-01T00:00:00Z",
+            "start_inclusive": "2017-01-01T00:00:00Z"
+          },
+          "url": "https://ct.googleapis.com/logs/argon2017/"
+        }
+      ]
+    },
+    {
+      "email": [
+        "sre@letsencrypt.org"
+      ],
+      "name": "Let's Encrypt",
+      "logs": [
+        {
+          "description": "Let's Encrypt 'Oak2026H2' log",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEanCds5bj7IU2lcNPnIvZfMnVkSmu69aH3AS8O/Y0D/bbCPdSqYjvuz9Z1tT29PxcqYxf+w1g5CwPFuwqsm3rFQ==",
+          "log_id": "rKswcGzr7IQx9BPS9JFfER5CJEOx8qaMTzwrO6ceAsM=",
+          "mmd": 86400,
+          "state": {
+            "readonly": {
+              "final_tree_head": {
+                "sha256_root_hash": "uTgg1k3DUbSFFdXewyyxbsQuCc9RupplMphTwtXqvf4=",
+                "tree_size": 130815692
+              },
+              "timestamp": "2025-12-11T16:28:41Z",
+              "version": "497"
+            }
+          },
+          "temporal_interval": {
+            "end_exclusive": "2027-01-20T00:00:00Z",
+            "start_inclusive": "2026-06-20T00:00:00Z"
+          },
+          "url": "https://oak.ct.letsencrypt.org/2026h2/"
+        },
+        {
+          "description": "Let's Encrypt 'Oak2019' log",
+          "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEFkqNKRuZ+Z8IOsnNJrUZ8gwp+KKGOdQrJ/HKhSadK/SJuoCc9+dxQ7awpmWIMr9SKcQeG5uRzG1kVSyFN4Wfcw==",
+          "log_id": "ZZszUPQ7EsxepatOx2XT/ebIgkN3d3jnIAP56yuMMSk=",
+          "mmd": 86400,
+          "state": {
+            "rejected": {
+              "timestamp": "2022-04-29T19:08:30Z",
+              "version": "110"
+            }
+          },
+          "temporal_interval": {
+            "end_exclusive": "2020-01-07T00:00:00Z",
+            "start_inclusive": "2019-01-01T00:00:00Z"
+          },
+          "url": "https://oak.ct.letsencrypt.org/2019/"
+        }
+      ]
+    }
+  ]
+}
