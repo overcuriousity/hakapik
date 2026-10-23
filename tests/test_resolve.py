@@ -64,3 +64,41 @@ async def test_empty_type_is_noerror(dns_server):
     ans = await r.resolve(NAME, "example.com")
     aaaa = next(x for x in ans if x.rrtype == "AAAA")
     assert aaaa.rcode == "NOERROR" and aaaa.answers == () and aaaa.ttl is None
+
+
+async def _start(data):
+    loop = asyncio.get_running_loop()
+    return await loop.create_datagram_endpoint(
+        lambda: DnsServer(data), local_addr=("127.0.0.1", 0))
+
+
+async def test_resolver_is_the_server_that_answered(dns_server):
+    # Nothing listens on 127.0.0.2 at this port, so the second server answers.
+    r = Resolver(("127.0.0.2", "127.0.0.1"), port=dns_server.port, timeout_s=0.5)
+    ans = await r.resolve("nope.example.org", "example.org")
+    assert all(a.rcode == "NXDOMAIN" and a.resolver == "127.0.0.1" for a in ans)
+
+
+async def test_servfail_recorded_with_answering_server():
+    t, srv = await _start({(NAME, "A"): ("SERVFAIL", [], 0)})
+    try:
+        r = Resolver(("127.0.0.1",), port=srv.port)
+        ans = await r.resolve(NAME, NAME)
+        a = next(x for x in ans if x.rrtype == "A")
+        assert a.rcode == "SERVFAIL" and a.resolver == "127.0.0.1" and a.answers == ()
+    finally:
+        t.close()
+
+
+async def test_unexpected_error_is_logged_and_recorded(dns_server, monkeypatch, caplog):
+    import dns.asyncresolver
+
+    async def boom(self, *a, **k):
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(dns.asyncresolver.Resolver, "resolve", boom)
+    r = Resolver(("127.0.0.1",), port=dns_server.port)
+    with caplog.at_level("WARNING", logger="hakapik.resolve"):
+        ans = await r.resolve(NAME, NAME)
+    assert ans and all(a.rcode == "ERROR" for a in ans)
+    assert any(NAME in rec.getMessage() and rec.exc_info for rec in caplog.records)

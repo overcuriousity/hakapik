@@ -5,6 +5,7 @@ recorded as an rcode, never raised.
 """
 
 import asyncio
+import logging
 from datetime import UTC, datetime
 
 import dns.asyncresolver
@@ -15,6 +16,8 @@ import dns.reversename
 
 from hakapik.protocol import DnsAnswer
 
+log = logging.getLogger(__name__)
+
 _TYPES = ("A", "AAAA", "CNAME", "NS", "MX", "TXT")
 
 
@@ -23,41 +26,65 @@ def _now() -> str:
 
 
 class Resolver:
+    """One dnspython resolver per nameserver, tried in order.
+
+    dnspython does not say which server produced an NXDOMAIN, so each server
+    gets its own resolver: the recorded ``resolver`` is then the one that
+    actually answered.
+    """
+
     def __init__(self, nameservers: tuple[str, ...] = (), *, port: int = 53,
                  timeout_s: float = 5.0):
-        self._res = dns.asyncresolver.Resolver(configure=not nameservers)
-        if nameservers:
-            self._res.nameservers = list(nameservers)
-            self._res.port = port
-        self._res.lifetime = timeout_s
-        self._res.timeout = timeout_s
+        if not nameservers:
+            nameservers = tuple(
+                str(ns) for ns in dns.resolver.Resolver(configure=True).nameservers)
+        self._servers = nameservers
+        self._resolvers = []
+        for ns in nameservers:
+            res = dns.asyncresolver.Resolver(configure=False)
+            res.nameservers = [ns]
+            res.port = port
+            res.lifetime = timeout_s
+            res.timeout = timeout_s
+            self._resolvers.append(res)
 
-    def _first_server(self) -> str:
-        return str(self._res.nameservers[0]) if self._res.nameservers else ""
-
-    async def _query(self, qname: str, rrtype: str) -> DnsAnswer:
-        queried_at = _now()
-        rcode, ttl, answers, server = "NOERROR", None, (), self._first_server()
+    async def _ask(self, res, server, qname, rrtype, queried_at) -> DnsAnswer:
+        """Ask one server. rcode TIMEOUT/SERVFAIL/ERROR... mean 'try the next'."""
+        rcode, ttl, answers = "NOERROR", None, ()
         try:
-            ans = await self._res.resolve(qname, rrtype, raise_on_no_answer=False)
-            server = str(ans.nameserver)
+            ans = await res.resolve(qname, rrtype, raise_on_no_answer=False)
             if ans.rrset is not None:
                 ttl = ans.rrset.ttl
                 answers = tuple(sorted(r.to_text() for r in ans.rrset))
         except dns.resolver.NXDOMAIN:
             rcode = "NXDOMAIN"
+        except dns.resolver.YXDOMAIN:
+            rcode = "YXDOMAIN"
         except dns.resolver.NoNameservers as e:
-            rcode = "SERVFAIL"
-            for ns, _tcp, _port, _exc, response in e.errors():
-                server = str(ns)
+            # SERVFAIL/REFUSED carry a response; I/O or parse failures do not.
+            rcode = "ERROR"
+            for _ns, _tcp, _port, _exc, response in e.kwargs.get("errors", ()):
                 if response is not None:
                     rcode = dns.rcode.to_text(response.rcode())
-                break
+                    break
         except dns.resolver.LifetimeTimeout:
             rcode = "TIMEOUT"
         except Exception:
+            log.warning("unexpected error resolving %s %s", qname, rrtype, exc_info=True)
             rcode = "ERROR"
         return DnsAnswer(qname, rrtype, rcode, ttl, answers, server, queried_at)
+
+    async def _query(self, qname: str, rrtype: str) -> DnsAnswer:
+        queried_at = _now()
+        failures = []
+        for res, server in zip(self._resolvers, self._servers):
+            a = await self._ask(res, server, qname, rrtype, queried_at)
+            if a.rcode in ("NOERROR", "NXDOMAIN", "YXDOMAIN"):
+                return a
+            failures.append(a)
+        # Every server failed: prefer one that actually answered (SERVFAIL...).
+        return next((a for a in failures if a.rcode not in ("TIMEOUT", "ERROR")),
+                    failures[0])
 
     async def resolve(self, fqdn: str, registrable: str) -> tuple[DnsAnswer, ...]:
         fqdn, registrable = fqdn.rstrip("."), registrable.rstrip(".")
