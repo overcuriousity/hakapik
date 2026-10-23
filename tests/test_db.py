@@ -9,6 +9,7 @@ from hakapik.db import (
     add_raw_batch,
     bump_stat,
     get_cursor,
+    migrate,
     read_stat,
     read_stats,
     set_cursor,
@@ -91,3 +92,37 @@ async def test_migrate_creates_indexes(conn):
     assert {
         "candidate_log_index", "raw_batch_created_at", "raw_batch_blob_sha256"
     } <= names
+
+
+STAGE_ONE_CANDIDATE_DDL = """CREATE TABLE candidate (
+    id bigserial PRIMARY KEY,
+    fqdn text NOT NULL,
+    registrable text NOT NULL,
+    log_id text NOT NULL,
+    log_index bigint NOT NULL,
+    cert_key bytea NOT NULL,
+    first_seen_ms bigint NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+)"""
+
+
+async def test_new_tables_exist(conn):
+    for t in ("fetch_job", "attempt", "dns_answer", "artifact", "blob", "manifest", "node"):
+        cur = await conn.execute("SELECT to_regclass(%s)", (t,))
+        assert (await cur.fetchone())[0] is not None
+
+
+async def test_migrate_upgrades_old_candidate_table(conn):
+    # a stage-one candidate table (NOT NULL log columns, no reason) is upgraded in place
+    await conn.execute("DROP TABLE candidate CASCADE")
+    await conn.execute(STAGE_ONE_CANDIDATE_DDL)
+    await migrate(conn)
+    await conn.execute(
+        "INSERT INTO candidate (fqdn, registrable, reason) "
+        "VALUES ('a.example.com','example.com','manual')"
+    )
+
+
+async def test_migrate_is_idempotent(conn):
+    await migrate(conn)
+    await migrate(conn)

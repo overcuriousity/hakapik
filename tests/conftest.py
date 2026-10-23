@@ -34,7 +34,10 @@ async def conn():
     try:
         # Dropped, not truncated: every test gets the current schema, even on
         # a test database created by an older version of hakapik.
-        await c.execute("DROP TABLE IF EXISTS log_cursor, raw_batch, candidate, ingest_stat")
+        await c.execute(
+            "DROP TABLE IF EXISTS log_cursor, raw_batch, candidate, ingest_stat, "
+            "fetch_job, node, blob, attempt, dns_answer, artifact, manifest CASCADE"
+        )
         await migrate(c)
         yield c
     finally:

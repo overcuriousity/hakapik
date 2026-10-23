@@ -59,6 +59,85 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
     "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
     "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)",
+    # Stage two. The ALTERs are idempotent: migrate() runs on every command start.
+    "ALTER TABLE candidate ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT 'first_seen'",
+    "ALTER TABLE candidate ALTER COLUMN log_id DROP NOT NULL",
+    "ALTER TABLE candidate ALTER COLUMN log_index DROP NOT NULL",
+    "ALTER TABLE candidate ALTER COLUMN cert_key DROP NOT NULL",
+    "ALTER TABLE candidate ALTER COLUMN first_seen_ms DROP NOT NULL",
+    "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)",
+    """CREATE TABLE IF NOT EXISTS fetch_job (
+        id bigserial PRIMARY KEY,
+        candidate_id bigint NOT NULL REFERENCES candidate(id),
+        fqdn text NOT NULL,
+        registrable text NOT NULL,
+        priority real NOT NULL DEFAULT 0,
+        step int NOT NULL DEFAULT 0,
+        due_at timestamptz NOT NULL,
+        state text NOT NULL DEFAULT 'open',
+        claimed_until timestamptz,
+        created_at timestamptz NOT NULL DEFAULT now()
+    )""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'",
+    "CREATE INDEX IF NOT EXISTS fetch_job_due ON fetch_job (priority DESC, due_at DESC) WHERE state = 'open'",
+    "CREATE INDEX IF NOT EXISTS fetch_job_fqdn ON fetch_job (fqdn)",
+    """CREATE TABLE IF NOT EXISTS node (
+        node_id text PRIMARY KEY,
+        public_key bytea NOT NULL,
+        added_at timestamptz NOT NULL DEFAULT now()
+    )""",
+    """CREATE TABLE IF NOT EXISTS blob (
+        sha256 text PRIMARY KEY,
+        size bigint NOT NULL,
+        media_type text NOT NULL,
+        created_at timestamptz NOT NULL DEFAULT now()
+    )""",
+    """CREATE TABLE IF NOT EXISTS attempt (
+        id bigserial PRIMARY KEY,
+        job_id bigint NOT NULL REFERENCES fetch_job(id),
+        step int NOT NULL,
+        node_id text NOT NULL REFERENCES node(node_id),
+        egress_address text,
+        started_at timestamptz NOT NULL,
+        finished_at timestamptz NOT NULL,
+        outcome text NOT NULL,
+        http_status int,
+        final_url text,
+        error text,
+        envelope_sha256 text NOT NULL REFERENCES blob(sha256),
+        asn bigint,
+        asn_org text,
+        asn_db_sha256 text REFERENCES blob(sha256),
+        UNIQUE (job_id, step)
+    )""",
+    """CREATE TABLE IF NOT EXISTS dns_answer (
+        id bigserial PRIMARY KEY,
+        attempt_id bigint NOT NULL REFERENCES attempt(id),
+        node_id text NOT NULL,
+        qname text NOT NULL,
+        rrtype text NOT NULL,
+        rcode text NOT NULL,
+        ttl int,
+        answers text[] NOT NULL,
+        resolver text NOT NULL,
+        queried_at timestamptz NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS artifact (
+        id bigserial PRIMARY KEY,
+        attempt_id bigint NOT NULL REFERENCES attempt(id),
+        profile text NOT NULL,
+        kind text NOT NULL,
+        sha256 text NOT NULL REFERENCES blob(sha256)
+    )""",
+    """CREATE TABLE IF NOT EXISTS manifest (
+        id bigserial PRIMARY KEY,
+        candidate_id bigint NOT NULL REFERENCES candidate(id),
+        version int NOT NULL,
+        sha256 text NOT NULL REFERENCES blob(sha256),
+        prev_sha256 text,
+        created_at timestamptz NOT NULL DEFAULT now(),
+        UNIQUE (candidate_id, version)
+    )""",
 ]
 
 STAT_COLUMNS = (
@@ -79,10 +158,11 @@ STAT_COLUMNS = (
 class CandidateRow:
     fqdn: str
     registrable: str
-    log_id: str
-    log_index: int
-    cert_key: bytes
-    first_seen_ms: int
+    log_id: str | None
+    log_index: int | None
+    cert_key: bytes | None
+    first_seen_ms: int | None
+    reason: str = "first_seen"
 
 
 async def connect(url: str) -> psycopg.AsyncConnection:
@@ -121,10 +201,10 @@ async def add_candidates(
     async with conn.cursor() as cur:
         await cur.executemany(
             """INSERT INTO candidate
-                 (fqdn, registrable, log_id, log_index, cert_key, first_seen_ms)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
+                 (fqdn, registrable, log_id, log_index, cert_key, first_seen_ms, reason)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
             [
-                (r.fqdn, r.registrable, r.log_id, r.log_index, r.cert_key, r.first_seen_ms)
+                (r.fqdn, r.registrable, r.log_id, r.log_index, r.cert_key, r.first_seen_ms, r.reason)
                 for r in rows
             ],
         )
