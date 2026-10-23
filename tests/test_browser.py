@@ -1,3 +1,4 @@
+import asyncio
 import gzip
 import io
 import json
@@ -6,7 +7,7 @@ import time
 import pytest
 from warcio.archiveiterator import ArchiveIterator
 
-from hakapik.browser import PROFILES, Browser, classify
+from hakapik.browser import PROFILES, Browser, _Recorder, classify
 
 # The shared browser fixture lives on the module loop; tests using it must too.
 module_loop = pytest.mark.asyncio(loop_scope="module")
@@ -237,3 +238,48 @@ async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
     assert [k.page.outcome for k in c.clicks] == ["error", "live", "live"]
     assert c.clicks[0].page.error == "click failed: RuntimeError: boom"
     assert c.clicks[0].page.profile == "desktop-click1" and c.clicks[0].label == "Log in"
+
+
+@module_loop
+async def test_freeze_holds_against_later_meta_refresh(site, browser):
+    # a refresh already scheduled at the freeze must not fire afterwards
+    context = await browser._browser.new_context()
+    rec = _Recorder()
+    try:
+        rec.watch(context)
+        page = await context.new_page()
+        cdp = await browser.prepare_page(context, page, "mobile")
+        await page.goto(site.url("/late"), wait_until="load")
+        await browser._freeze(page, cdp, rec, asyncio.get_running_loop().time() + 5)
+        await asyncio.sleep(2)
+        assert page.url == site.url("/late") and "/late-done" not in site.paths_requested
+        assert (await page.screenshot(type="png", timeout=5000)).startswith(b"\x89PNG")
+    finally:
+        await rec.exchanges(1)
+        await context.close()
+
+
+@module_loop
+async def test_freeze_stops_a_refresh_loop(site, browser):
+    # The /loop flake: Page.stopLoading landing between a commit and the
+    # document's load let its 0-second refresh be scheduled after the freeze,
+    # so the page kept reloading and the screenshot hung until the deadline.
+    # The race hits about every second freeze; five in a row must all hold.
+    for _ in range(5):
+        context = await browser._browser.new_context()
+        rec = _Recorder()
+        try:
+            rec.watch(context)
+            page = await context.new_page()
+            cdp = await browser.prepare_page(context, page, "mobile")
+            await page.goto(site.url("/loop"), wait_until="load")
+            await asyncio.sleep(0.3)
+            await browser._freeze(page, cdp, rec, asyncio.get_running_loop().time() + 5)
+            await asyncio.sleep(0.2)  # anything in flight at the freeze lands
+            before = len(site.paths_requested)
+            await asyncio.sleep(0.5)
+            assert len(site.paths_requested) == before
+            assert (await page.screenshot(type="png", timeout=3000)).startswith(b"\x89PNG")
+        finally:
+            await rec.exchanges(1)
+            await context.close()

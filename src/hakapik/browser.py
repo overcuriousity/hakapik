@@ -353,6 +353,34 @@ class Browser:
             log.debug("capture step failed: %s", e)
             return None
 
+    @classmethod
+    async def _freeze(cls, page, cdp, rec: _Recorder, deadline: float):
+        """Stop ``page`` where it is: a page that keeps navigating never yields
+        a frame or DOM. ``cdp`` may be None (then only navigations are held).
+
+        Page.stopLoading cancels only what is scheduled when it lands: between
+        a commit and that document's load, a meta refresh is not scheduled yet
+        and fires afterwards. So new main-frame navigations are aborted first,
+        with ERR_ABORTED, which Chromium drops without an error page.
+        """
+        bounded = functools.partial(cls._bounded, deadline=deadline)
+
+        async def hold(route):
+            req = route.request
+            try:
+                if req.is_navigation_request() and req.frame == page.main_frame:
+                    rec.blocked.add(req)  # our doing, not the site's: kept out of the WARC
+                    await route.abort("aborted")
+                else:
+                    await route.fallback()
+            except PlaywrightError:  # page or context gone
+                log.debug("navigation hold failed", exc_info=True)
+
+        await bounded(page.route("**/*", hold))
+        if cdp is not None:
+            await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
+            await bounded(cdp.send("Page.stopLoading"))
+
     async def _click(self, context, rec: _Recorder, url: str, profile: str, n: int,
                      label: str, deadline: float) -> ClickCapture:
         """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks the
@@ -427,10 +455,7 @@ class Browser:
             if target.url.startswith("chrome-error:"):
                 nav_error = nav.failure or "navigation failed"
             else:
-                if cdp is not None:
-                    await bounded(cdp.send("Emulation.setScriptExecutionDisabled",
-                                           {"value": True}))
-                    await bounded(cdp.send("Page.stopLoading"))
+                await self._freeze(target, cdp, rec, deadline)
                 screenshot = await bounded(target.screenshot(
                     type="png", timeout=max(deadline - loop.time(), 0.001) * 1000))
             if not target.url.startswith(_BLANK):
@@ -495,9 +520,7 @@ class Browser:
             deadline = loop.time() + self.nav_timeout_s
             bounded = functools.partial(self._bounded, deadline=deadline)
             if navigated:
-                # Freeze: a page that keeps navigating never yields a frame or DOM.
-                await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
-                await bounded(cdp.send("Page.stopLoading"))
+                await self._freeze(page, cdp, rec, deadline)
             if not page.url.startswith(_BLANK):
                 final_url = page.url
             if (resp := nav.response_for(final_url)) is not None:

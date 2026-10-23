@@ -18,6 +18,8 @@ PAGES = {
     "/js": (200, [], b'<html><body><script>location.href = "/";</script></body></html>'),
     "/loop": (200, [], b'<html><head><meta http-equiv="refresh" content="0;url=/loop">'
                        b'</head><body>loop</body></html>'),
+    "/late": (200, [], b'<html><head><meta http-equiv="refresh" content="1;url=/late-done">'
+                       b'</head><body>late</body></html>'),
     "/stall": (200, [], b'<html><body>stalled<img src="/never"></body></html>'),
     "/push": (200, [], b'<html><body>push<script>history.pushState({}, "", "/pushed");'
                        b'</script></body></html>'),
