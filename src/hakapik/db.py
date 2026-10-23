@@ -3,10 +3,14 @@
 No function here commits; the caller owns the transaction.
 """
 
+import os
 from dataclasses import dataclass
 from datetime import date
 
 import psycopg
+from psycopg.rows import dict_row
+
+from hakapik.blobstore import BlobStore
 
 _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS log_cursor (
@@ -161,3 +165,60 @@ async def read_stat(conn: psycopg.AsyncConnection, log_id: str, day: date) -> di
     )
     row = await cur.fetchone()
     return dict(zip(STAT_COLUMNS, row)) if row else dict.fromkeys(STAT_COLUMNS, 0)
+
+
+async def read_stats(conn: psycopg.AsyncConnection, since: date) -> list[dict]:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            f"SELECT log_id, day, {', '.join(STAT_COLUMNS)} FROM ingest_stat "
+            "WHERE day >= %s ORDER BY log_id, day",
+            (since,),
+        )
+        return await cur.fetchall()
+
+
+async def sample_candidates(conn: psycopg.AsyncConnection, n: int) -> list[dict]:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT fqdn, registrable, log_id, log_index, first_seen_ms, created_at "
+            "FROM candidate ORDER BY random() LIMIT %s",
+            (n,),
+        )
+        return await cur.fetchall()
+
+
+async def prune_raw(
+    conn: psycopg.AsyncConnection, bs: BlobStore, older_than: date
+) -> int:
+    """Delete raw batches older than ``older_than`` that hold no candidate.
+
+    A batch is kept if any candidate on the same log has a log_index inside
+    its [start_index, end_index]. Blob files are unlinked unless another
+    remaining batch still references the same (content-addressed) blob.
+    The caller commits.
+    """
+    cur = await conn.execute(
+        """DELETE FROM raw_batch rb
+           WHERE rb.created_at < %s
+             AND NOT EXISTS (
+               SELECT 1 FROM candidate c
+               WHERE c.log_id = rb.log_id
+                 AND c.log_index BETWEEN rb.start_index AND rb.end_index)
+           RETURNING rb.blob_sha256""",
+        (older_than,),
+    )
+    shas = {r[0] for r in await cur.fetchall()}
+    count = cur.rowcount
+    for sha in shas:
+        cur = await conn.execute(
+            "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)
+        )
+        if await cur.fetchone():
+            continue
+        path = bs.path(sha)
+        try:
+            os.chmod(path, 0o644)
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return count
