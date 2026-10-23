@@ -1,9 +1,11 @@
 import asyncio
 import dataclasses
 import os
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 
+import httpx
 import pytest
 
 import hakapik.ingest as ingest
@@ -17,6 +19,7 @@ from hakapik.firstseen import FirstSeenIndex
 from hakapik.ingest import (
     StatCounter,
     bootstrap_log,
+    bootstrap_until_done,
     pack_entries,
     process_batch,
     tail_log,
@@ -228,6 +231,7 @@ async def test_suppressed_names_are_indexed_not_candidates(fake, ix, bs, conn):
     assert ix.get(suppressed) is not None
     stat = await read_stat(conn, INFO.log_id, today())
     assert (stat["fqdns_new"], stat["suppressed"], stat["candidates"]) == (3, 1, 2)
+    assert (stat["supp_public_apex"], stat["supp_tranco"], stat["supp_wildcard"]) == (1, 0, 0)
 
 
 async def test_bootstrap_log_walks_to_tree_size_and_marks_done(fake, ix, sup, bs, cfg, conn):
@@ -313,8 +317,9 @@ def two_logs(monkeypatch, tmp_path, conn):
     return cfg, a, b
 
 
-async def test_run_survives_one_log_failing_to_connect(two_logs, monkeypatch, conn):
+async def test_run_retries_log_that_failed_to_connect(two_logs, monkeypatch, conn):
     cfg, a, b = two_logs
+    monkeypatch.setattr(ingest, "BOOTSTRAP_RETRY_BASE_S", 0.01)
     calls = 0
 
     async def flaky_connect(url):
@@ -327,8 +332,10 @@ async def test_run_survives_one_log_failing_to_connect(two_logs, monkeypatch, co
     monkeypatch.setattr(ingest, "connect", flaky_connect)
     await ingest.run(cfg, "bootstrap")
     await conn.rollback()
-    assert await get_cursor(conn, "logA") == (0, False)
+    # Log A's first connection failed; the retry bootstrapped it anyway.
+    assert await get_cursor(conn, "logA") == (1, True)
     assert await get_cursor(conn, "logB") == (2, True)
+    assert a.calls == [(0, 0)]
     assert b.calls == [(0, 0), (1, 1)]
     with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
         assert ix.get(EXPECTED_FQDN) is not None
@@ -344,7 +351,73 @@ async def test_run_tail_skips_log_not_bootstrapped(two_logs, conn, caplog):
     await conn.rollback()
     assert a.calls == [] and b.calls == []
     assert await get_cursor(conn, "logA") == (0, False)
-    assert caplog.text.count("not bootstrapped") == 2
+    errors = [r for r in caplog.records if "not bootstrapped" in r.getMessage()]
+    assert len(errors) == 1 and errors[0].levelname == "ERROR"
+    assert "(logA)" in errors[0].getMessage() and "(logB)" in errors[0].getMessage()
+
+
+async def test_run_tail_tails_only_bootstrapped_logs(two_logs, conn, monkeypatch):
+    cfg, a, b = two_logs
+    await bootstrapped(conn, "logB")
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.01)
+
+    async def stopper():
+        while len(b.calls) < 2:
+            await asyncio.sleep(0.01)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    t = asyncio.create_task(stopper())
+    await asyncio.wait_for(ingest.run(cfg, "tail"), timeout=5)
+    await t
+    await conn.rollback()
+    assert a.calls == [] and b.calls == [(0, 0), (1, 1)]
+    assert await get_cursor(conn, "logB") == (2, True)
+
+
+async def test_run_sets_user_agent(two_logs, monkeypatch, conn):
+    cfg, a, b = two_logs
+    seen = []
+
+    async def fake_lists(urls, client):
+        seen.append(client.headers["User-Agent"])
+        return []
+
+    monkeypatch.setattr(ingest, "fetch_log_lists", fake_lists)
+    await ingest.run(cfg, "bootstrap")
+    assert seen == ["hakapik/0.1 (CT monitor)"]
+
+
+async def test_run_caps_open_db_connections(two_logs, monkeypatch, conn):
+    cfg, a, b = two_logs
+    cfg = dataclasses.replace(cfg, max_db_connections=1)
+    open_now = peak = 0
+
+    class Tracked:
+        def __init__(self, c):
+            self._c = c
+
+        def __getattr__(self, name):
+            return getattr(self._c, name)
+
+        async def close(self):
+            nonlocal open_now
+            if not self._c.closed:
+                open_now -= 1
+            await self._c.close()
+
+    async def tracking_connect(url):
+        nonlocal open_now, peak
+        c = await real_connect(url)
+        open_now += 1
+        peak = max(peak, open_now)
+        return Tracked(c)
+
+    monkeypatch.setattr(ingest, "connect", tracking_connect)
+    await ingest.run(cfg, "bootstrap")
+    await conn.rollback()
+    assert peak == 1 and open_now == 0
+    assert await get_cursor(conn, "logA") == (1, True)
+    assert await get_cursor(conn, "logB") == (2, True)
 
 
 class GappySource(FakeSource):
@@ -459,3 +532,119 @@ async def test_tail_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
     assert src.calls == [(100, 255), (256, 511), (512, 599)]
     assert await get_cursor(conn, TILED_INFO.log_id) == (600, True)
     assert await count(conn, "raw_batch") == 3
+
+
+
+async def test_stats_split_by_mode_and_reason(synth, ix, bs, conn):
+    sup = Suppressor(frozenset({"t.com"}), frozenset({"pub.com"}))
+    src = FakeSource([
+        _synth("1", "t.com", "x.com"),
+        _synth("2", "www.t.com", "*.w.com", "pub.com", "y.com"),
+    ])
+    await process_batch(src, 0, 0, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await bootstrapped(conn, next_index=1)
+    await process_batch(src, 1, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    boot = await read_stat(conn, INFO.log_id, today(), "bootstrap")
+    live = await read_stat(conn, INFO.log_id, today(), "live")
+    assert (boot["entries"], boot["fqdns_new"], boot["supp_tranco"], boot["suppressed"]) == (1, 2, 1, 1)
+    assert (live["entries"], live["fqdns_new"], live["suppressed"]) == (1, 4, 3)
+    assert (live["supp_tranco"], live["supp_wildcard"], live["supp_public_apex"]) == (1, 1, 1)
+    assert live["candidates"] == 1
+    assert (await read_stat(conn, INFO.log_id, today()))["entries"] == 2
+
+
+# --- bootstrap retry, tail logging -------------------------------------------
+
+class FailOnceSource(FakeSource):
+    """Raises on the first fetch that starts at ``fail_at``."""
+
+    def __init__(self, leaves, fail_at):
+        super().__init__(leaves)
+        self._fail_at = fail_at
+
+    async def entries(self, start, end):
+        if start == self._fail_at:
+            self._fail_at = None
+            self.calls.append((start, end))
+            raise httpx.ConnectError("boom")
+        return await super().entries(start, end)
+
+
+async def test_bootstrap_until_done_resumes_from_cursor(ix, sup, bs, cfg, conn, monkeypatch, caplog):
+    monkeypatch.setattr(ingest, "BOOTSTRAP_RETRY_BASE_S", 0.01)
+    src = FailOnceSource([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT], fail_at=2)
+    with caplog.at_level("WARNING"):
+        assert await bootstrap_until_done(src, cfg, ix, sup, bs, conn, asyncio.Event())
+    assert src.calls == [(0, 1), (2, 3), (2, 3)]
+    assert await get_cursor(conn, INFO.log_id) == (4, True)
+    assert "bootstrap failed: ConnectError('boom')" in caplog.text
+
+
+async def test_bootstrap_until_done_backoff_doubles_and_caps(ix, sup, bs, cfg, conn, monkeypatch):
+    waits = []
+
+    async def fake_sleep(stop, seconds):
+        waits.append(seconds)
+        if len(waits) == 12:
+            stop.set()
+
+    class Broken(FakeSource):
+        async def tree_size(self):
+            raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(ingest, "_sleep_or_stop", fake_sleep)
+    assert not await bootstrap_until_done(Broken([LEAF_X509]), cfg, ix, sup, bs, conn, asyncio.Event())
+    assert waits == [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]
+
+
+async def test_bootstrap_log_stops_between_batches(ix, sup, bs, cfg, conn):
+    stop = asyncio.Event()
+
+    class StopAfterFirst(FakeSource):
+        async def entries(self, start, end):
+            stop.set()
+            return await super().entries(start, end)
+
+    src = StopAfterFirst([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT])
+    assert not await bootstrap_log(src, cfg, ix, sup, bs, conn, stop)
+    assert src.calls == [(0, 1)]
+    assert await get_cursor(conn, INFO.log_id) == (2, False)
+
+
+async def test_tail_log_logs_rate_and_lag(fake, ix, sup, bs, cfg, conn, monkeypatch, caplog):
+    await bootstrapped(conn)
+    monkeypatch.setattr(ingest, "PROGRESS_INTERVAL_S", 0.0)
+    stop = asyncio.Event()
+    with caplog.at_level("INFO"):
+        task = asyncio.create_task(tail_log(fake, cfg, ix, sup, bs, conn, stop))
+        for _ in range(200):
+            if "lag=0" in caplog.text:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+    assert "entries/s lag=2 next_index=2 tree_size=4" in caplog.text
+    assert "lag=0 next_index=4 tree_size=4" in caplog.text
+
+
+async def test_tail_log_rate_limits_tracebacks(ix, sup, bs, cfg, conn, monkeypatch, caplog):
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.001)
+
+    class Broken(FakeSource):
+        tries = 0
+
+        async def tree_size(self):
+            Broken.tries += 1
+            raise httpx.ConnectError("down")
+
+    stop = asyncio.Event()
+    with caplog.at_level("WARNING"):
+        task = asyncio.create_task(tail_log(Broken([]), cfg, ix, sup, bs, conn, stop))
+        while Broken.tries < 5:
+            await asyncio.sleep(0.005)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+    recs = [r for r in caplog.records if "batch failed" in r.getMessage()]
+    assert len(recs) >= 5 and all(r.levelname == "WARNING" for r in recs)
+    assert "ConnectError('down')" in recs[0].getMessage()
+    assert [bool(r.exc_info) for r in recs].count(True) == 1 and recs[0].exc_info

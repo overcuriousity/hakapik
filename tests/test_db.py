@@ -10,6 +10,7 @@ from hakapik.db import (
     bump_stat,
     get_cursor,
     read_stat,
+    read_stats,
     set_cursor,
 )
 
@@ -26,9 +27,9 @@ async def _count(conn, table):
 async def test_cursor_and_stat_roundtrip(conn):
     await set_cursor(conn, "L", 10, False)
     assert await get_cursor(conn, "L") == (10, False)
-    await bump_stat(conn, "L", date(2026, 10, 23), entries=5)
-    await bump_stat(conn, "L", date(2026, 10, 23), entries=2)
-    assert (await read_stat(conn, "L", date(2026, 10, 23)))["entries"] == 7
+    await bump_stat(conn, "L", date(2026, 10, 23), "live", entries=5)
+    await bump_stat(conn, "L", date(2026, 10, 23), "live", entries=2)
+    assert (await read_stat(conn, "L", date(2026, 10, 23), "live"))["entries"] == 7
 
 
 async def test_get_cursor_absent(conn):
@@ -67,4 +68,26 @@ async def test_read_stat_absent_is_zeros(conn):
 
 async def test_bump_stat_unknown_column(conn):
     with pytest.raises(ValueError):
-        await bump_stat(conn, "L", date(2026, 10, 23), bogus=1)
+        await bump_stat(conn, "L", date(2026, 10, 23), "live", bogus=1)
+
+
+async def test_stat_rows_are_per_mode(conn):
+    d = date(2026, 10, 23)
+    await bump_stat(conn, "L", d, "bootstrap", entries=10, supp_tranco=1)
+    await bump_stat(conn, "L", d, "live", entries=3, supp_wildcard=2)
+    assert (await read_stat(conn, "L", d, "bootstrap"))["entries"] == 10
+    assert (await read_stat(conn, "L", d, "live"))["supp_wildcard"] == 2
+    both = await read_stat(conn, "L", d)
+    assert (both["entries"], both["supp_tranco"], both["supp_wildcard"]) == (13, 1, 2)
+    rows = await read_stats(conn, d)
+    assert [(r["log_id"], r["mode"]) for r in rows] == [("L", "bootstrap"), ("L", "live")]
+
+
+async def test_migrate_creates_indexes(conn):
+    cur = await conn.execute(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'"
+    )
+    names = {r[0] for r in await cur.fetchall()}
+    assert {
+        "candidate_log_index", "raw_batch_created_at", "raw_batch_blob_sha256"
+    } <= names

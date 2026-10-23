@@ -19,8 +19,9 @@ class Config:
     tranco_top_n: int = 100_000
     public_apexes: tuple[str, ...] = ()
     log_lists: tuple[str, ...] = DEFAULT_LOG_LISTS
-    per_log_concurrency: int = 2
+    per_log_concurrency: int = 2  # reserved, not used yet
     batch_size: int = 256
+    max_db_connections: int = 64
 
 
 def load_config(path: Path) -> Config:

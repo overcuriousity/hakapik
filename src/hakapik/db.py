@@ -45,15 +45,22 @@ _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS ingest_stat (
         log_id text NOT NULL,
         day date NOT NULL,
+        mode text NOT NULL,
         entries bigint NOT NULL DEFAULT 0,
         bytes bigint NOT NULL DEFAULT 0,
         parse_failed bigint NOT NULL DEFAULT 0,
         certs_unique bigint NOT NULL DEFAULT 0,
         fqdns_new bigint NOT NULL DEFAULT 0,
         suppressed bigint NOT NULL DEFAULT 0,
+        supp_tranco bigint NOT NULL DEFAULT 0,
+        supp_public_apex bigint NOT NULL DEFAULT 0,
+        supp_wildcard bigint NOT NULL DEFAULT 0,
         candidates bigint NOT NULL DEFAULT 0,
-        PRIMARY KEY (log_id, day)
+        PRIMARY KEY (log_id, day, mode)
     )""",
+    "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
+    "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
+    "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)",
 ]
 
 STAT_COLUMNS = (
@@ -62,7 +69,10 @@ STAT_COLUMNS = (
     "parse_failed",
     "certs_unique",
     "fqdns_new",
-    "suppressed",
+    "suppressed",  # total; the supp_* columns split it by reason
+    "supp_tranco",
+    "supp_public_apex",
+    "supp_wildcard",
     "candidates",
 )
 
@@ -94,6 +104,11 @@ async def get_cursor(conn: psycopg.AsyncConnection, log_id: str) -> tuple[int, b
     )
     row = await cur.fetchone()
     return (0, False) if row is None else (row[0], row[1])
+
+
+async def bootstrapped_logs(conn: psycopg.AsyncConnection) -> set[str]:
+    cur = await conn.execute("SELECT log_id FROM log_cursor WHERE bootstrap_done")
+    return {r[0] for r in await cur.fetchall()}
 
 
 async def set_cursor(
@@ -143,8 +158,9 @@ async def add_raw_batch(
 
 
 async def bump_stat(
-    conn: psycopg.AsyncConnection, log_id: str, day: date, **increments: int
+    conn: psycopg.AsyncConnection, log_id: str, day: date, mode: str, **increments: int
 ) -> None:
+    """Add ``increments`` to the (log_id, day, mode) row; mode is bootstrap|live."""
     unknown = set(increments) - set(STAT_COLUMNS)
     if unknown:
         raise ValueError(f"unknown ingest_stat columns: {sorted(unknown)}")
@@ -152,29 +168,33 @@ async def bump_stat(
         return
     cols = list(increments)  # validated against STAT_COLUMNS, safe to interpolate
     sql = (
-        f"INSERT INTO ingest_stat (log_id, day, {', '.join(cols)}) "
-        f"VALUES (%s, %s, {', '.join(['%s'] * len(cols))}) "
-        "ON CONFLICT (log_id, day) DO UPDATE SET "
+        f"INSERT INTO ingest_stat (log_id, day, mode, {', '.join(cols)}) "
+        f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(cols))}) "
+        "ON CONFLICT (log_id, day, mode) DO UPDATE SET "
         + ", ".join(f"{c} = ingest_stat.{c} + EXCLUDED.{c}" for c in cols)
     )
-    await conn.execute(sql, (log_id, day, *increments.values()))
+    await conn.execute(sql, (log_id, day, mode, *increments.values()))
 
 
-async def read_stat(conn: psycopg.AsyncConnection, log_id: str, day: date) -> dict:
+async def read_stat(
+    conn: psycopg.AsyncConnection, log_id: str, day: date, mode: str | None = None
+) -> dict:
+    """Counts for one log and day: one mode's row, or summed over modes if None."""
+    sums = ", ".join(f"coalesce(sum({c}), 0)::bigint" for c in STAT_COLUMNS)
     cur = await conn.execute(
-        f"SELECT {', '.join(STAT_COLUMNS)} FROM ingest_stat "
-        "WHERE log_id = %s AND day = %s",
-        (log_id, day),
+        f"SELECT {sums} FROM ingest_stat "
+        "WHERE log_id = %s AND day = %s AND (%s::text IS NULL OR mode = %s)",
+        (log_id, day, mode, mode),
     )
     row = await cur.fetchone()
-    return dict(zip(STAT_COLUMNS, row)) if row else dict.fromkeys(STAT_COLUMNS, 0)
+    return dict(zip(STAT_COLUMNS, row))
 
 
 async def read_stats(conn: psycopg.AsyncConnection, since: date) -> list[dict]:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            f"SELECT log_id, day, {', '.join(STAT_COLUMNS)} FROM ingest_stat "
-            "WHERE day >= %s ORDER BY log_id, day",
+            f"SELECT log_id, day, mode, {', '.join(STAT_COLUMNS)} FROM ingest_stat "
+            "WHERE day >= %s ORDER BY log_id, day, mode",
             (since,),
         )
         return await cur.fetchall()

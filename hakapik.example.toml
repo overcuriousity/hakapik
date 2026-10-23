@@ -2,6 +2,9 @@
 data_dir = "/var/lib/hakapik"
 
 # PostgreSQL connection string (required).
+# Tests use a separate database whose name must end in _test, set through
+# HAKAPIK_TEST_DB, e.g. postgresql://hakapik:hakapik@127.0.0.1:5432/hakapik_test
+# (see docs/testing.md). Never point the tests at this database.
 database_url = "postgresql://hakapik:hakapik@127.0.0.1:5432/hakapik"
 
 # Days of history to backfill when a log is first seen.
@@ -22,8 +25,13 @@ log_lists = [
   "https://valid.apple.com/ct/log_list/current_log_list.json",
 ]
 
-# Concurrent requests per CT log.
+# Reserved for concurrent fetches per CT log; not used yet (one batch at a time).
 per_log_concurrency = 2
 
 # Entries fetched per get-entries batch.
 batch_size = 256
+
+# Upper bound on open Postgres connections. Log tasks borrow a connection per
+# batch (bootstrap: per bootstrap attempt) from a shared pool of at most this
+# many; keep it below the server's max_connections (compose.yaml sets 300).
+max_db_connections = 64

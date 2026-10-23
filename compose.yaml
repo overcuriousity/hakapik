@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:17-alpine
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_PASSWORD: hakapik
       POSTGRES_USER: hakapik

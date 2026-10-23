@@ -35,17 +35,22 @@ def _cand(i, log_id="L"):
 @needs_db
 async def test_stats_prints_totals_row(capsys, conn, cfg_path):
     today = date.today()
-    await bump_stat(conn, "A", today, entries=3, bytes=10, candidates=1)
-    await bump_stat(conn, "B", today, entries=4, bytes=5, suppressed=2)
-    await bump_stat(conn, "B", today - timedelta(days=30), entries=100)
+    await bump_stat(conn, "A", today, "live", entries=3, bytes=10, candidates=1)
+    await bump_stat(conn, "B", today, "live", entries=4, bytes=5, suppressed=2, supp_tranco=2)
+    await bump_stat(conn, "B", today, "bootstrap", entries=6, bytes=1)
+    await bump_stat(conn, "B", today - timedelta(days=30), "live", entries=100)
     await conn.commit()
     assert await run_main(["--config", cfg_path, "stats"]) == 0
     out = capsys.readouterr().out.splitlines()
-    assert out[0].split()[:2] == ["log_id", "day"]
-    assert len(out) == 1 + 2 + 1  # header, two rows within 7 days, total
+    header = out[0].split()
+    assert header[:3] == ["log_id", "day", "mode"]
+    assert "supp_tranco" in header and "supp_wildcard" in header
+    assert len(out) == 1 + 3 + 1  # header, three rows within 7 days, total
+    assert [line.split()[2] for line in out[1:4]] == ["live", "bootstrap", "live"]
     total = out[-1].split()
-    assert total[0] == "TOTAL"
-    assert total[2:4] == ["7", "15"]  # entries, bytes (old row excluded)
+    assert total[:3] == ["TOTAL", "-", "-"]
+    assert total[3:5] == ["13", "16"]  # entries, bytes (old row excluded)
+    assert total[header.index("supp_tranco")] == "2"
 
 
 @needs_db
@@ -113,13 +118,20 @@ def test_bootstrap_tail_dispatch(mode, cfg_path, monkeypatch):
     async def fake_run(cfg, m):
         calls.append(m)
 
-    async def fake_lag(cfg, interval=60):
-        await asyncio.sleep(3600)
-
     monkeypatch.setattr(cli.ingest, "run", fake_run)
-    monkeypatch.setattr(cli, "_lag_loop", fake_lag)
     assert main(["--config", cfg_path, mode]) == 0
     assert calls == [mode]
+
+
+def test_main_quiets_httpx_request_logging(cfg_path, monkeypatch):
+    import logging
+
+    async def fake_run(cfg, m):
+        pass
+
+    monkeypatch.setattr(cli.ingest, "run", fake_run)
+    main(["--config", cfg_path, "tail"])
+    assert logging.getLogger("httpx").getEffectiveLevel() == logging.WARNING
 
 
 @needs_db
@@ -140,3 +152,16 @@ async def test_prune_commit_failure_keeps_blob_and_row(tmp_path, conn, monkeypat
     assert bs.path(sha).exists()
     cur = await conn.execute("SELECT count(*) FROM raw_batch")
     assert (await cur.fetchone())[0] == 1
+
+
+@needs_db
+async def test_prune_skips_invalid_digest(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    good = await _batch(conn, bs, "L", 0, 9, b"old", 30)
+    await add_raw_batch(conn, "L", 10, 19, "../../etc/passwd", 10, 3)
+    await conn.execute(
+        "UPDATE raw_batch SET created_at = now() - interval '30 days' WHERE start_index = 10"
+    )
+    await conn.commit()
+    assert await prune_raw(conn, bs, date.today() - timedelta(days=7)) == 2
+    assert not bs.path(good).exists()

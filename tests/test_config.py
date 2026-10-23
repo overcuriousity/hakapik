@@ -40,3 +40,8 @@ def _write(tmp_path, extra):
 def test_unknown_key_raises(tmp_path):
     with pytest.raises(ValueError, match="bogus"):
         load_config(_write(tmp_path, "bogus = 1\n"))
+
+
+def test_example_config_loads_with_pool_cap():
+    cfg = load_config(Path(__file__).parent.parent / "hakapik.example.toml")
+    assert cfg.max_db_connections == 64

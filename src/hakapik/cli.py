@@ -29,37 +29,6 @@ SAMPLE_COLUMNS = (
 )
 
 
-async def _lag_loop(cfg: Config, interval: float = 60) -> None:
-    """Log each log's cursor every ``interval`` s.
-
-    The tree size is not known without a network call, so this logs
-    next_index per log, not lag.
-    """
-    conn = await connect(cfg.database_url)
-    try:
-        while True:
-            await asyncio.sleep(interval)
-            cur = await conn.execute(
-                "SELECT log_id, next_index FROM log_cursor ORDER BY log_id"
-            )
-            rows = await cur.fetchall()
-            await conn.rollback()
-            for log_id, next_index in rows:
-                log.info("cursor log=%s next_index=%d", log_id, next_index)
-    finally:
-        await conn.close()
-
-
-async def _run_ingest(cfg: Config, mode: str) -> None:
-    lag = asyncio.create_task(_lag_loop(cfg)) if mode == "tail" else None
-    try:
-        await ingest.run(cfg, mode)
-    finally:
-        if lag:
-            lag.cancel()
-            await asyncio.gather(lag, return_exceptions=True)
-
-
 async def _with_conn(cfg: Config, fn, commit: bool = True):
     conn = await connect(cfg.database_url)
     try:
@@ -73,13 +42,17 @@ async def _with_conn(cfg: Config, fn, commit: bool = True):
 
 
 def _format_stats(rows: list[dict]) -> str:
-    header = ["log_id", "day", *STAT_COLUMNS]
-    body = [[r["log_id"], str(r["day"]), *(str(r[c]) for c in STAT_COLUMNS)] for r in rows]
-    total = ["TOTAL", "-", *(str(sum(r[c] for r in rows)) for c in STAT_COLUMNS)]
+    keys = ("log_id", "day", "mode")
+    header = [*keys, *STAT_COLUMNS]
+    body = [
+        [r["log_id"], str(r["day"]), r["mode"], *(str(r[c]) for c in STAT_COLUMNS)]
+        for r in rows
+    ]
+    total = ["TOTAL", "-", "-", *(str(sum(r[c] for r in rows)) for c in STAT_COLUMNS)]
     table = [header, *body, total]
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     return "\n".join(
-        "  ".join(cell.ljust(widths[i]) if i < 2 else cell.rjust(widths[i])
+        "  ".join(cell.ljust(widths[i]) if i < len(keys) else cell.rjust(widths[i])
                   for i, cell in enumerate(row)).rstrip()
         for row in table
     )
@@ -112,7 +85,8 @@ def _cmd_prune(cfg: Config, args) -> int:
 
 
 def _cmd_ingest(cfg: Config, args) -> int:
-    asyncio.run(_run_ingest(cfg, args.command))
+    # Per-log rate and lag are logged by ingest itself (no extra network call).
+    asyncio.run(ingest.run(cfg, args.command))
     return 0
 
 
@@ -140,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
         stream=sys.stderr,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # one INFO line per request
     try:
         cfg = load_config(args.config)
         return args.func(cfg, args)
