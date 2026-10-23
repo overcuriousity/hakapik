@@ -25,11 +25,25 @@ def _cf_options() -> Options:
     return opts
 
 
+def _fqdn_key(fqdn: str) -> bytes:
+    try:
+        return fqdn.encode("ascii")
+    except UnicodeEncodeError:
+        raise ValueError(f"fqdn is not ASCII/IDNA-normalised: {fqdn!r}") from None
+
+
 class FirstSeenIndex:
+    """First-seen index; see the module docstring for the writer assumption.
+
+    Callers must pass canonical names from ``hakapik.names.normalize`` with
+    ``valid=True``; non-ASCII names raise ``ValueError``.
+    """
+
     def __init__(self, path: Path):
         opts = _cf_options()
         opts.create_if_missing(True)
         opts.create_missing_column_families(True)
+        self._closed = False
         self._db = Rdict(
             str(path),
             options=opts,
@@ -47,23 +61,28 @@ class FirstSeenIndex:
 
     def first_seen(self, fqdn: str, ts_ms: int, log_id: str, index: int) -> bool:
         """Record the first sighting of ``fqdn``; True only if newly inserted."""
-        key = fqdn.encode("ascii")
+        key = _fqdn_key(fqdn)
         if key in self._fqdn:
             return False
         self._fqdn[key] = _HEAD.pack(ts_ms, index) + log_id.encode()
         return True
 
     def get(self, fqdn: str) -> tuple[int, str, int] | None:
-        value = self._fqdn.get(fqdn.encode("ascii"))
+        value = self._fqdn.get(_fqdn_key(fqdn))
         if value is None:
             return None
         ts_ms, index = _HEAD.unpack_from(value)
         return ts_ms, value[_HEAD.size :].decode(), index
 
     def close(self) -> None:
-        self._fqdn.close()
-        self._cert.close()
-        self._db.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._fqdn.close()
+            self._cert.close()
+        finally:
+            self._db.close()
 
     def __enter__(self) -> "FirstSeenIndex":
         return self

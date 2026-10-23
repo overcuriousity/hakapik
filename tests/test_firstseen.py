@@ -1,3 +1,5 @@
+import pytest
+
 from hakapik.firstseen import FirstSeenIndex
 
 
@@ -25,3 +27,25 @@ def test_persists_across_reopen(tmp_path):
         assert ix2.get("a.example") == (5, "L", 3)
         assert ix2.first_seen("a.example", 9, "M", 1) is False
         assert ix2.seen_cert(b"\x02" * 32) is True
+
+
+def test_close_is_idempotent(tmp_path):
+    ix = FirstSeenIndex(tmp_path / "idx")
+    ix.close()
+    ix.close()
+
+
+def test_close_after_with_block(tmp_path):
+    with FirstSeenIndex(tmp_path / "idx") as ix:
+        ix.first_seen("a.example", 1, "L", 1)
+    ix.close()
+
+
+def test_non_ascii_fqdn_rejected_and_not_written(tmp_path):
+    with FirstSeenIndex(tmp_path / "idx") as ix:
+        with pytest.raises(ValueError):
+            ix.first_seen("prüfung.de", 1, "L", 1)
+        with pytest.raises(ValueError):
+            ix.get("prüfung.de")
+        assert ix.get("pruefung.de") is None
+        assert ix.get("xn--prfung-t2a.de") is None
