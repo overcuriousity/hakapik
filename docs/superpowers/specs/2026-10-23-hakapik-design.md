@@ -405,13 +405,25 @@ Answered by the owner (2026-10-23):
 4. **Deployment**: Docker or Podman is available; compose services as
    planned.
 
+Answered by the owner (2026-10-24):
+
+5. **Measuring gate** removed; see section 14.
+6. **Fetcher egress**: the PoC fetches and resolves from the head's own
+   address. All outbound fetch and resolve traffic goes through one egress
+   setting so that a proxy or VPN is a configuration change later, not a
+   code change.
+7. **Fetcher rate limits** (concurrency, per-address spacing, daily cap)
+   are configuration with no shipped defaults; unset means unlimited.
+
 ## 11a. Additions from the sibling fake-shop design (2026-10-13)
 
 - **Volume**: that design estimates 150 M CT entries and 150 to 300 GB
   download per day, counting entries per log and precertificates; our 10 M
   certs per day is the deduplicated figure. The tailer is sized for the entry
-  rate. Python parsing throughput is a risk; the first implementation step
-  is a measuring spike (see section 14).
+  rate. Python parsing throughput was a risk; ingest measured about 3.4
+  thousand entries per second on one core against a live rate of about 1.7
+  thousand (see 5.1). No separate measuring run gates later stages (see
+  section 14).
 - **First-seen index** moves from Postgres to an embedded key-value store
   (RocksDB or equivalent) keyed on FQDN, with the bloom filter in front.
   Postgres keeps only what humans query.
@@ -429,15 +441,16 @@ Answered by the owner (2026-10-23):
 - **Training rows are the feature vector at detection time**, never a later
   re-fetch.
 
-## 14. First step: measuring spike
+## 14. No measuring gate (amended 2026-10-24)
 
-Before the full plan is executed, a short throwaway spike builds the CT
-tailer for both log APIs, runs it for several days, and measures: entries
-per day per log, bytes per day, parse throughput per core, first-seen
-FQDNs per day after dedup, candidates per day after the suppression lists,
-and a manual look at 200 candidates. These numbers replace the estimates in
-sections 4, 5.1 and 11a before the fetch budget and storage are sized. The
-spike's code is not kept unless it comes back through review.
+Earlier drafts required a multi-day measuring run of the tailer before the
+fetch budget and storage were sized. The owner removed that gate: no stage
+waits on a measurement report. Every quantity the run would have measured
+is configuration instead (fetch budget per day, queue cap, age-out window,
+retention), and the running system reports the actual volumes through the
+metrics in section 9 (`hakapik stats` already reports entries, first-seen
+names, suppression per reason and candidates per log and day). Later
+stages can be exercised without a running tail by enqueueing FQDNs by hand.
 
 ## 12. Left to the builder
 

@@ -545,6 +545,9 @@ git add -A && git commit -m "feat: CLI with bootstrap, tail, stats, sample, prun
 
 ### Task 12: Measurement run and report
 
+> Dropped 2026-10-24 by the owner: no measuring run gates later stages
+> (spec section 14). Kept below as history.
+
 **Files:**
 - Create: `docs/measurements/2026-XX-XX-ingest-spike.md`
 
