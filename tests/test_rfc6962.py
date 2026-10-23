@@ -1,0 +1,120 @@
+import base64
+
+import httpx
+import pytest
+
+from hakapik.ct import _retry
+from hakapik.ct.loglist import LogInfo
+from hakapik.ct.rfc6962 import Rfc6962Log
+
+BASE = "https://ct.example.test/logs/argon/"
+
+
+def b64(data: bytes) -> str:
+    return base64.b64encode(data).decode()
+
+
+def leaf(ts: int) -> bytes:
+    return b"\x00\x00" + ts.to_bytes(8, "big") + b"\x00\x00" + b"rest"
+
+
+TWO_ENTRIES = {
+    "entries": [
+        {"leaf_input": b64(b"leaf-a"), "extra_data": b64(b"extra-a")},
+        {"leaf_input": b64(b"leaf-b"), "extra_data": b64(b"extra-b")},
+    ]
+}
+
+
+@pytest.fixture(autouse=True)
+def no_sleep(monkeypatch):
+    delays: list[float] = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(_retry, "_sleep", fake_sleep)
+    return delays
+
+
+@pytest.fixture
+async def log():
+    info = LogInfo(
+        log_id="id",
+        description="Argon",
+        kind="rfc6962",
+        url=BASE,
+        monitoring_url=None,
+        state="usable",
+        operator="Op",
+    )
+    async with httpx.AsyncClient() as client:
+        yield Rfc6962Log(info, client)
+
+
+async def test_info_exposed(log):
+    assert log.info.url == BASE
+
+
+async def test_tree_size(respx_mock, log):
+    respx_mock.get(BASE + "ct/v1/get-sth").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "tree_size": 1234,
+                "timestamp": 1,
+                "sha256_root_hash": "",
+                "tree_head_signature": "",
+            },
+        )
+    )
+    assert await log.tree_size() == 1234
+
+
+async def test_entries_decodes_base64(respx_mock, log):
+    route = respx_mock.get(url__regex=r".*get-entries.*").mock(
+        return_value=httpx.Response(200, json=TWO_ENTRIES)
+    )
+    out = await log.entries(5, 6)
+    assert out == [(5, b"leaf-a", b"extra-a"), (6, b"leaf-b", b"extra-b")]
+    assert route.calls[0].request.url.params["start"] == "5"
+    assert route.calls[0].request.url.params["end"] == "6"
+
+
+async def test_entries_may_return_fewer(respx_mock, log):
+    respx_mock.get(url__regex=r".*get-entries.*").mock(
+        return_value=httpx.Response(200, json={"entries": TWO_ENTRIES["entries"][:1]})
+    )
+    assert await log.entries(10, 19) == [(10, b"leaf-a", b"extra-a")]
+
+
+async def test_get_entries_retries_on_429(respx_mock, log, no_sleep):
+    route = respx_mock.get(url__regex=r".*get-entries.*").mock(
+        side_effect=[httpx.Response(429), httpx.Response(200, json=TWO_ENTRIES)]
+    )
+    out = await log.entries(0, 1)
+    assert len(out) == 2 and route.call_count == 2
+    assert no_sleep == [1]
+
+
+async def test_index_at_bisects(respx_mock, log):
+    respx_mock.get(BASE + "ct/v1/get-sth").mock(
+        return_value=httpx.Response(200, json={"tree_size": 1000})
+    )
+    probes: list[int] = []
+
+    def entries_side_effect(request: httpx.Request) -> httpx.Response:
+        start = int(request.url.params["start"])
+        assert request.url.params["end"] == str(start)
+        probes.append(start)
+        return httpx.Response(
+            200,
+            json={"entries": [{"leaf_input": b64(leaf(1000 * start)), "extra_data": ""}]},
+        )
+
+    respx_mock.get(url__regex=r".*get-entries.*").mock(side_effect=entries_side_effect)
+    assert await log.index_at(500_000) == 500
+    assert len(probes) <= 11
+    assert await log.index_at(499_999) == 500
+    assert await log.index_at(0) == 0
+    assert await log.index_at(10**12) == 1000
