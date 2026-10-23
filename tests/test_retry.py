@@ -31,13 +31,34 @@ async def test_retry_after_honoured_and_capped(respx_mock, delays):
         side_effect=[
             httpx.Response(429, headers={"Retry-After": "7"}),
             httpx.Response(429, headers={"Retry-After": "500"}),
+            httpx.Response(429, headers={"Retry-After": "900"}),
             httpx.Response(200),
         ]
     )
     async with httpx.AsyncClient() as c:
         r = await retry_get(c, URL)
     assert r.status_code == 200
-    assert delays == [7, 60]
+    assert delays == [7, 500, 600]
+
+
+async def test_429_does_not_count_toward_max_attempts(respx_mock, delays):
+    route = respx_mock.get(URL).mock(
+        side_effect=[httpx.Response(429)] * 10 + [httpx.Response(200)]
+    )
+    async with httpx.AsyncClient() as c:
+        r = await retry_get(c, URL, max_attempts=2)
+    assert r.status_code == 200 and route.call_count == 11
+
+
+async def test_5xx_still_bounded_between_429s(respx_mock, delays):
+    respx_mock.get(URL).mock(
+        side_effect=[httpx.Response(429), httpx.Response(503), httpx.Response(429),
+                     httpx.Response(503)]
+    )
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(httpx.HTTPStatusError) as ei:
+            await retry_get(c, URL, max_attempts=2)
+    assert ei.value.response.status_code == 503 and len(delays) == 3
 
 
 async def test_transport_error_retried_then_raised(respx_mock, delays):
