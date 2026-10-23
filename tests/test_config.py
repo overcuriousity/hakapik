@@ -9,7 +9,6 @@ def test_load_config_defaults(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text('data_dir = "/var/lib/hakapik"\ndatabase_url = "postgresql://x"\n')
     cfg = load_config(p)
-    assert cfg.bootstrap_days == 90
     assert cfg.raw_retention_days == 7
     assert cfg.tranco_top_n == 100_000
     assert cfg.log_lists == (

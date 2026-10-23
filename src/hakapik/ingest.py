@@ -1,4 +1,7 @@
-"""Per-log ingest: the per-batch pipeline, the bootstrap walk and the live tail.
+"""Per-log ingest: the per-batch pipeline and the live tail.
+
+A log without a cursor row starts at its current tree size: ingest only ever
+reads forward from the moment a log is first tailed, never its history.
 
 Transaction boundary: one Postgres transaction per batch. Candidates, the
 raw_batch row, the stats increments and the cursor advance commit together,
@@ -38,7 +41,6 @@ import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 
 import httpx
 import zstandard
@@ -53,7 +55,6 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
-    bootstrapped_logs,
     bump_stat,
     connect,
     get_cursor,
@@ -70,8 +71,6 @@ USER_AGENT = "hakapik/0.1 (CT monitor)"
 IDLE_SLEEP_S = 10.0
 PROGRESS_INTERVAL_S = 60.0  # per-log rate/lag log line
 TRACEBACK_INTERVAL_S = 600.0  # at most one full traceback per log per window
-BOOTSTRAP_RETRY_BASE_S = 1.0
-BOOTSTRAP_RETRY_MAX_S = 300.0
 
 _HEAD = struct.Struct(">QI")
 _LEN = struct.Struct(">I")
@@ -153,7 +152,6 @@ async def process_batch(
     start: int,
     end: int,
     *,
-    mode: Literal["bootstrap", "live"],
     ix: FirstSeenIndex,
     sup: Suppressor,
     bs: BlobStore,
@@ -165,7 +163,7 @@ async def process_batch(
     See ``_process_batch`` for the details.
     """
     n, _ = await _process_batch(
-        src, start, end, mode=mode, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
+        src, start, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
     )
     return n
 
@@ -175,7 +173,6 @@ async def _process_batch(
     start: int,
     end: int,
     *,
-    mode: Literal["bootstrap", "live"],
     ix: FirstSeenIndex,
     sup: Suppressor,
     bs: BlobStore,
@@ -193,8 +190,6 @@ async def _process_batch(
         entries = await src.entries(start, end)
         if not entries:
             return 0, start
-        _, bootstrap_done = await get_cursor(conn, log_id)
-        emit = mode == "live" and bootstrap_done
         batch = StatCounter(entries=len(entries))
         rows: list[CandidateRow] = []
         new_certs: set[bytes] = set()
@@ -224,7 +219,7 @@ async def _process_batch(
                     by_reason = f"supp_{reason}"
                     if hasattr(batch, by_reason):
                         setattr(batch, by_reason, getattr(batch, by_reason) + 1)
-                elif emit:
+                else:
                     rows.append(
                         CandidateRow(
                             rec.fqdn, rec.registrable, log_id, index, key,
@@ -233,13 +228,12 @@ async def _process_batch(
                     )
         batch.candidates = len(rows)
         last = entries[-1][0]
-        if mode == "live":
-            blob = bs.put(pack_entries(entries), RAW_MEDIA_TYPE)
-            await add_raw_batch(conn, log_id, start, last, blob, len(entries), batch.bytes)
+        blob = bs.put(pack_entries(entries), RAW_MEDIA_TYPE)
+        await add_raw_batch(conn, log_id, start, last, blob, len(entries), batch.bytes)
         await add_candidates(conn, rows)
         day = datetime.now(timezone.utc).date()
-        await bump_stat(conn, log_id, day, mode, **batch.increments())
-        await set_cursor(conn, log_id, last + 1, bootstrap_done)
+        await bump_stat(conn, log_id, day, **batch.increments())
+        await set_cursor(conn, log_id, last + 1)
         await conn.commit()
     except BaseException:
         await conn.rollback()
@@ -254,11 +248,10 @@ async def _process_batch(
 
 
 class _Progress:
-    """Logs a log's entries/s (and lag or remaining) once per PROGRESS_INTERVAL_S."""
+    """Logs a log's entries/s and lag once per PROGRESS_INTERVAL_S."""
 
-    def __init__(self, log: logging.Logger, what: str):
+    def __init__(self, log: logging.Logger):
         self._log = log
-        self._what = what
         self._t0 = time.monotonic()
         self._n = 0
 
@@ -268,10 +261,9 @@ class _Progress:
         if dt < PROGRESS_INTERVAL_S:
             return
         rate = self._n / dt if dt > 0 else 0.0
-        label = "lag" if self._what == "tail" else "remaining"
         self._log.info(
-            "%s %.1f entries/s %s=%d next_index=%d tree_size=%d",
-            self._what, rate, label, size - next_index, next_index, size,
+            "tail %.1f entries/s lag=%d next_index=%d tree_size=%d",
+            rate, size - next_index, next_index, size,
         )
         self._t0 = time.monotonic()
         self._n = 0
@@ -343,96 +335,32 @@ def _borrow(db):
     return db.borrow() if isinstance(db, ConnPool) else contextlib.nullcontext(db)
 
 
-async def bootstrap_log(
-    src: LogSource,
-    cfg: Config,
-    ix: FirstSeenIndex,
-    sup: Suppressor,
-    bs: BlobStore,
-    conn,
-    stop: asyncio.Event | None = None,
-) -> bool:
-    """Index the last ``bootstrap_days`` of the log, then mark it bootstrapped.
-
-    Resumes from the cursor. Returns True once the log is bootstrapped, False
-    if ``stop`` was set first (checked between batches).
-    """
-    log = _logger(src)
-    next_index, done = await get_cursor(conn, src.info.log_id)
-    await conn.rollback()  # end the read-only transaction get_cursor opened
-    if done:
-        return True
-    now_ms = int(time.time() * 1000)
-    since = await src.index_at(now_ms - cfg.bootstrap_days * 86_400_000)
-    pos = max(next_index, since)
-    size = await src.tree_size()
-    log.info("bootstrap from %d to %d", pos, size)
-    stats = StatCounter()
-    progress = _Progress(log, "bootstrap")
-    while pos < size:
-        if stop is not None and stop.is_set():
-            log.info("bootstrap stopped at %d of %d", pos, size)
-            return False
-        end = _batch_end(src, pos, size, cfg.batch_size)
-        n, pos_next = await _process_batch(
-            src, pos, end, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
-        )
-        if n == 0:
-            raise RuntimeError(f"log returned no entries for {pos}..{end}")
-        pos = pos_next  # same value the batch wrote to the cursor
-        progress.note(n, pos, size)
-    try:
-        await set_cursor(conn, src.info.log_id, pos, True)
-        await conn.commit()
-    except BaseException:
-        await conn.rollback()
-        raise
-    log.info("bootstrap done at %d: %s", pos, stats.increments())
-    return True
-
-
-async def bootstrap_until_done(
-    src: LogSource,
-    cfg: Config,
-    ix: FirstSeenIndex,
-    sup: Suppressor,
-    bs: BlobStore,
-    db,
-    stop: asyncio.Event,
-) -> bool:
-    """Run ``bootstrap_log`` until it completes or ``stop`` is set.
-
-    Each failure is retried from the cursor after an exponential backoff
-    (BOOTSTRAP_RETRY_BASE_S doubling, capped at BOOTSTRAP_RETRY_MAX_S), with
-    no limit on attempts. ``db`` is a ``ConnPool`` or a connection.
-    """
-    failures = _Failures(_logger(src))
-    delay = BOOTSTRAP_RETRY_BASE_S
-    while not stop.is_set():
-        try:
-            async with _borrow(db) as conn:
-                if await bootstrap_log(src, cfg, ix, sup, bs, conn, stop):
-                    return True
-        except Exception as e:
-            failures.warn("bootstrap", e, delay)
-            await _sleep_or_stop(stop, delay)
-            delay = min(delay * 2, BOOTSTRAP_RETRY_MAX_S)
-    return False
-
-
 async def _tail_once(
     src: LogSource, cfg: Config, ix: FirstSeenIndex, sup: Suppressor, bs: BlobStore, conn
 ) -> tuple[int, int, int]:
-    """One live batch from the cursor; return (entries, next index, tree size)."""
-    next_index, _ = await get_cursor(conn, src.info.log_id)
+    """One live batch from the cursor; return (entries, next index, tree size).
+
+    A log without a cursor row gets one at the current tree size, committed
+    before any entry is fetched (nothing before it is ever read).
+    """
+    log_id = src.info.log_id
+    next_index = await get_cursor(conn, log_id)
     await conn.rollback()
     size = await src.tree_size()
+    if next_index is None:
+        try:
+            await set_cursor(conn, log_id, size)
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+        _logger(src).info("no cursor; starting at tree_size=%d", size)
+        return 0, size, size
     if next_index >= size:
         return 0, next_index, size
     end = _batch_end(src, next_index, size, cfg.batch_size)
     n, nxt = await _process_batch(
-        src, next_index, end, mode="live", ix=ix, sup=sup, bs=bs, conn=conn,
-        stats=StatCounter(),
+        src, next_index, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter()
     )
     return n, nxt, size
 
@@ -466,7 +394,7 @@ async def tail_log(
     connection. Logs entries/s and lag every PROGRESS_INTERVAL_S.
     """
     log = _logger(src)
-    progress = _Progress(log, "tail")
+    progress = _Progress(log)
     failures = _Failures(log)
     while not stop.is_set():
         try:
@@ -489,13 +417,14 @@ def _load_suppressor(cfg: Config) -> Suppressor:
     return Suppressor.from_files(Path(os.devnull), 0, cfg.public_apexes)
 
 
-async def run(cfg: Config, mode: Literal["bootstrap", "tail"]) -> None:
-    """Bootstrap or tail every active log, one task per log.
+async def run(cfg: Config) -> None:
+    """Tail every active log, one task per log.
 
-    The tasks share one HTTP client, one first-seen index and a ``ConnPool``
-    of at most ``cfg.max_db_connections`` connections. SIGINT/SIGTERM set the
-    stop event (bootstrap stops between batches, tail between batches); a
-    second signal cancels the run.
+    A log seen for the first time starts at its current tree size (see
+    ``_tail_once``). The tasks share one HTTP client, one first-seen index and
+    a ``ConnPool`` of at most ``cfg.max_db_connections`` connections.
+    SIGINT/SIGTERM set the stop event (tail stops between batches); a second
+    signal cancels the run.
     """
     root = logging.getLogger(__name__)
     sup = _load_suppressor(cfg)
@@ -516,8 +445,6 @@ async def run(cfg: Config, mode: Literal["bootstrap", "tail"]) -> None:
         conn = await connect(cfg.database_url)
         try:
             await migrate(conn)
-            done = await bootstrapped_logs(conn) if mode == "tail" else set()
-            await conn.rollback()
         finally:
             await conn.close()
 
@@ -526,15 +453,6 @@ async def run(cfg: Config, mode: Literal["bootstrap", "tail"]) -> None:
         ) as client:
             logs = await fetch_log_lists(cfg.log_lists, client)
             root.info("%d active logs", len(logs))
-            if mode == "tail":
-                skipped = [info for info in logs if info.log_id not in done]
-                if skipped:
-                    root.error(
-                        "%d logs not bootstrapped; skipping (run bootstrap first): %s",
-                        len(skipped),
-                        "; ".join(f"{i.description} ({i.log_id})" for i in skipped),
-                    )
-                logs = [info for info in logs if info.log_id in done]
             with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
 
                 async def one(info) -> None:
@@ -544,10 +462,7 @@ async def run(cfg: Config, mode: Literal["bootstrap", "tail"]) -> None:
                     log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
                     try:
                         src = make_source(info, client)
-                        if mode == "bootstrap":
-                            await bootstrap_until_done(src, cfg, ix, sup, bs, pool, stop)
-                        else:
-                            await tail_log(src, cfg, ix, sup, bs, pool, stop)
+                        await tail_log(src, cfg, ix, sup, bs, pool, stop)
                     except Exception:
                         log.exception("log task failed (%s)", info.description)
 

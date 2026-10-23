@@ -91,9 +91,9 @@ Anti-goals (would make the PoC a failure even if it runs):
   rendered pages a day, matching the post-filter candidate volume AlSabah et
   al. observed (about 25 K domains per 10-minute batch before their
   classifier, a few hundred positives per batch).
-- Anterograde only: no mining of historic data for phishing. A one-time
-  bootstrap of the last 90 days of CT entries is permitted and used only to
-  know which FQDNs already existed.
+- Anterograde only: no mining of historic data for phishing, and no
+  history bootstrap of the first-seen index (decided 2026-10-24; see 5.1).
+  Each log is picked up at its current tree size.
 - Qdrant with telemetry disabled is the vector store. No MinIO. NATS
   JetStream is the queue. Postgres holds metadata, features, labels, jobs
   state, and the evidence index.
@@ -117,9 +117,16 @@ in the PoC they run on the head.
   Postgres. Raw leaf, extra data, and the log's signed tree head at read time
   are stored in the blob store; an inclusion proof is fetched and stored
   lazily for any entry that becomes a candidate.
-- Bootstrap: the same tailer runs over the last 90 days of each log before
-  going live. Bootstrap entries populate the first-seen index only; they are
-  never candidates.
+- No bootstrap (decided 2026-10-24, superseding the 90-day bootstrap in
+  earlier drafts and in section 11). A log is picked up at its current tree
+  size the first time it is seen and tailed forward from there. The
+  first-seen index starts empty and fills from the live stream, so on day
+  one most renewals of existing names look new; detections exist from day
+  one and precision improves naturally as the index warms over the
+  certificate lifetime. The owner's rule: carry no complexity that cannot be
+  explained later. The measured reason: single-core parsing runs at about
+  3.4 thousand entries per second, so reading 90 days of history would take
+  weeks and gain nothing a week of live tailing does not.
 - Dedup across logs by issuer plus serial (Drichel et al.). Precertificates
   and their final certificates count once.
 - Extract every SAN DNS name. Wildcards are recorded with the `*.` stripped
@@ -371,9 +378,9 @@ Settled by the author (not owner decisions):
   fetched within a configurable window are aged out and recorded as
   unfetched. All metrics are reported over the fetched population with the
   unfetched share stated beside them.
-- **Bootstrap** writes only the first-seen index, not raw entries. The live
-  tail starts at once and mirrors raw entries, but emits no candidates for a
-  log until that log's 90-day bootstrap has completed.
+- **No bootstrap** (superseded 2026-10-24). The live tail starts at once,
+  mirrors raw entries and emits candidates from the first batch; the
+  first-seen index fills from the stream.
 - **Brand model input** is the desktop screenshot. The desktop pass runs for
   every attempt that reached a live page, not for parked, default or failed
   outcomes. Both profiles share one retry ladder.

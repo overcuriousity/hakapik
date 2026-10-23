@@ -7,9 +7,6 @@ data_dir = "/var/lib/hakapik"
 # (see docs/testing.md). Never point the tests at this database.
 database_url = "postgresql://hakapik:hakapik@127.0.0.1:5432/hakapik"
 
-# Days of history to backfill when a log is first seen.
-bootstrap_days = 90
-
 # Days to keep raw CT entries.
 raw_retention_days = 7
 
@@ -32,6 +29,6 @@ per_log_concurrency = 2
 batch_size = 256
 
 # Upper bound on open Postgres connections. Log tasks borrow a connection per
-# batch (bootstrap: per bootstrap attempt) from a shared pool of at most this
-# many; keep it below the server's max_connections (compose.yaml sets 300).
+# batch from a shared pool of at most this many; keep it below the server's
+# max_connections (compose.yaml sets 300).
 max_db_connections = 64

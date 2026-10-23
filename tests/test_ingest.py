@@ -11,15 +11,12 @@ import pytest
 import hakapik.ingest as ingest
 from hakapik.blobstore import BlobStore
 from hakapik.config import Config
-from hakapik.ct.leaf import parse_rfc6962_leaf
 from hakapik.ct.loglist import LogInfo
 from hakapik.db import connect as real_connect
 from hakapik.db import get_cursor, read_stat, set_cursor
 from hakapik.firstseen import FirstSeenIndex
 from hakapik.ingest import (
     StatCounter,
-    bootstrap_log,
-    bootstrap_until_done,
     pack_entries,
     process_batch,
     tail_log,
@@ -67,13 +64,6 @@ class FakeSource:
         self.calls.append((start, end))
         return self._entries[start : end + 1]
 
-    async def index_at(self, ts_ms: int) -> int:
-        for i, leaf, _ in self._entries:
-            p = parse_rfc6962_leaf(leaf)
-            if getattr(p, "timestamp_ms", None) is not None and p.timestamp_ms >= ts_ms:
-                return i
-        return len(self._entries)
-
 
 class FailingBlobStore(BlobStore):
     def put(self, data: bytes, media_type: str) -> str:
@@ -112,8 +102,8 @@ async def count(conn, table: str) -> int:
     return (await cur.fetchone())[0]
 
 
-async def bootstrapped(conn, log_id=INFO.log_id, next_index=0):
-    await set_cursor(conn, log_id, next_index, True)
+async def cursor_at(conn, log_id=INFO.log_id, next_index=0):
+    await set_cursor(conn, log_id, next_index)
     await conn.commit()
 
 
@@ -127,19 +117,10 @@ def test_pack_roundtrip():
     assert unpack_entries(pack_entries([])) == []
 
 
-async def test_bootstrap_writes_index_only(fake, ix, sup, bs, conn):
-    await process_batch(fake, 0, 1, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
-    assert ix.get(EXPECTED_FQDN) is not None
-    assert await count(conn, "candidate") == 0 and await count(conn, "raw_batch") == 0
-    assert not bs.root.exists() or not any(bs.root.rglob("*"))
-    assert await get_cursor(conn, INFO.log_id) == (2, False)
-
-
-async def test_live_emits_candidate_once_and_stores_raw(fake, ix, sup, bs, conn):
-    await bootstrapped(conn)
+async def test_batch_emits_candidate_once_and_stores_raw(fake, ix, sup, bs, conn):
     stats = StatCounter()
-    n1 = await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
-    n2 = await process_batch(fake, 2, 3, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    n1 = await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    n2 = await process_batch(fake, 2, 3, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
     assert (n1, n2) == (2, 2)
     assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
     cur = await conn.execute("SELECT fqdn, log_index FROM candidate")
@@ -156,7 +137,7 @@ async def test_live_emits_candidate_once_and_stores_raw(fake, ix, sup, bs, conn)
     with bs.open(batches[1][2]) as f:
         assert unpack_entries(f.read()) == fake._entries[2:4]
 
-    assert await get_cursor(conn, INFO.log_id) == (4, True)
+    assert await get_cursor(conn, INFO.log_id) == 4
     stat = await read_stat(conn, INFO.log_id, today())
     assert stat["entries"] == 4
     assert stat["certs_unique"] == 2
@@ -169,11 +150,11 @@ async def test_live_emits_candidate_once_and_stores_raw(fake, ix, sup, bs, conn)
 
 
 async def test_cursor_advances_only_after_batch_commit(fake, ix, sup, tmp_path, cfg, conn):
-    await bootstrapped(conn)
+    await cursor_at(conn)
     fake_failing_blobstore = FailingBlobStore(tmp_path / "blobs")
     with pytest.raises(OSError):
         await tail_log_once(fake, cfg, ix, sup, fake_failing_blobstore, conn)
-    assert await get_cursor(conn, fake.info.log_id) == (0, True)
+    assert await get_cursor(conn, fake.info.log_id) == 0
     assert await count(conn, "candidate") == 0
     assert await count(conn, "raw_batch") == 0
     assert (await read_stat(conn, INFO.log_id, today()))["entries"] == 0
@@ -186,20 +167,17 @@ async def test_cursor_advances_only_after_batch_commit(fake, ix, sup, tmp_path, 
 
 
 async def test_rerun_of_committed_batch_emits_no_new_candidates(fake, ix, sup, bs, conn):
-    await bootstrapped(conn)
-    await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     # Simulate a restart that re-processes the same range (e.g. cursor rewound).
-    await set_cursor(conn, INFO.log_id, 0, True)
-    await conn.commit()
-    await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await cursor_at(conn)
+    await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
-    assert await get_cursor(conn, INFO.log_id) == (2, True)
+    assert await get_cursor(conn, INFO.log_id) == 2
 
 
 async def test_duplicates_within_one_batch_count_once(fake, ix, sup, bs, conn):
-    await bootstrapped(conn)
     stats = StatCounter()
-    await process_batch(fake, 0, 3, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    await process_batch(fake, 0, 3, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
     assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
     assert (stats.certs_unique, stats.fqdns_new) == (2, 3)
     cur = await conn.execute("SELECT DISTINCT log_index FROM candidate")
@@ -207,25 +185,24 @@ async def test_duplicates_within_one_batch_count_once(fake, ix, sup, bs, conn):
     assert ix.get(EXPECTED_FQDN)[2] == 0
 
 
-async def test_live_skips_candidates_until_bootstrap_done(ix, sup, bs, conn):
+async def test_batch_counts_parse_failures_and_emits_the_rest(ix, sup, bs, conn):
     src = FakeSource([LEAF_X509, LEAF_PRECERT, GARBAGE])
-    n = await process_batch(src, 0, 2, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    n = await process_batch(src, 0, 2, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     assert n == 3
     assert await count(conn, "raw_batch") == 1
-    assert await count(conn, "candidate") == 0
+    assert await count(conn, "candidate") == len(EXPECTED_NEW_FQDNS)
     stat = await read_stat(conn, INFO.log_id, today())
     assert stat["entries"] == 3
     assert stat["parse_failed"] == 1
     assert stat["fqdns_new"] == 3
-    assert stat["candidates"] == 0
-    assert await get_cursor(conn, INFO.log_id) == (3, False)
+    assert stat["candidates"] == 3
+    assert await get_cursor(conn, INFO.log_id) == 3
 
 
 async def test_suppressed_names_are_indexed_not_candidates(fake, ix, bs, conn):
-    await bootstrapped(conn)
     suppressed = "san0.9950eab53001792788541807.osu.prod.canaries.quickbeam.acm.aws.dev"
     sup = Suppressor(frozenset(), frozenset({suppressed}))
-    await process_batch(fake, 0, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     cur = await conn.execute("SELECT fqdn FROM candidate")
     assert {r[0] for r in await cur.fetchall()} == EXPECTED_NEW_FQDNS - {suppressed}
     assert ix.get(suppressed) is not None
@@ -234,38 +211,24 @@ async def test_suppressed_names_are_indexed_not_candidates(fake, ix, bs, conn):
     assert (stat["supp_public_apex"], stat["supp_tranco"], stat["supp_wildcard"]) == (1, 0, 0)
 
 
-async def test_bootstrap_log_walks_to_tree_size_and_marks_done(fake, ix, sup, bs, cfg, conn):
-    await bootstrap_log(fake, cfg, ix, sup, bs, conn)
-    assert await get_cursor(conn, INFO.log_id) == (4, True)
-    assert fake.calls == [(0, 1), (2, 3)]
-    assert await count(conn, "candidate") == 0 and await count(conn, "raw_batch") == 0
-    assert ix.get(EXPECTED_FQDN) is not None
-    # Already done: a second call does nothing.
-    fake.calls.clear()
-    await bootstrap_log(fake, cfg, ix, sup, bs, conn)
+async def test_tail_without_cursor_starts_at_tree_size(fake, ix, sup, bs, cfg, conn):
+    assert await tail_log_once(fake, cfg, ix, sup, bs, conn) == 0
     assert fake.calls == []
-
-
-async def test_bootstrap_log_starts_at_index_at(ix, sup, bs, cfg, conn):
-    src = FakeSource([LEAF_X509, LEAF_PRECERT])
-    cfg = Config(data_dir=cfg.data_dir, database_url="unused", bootstrap_days=0)
-    # The fixture leaves are older than "now", so index_at(now) is the tree size.
-    await bootstrap_log(src, cfg, ix, sup, bs, conn)
-    assert src.calls == []
-    assert await get_cursor(conn, INFO.log_id) == (2, True)
+    assert await get_cursor(conn, INFO.log_id) == 4
+    assert await count(conn, "candidate") == 0
 
 
 async def test_tail_log_once_batches_and_catches_up(fake, ix, sup, bs, cfg, conn):
-    await bootstrapped(conn)
+    await cursor_at(conn)
     assert await tail_log_once(fake, cfg, ix, sup, bs, conn) == 2
     assert await tail_log_once(fake, cfg, ix, sup, bs, conn) == 2
     assert await tail_log_once(fake, cfg, ix, sup, bs, conn) == 0
     assert fake.calls == [(0, 1), (2, 3)]
-    assert await get_cursor(conn, INFO.log_id) == (4, True)
+    assert await get_cursor(conn, INFO.log_id) == 4
 
 
 async def test_tail_log_stops_on_event(fake, ix, sup, bs, cfg, conn):
-    await bootstrapped(conn)
+    await cursor_at(conn)
     stop = asyncio.Event()
     task = asyncio.create_task(tail_log(fake, cfg, ix, sup, bs, conn, stop))
     # Poll the source, not the shared connection, until the tailer is caught up
@@ -277,7 +240,7 @@ async def test_tail_log_stops_on_event(fake, ix, sup, bs, cfg, conn):
     await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=2)
-    assert await get_cursor(conn, INFO.log_id) == (4, True)
+    assert await get_cursor(conn, INFO.log_id) == 4
 
 
 def test_missing_tranco_falls_back_to_empty_set(tmp_path, caplog):
@@ -317,61 +280,97 @@ def two_logs(monkeypatch, tmp_path, conn):
     return cfg, a, b
 
 
-async def test_run_retries_log_that_failed_to_connect(two_logs, monkeypatch, conn):
+async def _stop_when(cond):
+    """SIGTERM this process (run()'s stop signal) once ``cond()`` holds."""
+    while not cond():
+        await asyncio.sleep(0.01)
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+async def _run_until(cfg, cond):
+    t = asyncio.create_task(_stop_when(cond))
+    await asyncio.wait_for(ingest.run(cfg), timeout=5)
+    await t
+
+
+async def test_run_retries_log_that_failed_to_connect(two_logs, monkeypatch, conn, caplog):
     cfg, a, b = two_logs
-    monkeypatch.setattr(ingest, "BOOTSTRAP_RETRY_BASE_S", 0.01)
+    await cursor_at(conn, "logA")
+    await cursor_at(conn, "logB")
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.01)
     calls = 0
 
     async def flaky_connect(url):
         nonlocal calls
         calls += 1
-        if calls == 2:  # 1st is migrate; 2nd is log A's task
+        if calls == 2:  # 1st is migrate; 2nd is log A's first batch
             raise OSError("too many connections")
         return await real_connect(url)
 
     monkeypatch.setattr(ingest, "connect", flaky_connect)
-    await ingest.run(cfg, "bootstrap")
+    with caplog.at_level("WARNING"):
+        await _run_until(cfg, lambda: len(a.calls) >= 1 and len(b.calls) >= 2)
     await conn.rollback()
-    # Log A's first connection failed; the retry bootstrapped it anyway.
-    assert await get_cursor(conn, "logA") == (1, True)
-    assert await get_cursor(conn, "logB") == (2, True)
+    # Log A's first connection failed; the retry tailed it anyway, and log B
+    # was not held up meanwhile.
+    assert "batch failed: OSError('too many connections')" in caplog.text
+    assert await get_cursor(conn, "logA") == 1
+    assert await get_cursor(conn, "logB") == 2
     assert a.calls == [(0, 0)]
     assert b.calls == [(0, 0), (1, 1)]
     with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
-        assert ix.get(EXPECTED_FQDN) is not None
         for fqdn in EXPECTED_NEW_FQDNS:
             assert ix.get(fqdn) is not None
 
 
-async def test_run_tail_skips_log_not_bootstrapped(two_logs, conn, caplog):
-    cfg, a, b = two_logs
-    # Neither log is bootstrapped: run(tail) must skip both and return.
-    with caplog.at_level("ERROR"):
-        await asyncio.wait_for(ingest.run(cfg, "tail"), timeout=5)
-    await conn.rollback()
-    assert a.calls == [] and b.calls == []
-    assert await get_cursor(conn, "logA") == (0, False)
-    errors = [r for r in caplog.records if "not bootstrapped" in r.getMessage()]
-    assert len(errors) == 1 and errors[0].levelname == "ERROR"
-    assert "(logA)" in errors[0].getMessage() and "(logB)" in errors[0].getMessage()
+class GrowingSource(SlowFakeSource):
+    """Holds ``old`` entries at the first tree_size() call, ``old + new`` after.
+
+    Records the log's cursor (read on ``conn``) at the first entries() call.
+    """
+
+    def __init__(self, old, new, info, conn):
+        super().__init__(old + new, info)
+        self._visible = len(old)
+        self._conn = conn
+        self.cursor_at_first_fetch = "unset"
+
+    async def tree_size(self):
+        size = self._visible
+        self._visible = len(self._entries)
+        return size
+
+    async def entries(self, start, end):
+        if self.cursor_at_first_fetch == "unset":
+            self.cursor_at_first_fetch = await get_cursor(self._conn, self.info.log_id)
+            await self._conn.rollback()
+        return await super().entries(start, end)
 
 
-async def test_run_tail_tails_only_bootstrapped_logs(two_logs, conn, monkeypatch):
-    cfg, a, b = two_logs
-    await bootstrapped(conn, "logB")
+async def test_run_starts_new_log_at_tree_size_and_emits_from_first_batch(
+    tmp_path, monkeypatch, conn
+):
+    info = dataclasses.replace(INFO, log_id="newlog")
+    # The same two certs before and after the tip: had the old ones been
+    # read, the new ones would not be first sightings.
+    src = GrowingSource([LEAF_X509, LEAF_PRECERT], [LEAF_X509, LEAF_PRECERT], info, conn)
+
+    async def fake_lists(urls, client):
+        return [info]
+
+    monkeypatch.setattr(ingest, "fetch_log_lists", fake_lists)
+    monkeypatch.setattr(ingest, "make_source", lambda i, client: src)
     monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.01)
-
-    async def stopper():
-        while len(b.calls) < 2:
-            await asyncio.sleep(0.01)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    t = asyncio.create_task(stopper())
-    await asyncio.wait_for(ingest.run(cfg, "tail"), timeout=5)
-    await t
+    cfg = Config(data_dir=tmp_path, database_url=os.environ["HAKAPIK_TEST_DB"], batch_size=2)
+    await _run_until(cfg, lambda: len(src.calls) >= 1)
     await conn.rollback()
-    assert a.calls == [] and b.calls == [(0, 0), (1, 1)]
-    assert await get_cursor(conn, "logB") == (2, True)
+    assert src.cursor_at_first_fetch == 2  # cursor row written before tailing
+    assert src.calls == [(2, 3)]  # nothing before the tip is fetched
+    assert await get_cursor(conn, "newlog") == 4
+    cur = await conn.execute("SELECT fqdn, log_index FROM candidate")
+    rows = await cur.fetchall()
+    assert {r[0] for r in rows} == EXPECTED_NEW_FQDNS
+    assert {r[1] for r in rows} == {2, 3}
 
 
 async def test_run_sets_user_agent(two_logs, monkeypatch, conn):
@@ -383,13 +382,16 @@ async def test_run_sets_user_agent(two_logs, monkeypatch, conn):
         return []
 
     monkeypatch.setattr(ingest, "fetch_log_lists", fake_lists)
-    await ingest.run(cfg, "bootstrap")
+    await ingest.run(cfg)
     assert seen == ["hakapik/0.1 (CT monitor)"]
 
 
 async def test_run_caps_open_db_connections(two_logs, monkeypatch, conn):
     cfg, a, b = two_logs
     cfg = dataclasses.replace(cfg, max_db_connections=1)
+    await cursor_at(conn, "logA")
+    await cursor_at(conn, "logB")
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.01)
     open_now = peak = 0
 
     class Tracked:
@@ -413,11 +415,11 @@ async def test_run_caps_open_db_connections(two_logs, monkeypatch, conn):
         return Tracked(c)
 
     monkeypatch.setattr(ingest, "connect", tracking_connect)
-    await ingest.run(cfg, "bootstrap")
+    await _run_until(cfg, lambda: len(a.calls) >= 1 and len(b.calls) >= 2)
     await conn.rollback()
     assert peak == 1 and open_now == 0
-    assert await get_cursor(conn, "logA") == (1, True)
-    assert await get_cursor(conn, "logB") == (2, True)
+    assert await get_cursor(conn, "logA") == 1
+    assert await get_cursor(conn, "logB") == 2
 
 
 class GappySource(FakeSource):
@@ -429,13 +431,15 @@ class GappySource(FakeSource):
         return out
 
 
-async def test_bootstrap_advances_by_last_returned_index(ix, sup, bs, conn, tmp_path):
+async def test_tail_advances_by_last_returned_index(ix, sup, bs, conn, tmp_path):
     src = GappySource([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT, LEAF_X509])
+    await cursor_at(conn)
     cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=3)
-    await bootstrap_log(src, cfg, ix, sup, bs, conn)
+    while await tail_log_once(src, cfg, ix, sup, bs, conn):
+        pass
     # 0..2 returns indices 0 and 2 -> next is 3 (not 0 + 2); 3..4 returns 3 only.
     assert src.calls == [(0, 2), (3, 4), (4, 4)]
-    assert await get_cursor(conn, INFO.log_id) == (5, True)
+    assert await get_cursor(conn, INFO.log_id) == 5
 
 
 # --- wildcard vs apex (synthetic leaves) ------------------------------------
@@ -468,21 +472,19 @@ async def _candidates(conn) -> set[str]:
 
 
 async def test_wildcard_first_does_not_hide_apex(synth, ix, sup, bs, conn):
-    await bootstrapped(conn)
     src = FakeSource([_synth("1", "*.a.com", "a.com")])
     stats = StatCounter()
-    await process_batch(src, 0, 0, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
+    await process_batch(src, 0, 0, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats)
     assert await _candidates(conn) == {"a.com"}
     assert (stats.fqdns_new, stats.suppressed, stats.candidates) == (2, 1, 1)
     assert ix.get("*.a.com") is not None and ix.get("a.com") is not None
 
 
 async def test_wildcard_only_cert_then_apex_cert_emits_apex(synth, ix, sup, bs, conn):
-    await bootstrapped(conn)
     src = FakeSource([_synth("1", "*.b.com"), _synth("2", "b.com")])
-    await process_batch(src, 0, 0, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await process_batch(src, 0, 0, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     assert await _candidates(conn) == set()
-    await process_batch(src, 1, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await process_batch(src, 1, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
     assert await _candidates(conn) == {"b.com"}
 
 
@@ -509,110 +511,37 @@ class TiledFakeSource(FakeSource):
         super().__init__(_tile_leaves(n), TILED_INFO)
         self._entries = [(i, leaf, b"") for i, leaf, _ in self._entries]
 
-    async def index_at(self, ts_ms: int) -> int:
-        return 0
-
-
-async def test_bootstrap_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
-    src = TiledFakeSource(600)
-    await set_cursor(conn, TILED_INFO.log_id, 100, False)
-    await conn.commit()
-    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=256)
-    await bootstrap_log(src, cfg, ix, sup, bs, conn)
-    assert src.calls == [(100, 255), (256, 511), (512, 599)]
-    assert await get_cursor(conn, TILED_INFO.log_id) == (600, True)
-
 
 async def test_tail_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
     src = TiledFakeSource(600)
-    await bootstrapped(conn, TILED_INFO.log_id, 100)
+    await cursor_at(conn, TILED_INFO.log_id, 100)
     cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=256)
     while await tail_log_once(src, cfg, ix, sup, bs, conn):
         pass
     assert src.calls == [(100, 255), (256, 511), (512, 599)]
-    assert await get_cursor(conn, TILED_INFO.log_id) == (600, True)
+    assert await get_cursor(conn, TILED_INFO.log_id) == 600
     assert await count(conn, "raw_batch") == 3
 
 
-
-async def test_stats_split_by_mode_and_reason(synth, ix, bs, conn):
+async def test_stats_split_by_reason(synth, ix, bs, conn):
     sup = Suppressor(frozenset({"t.com"}), frozenset({"pub.com"}))
     src = FakeSource([
         _synth("1", "t.com", "x.com"),
         _synth("2", "www.t.com", "*.w.com", "pub.com", "y.com"),
     ])
-    await process_batch(src, 0, 0, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
-    await bootstrapped(conn, next_index=1)
-    await process_batch(src, 1, 1, mode="live", ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
-    boot = await read_stat(conn, INFO.log_id, today(), "bootstrap")
-    live = await read_stat(conn, INFO.log_id, today(), "live")
-    assert (boot["entries"], boot["fqdns_new"], boot["supp_tranco"], boot["suppressed"]) == (1, 2, 1, 1)
-    assert (live["entries"], live["fqdns_new"], live["suppressed"]) == (1, 4, 3)
-    assert (live["supp_tranco"], live["supp_wildcard"], live["supp_public_apex"]) == (1, 1, 1)
-    assert live["candidates"] == 1
-    assert (await read_stat(conn, INFO.log_id, today()))["entries"] == 2
+    await process_batch(src, 0, 0, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    await process_batch(src, 1, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    stat = await read_stat(conn, INFO.log_id, today())
+    assert (stat["entries"], stat["fqdns_new"], stat["suppressed"]) == (2, 6, 4)
+    assert (stat["supp_tranco"], stat["supp_wildcard"], stat["supp_public_apex"]) == (2, 1, 1)
+    assert stat["candidates"] == 2
+    assert await _candidates(conn) == {"x.com", "y.com"}
 
 
-# --- bootstrap retry, tail logging -------------------------------------------
-
-class FailOnceSource(FakeSource):
-    """Raises on the first fetch that starts at ``fail_at``."""
-
-    def __init__(self, leaves, fail_at):
-        super().__init__(leaves)
-        self._fail_at = fail_at
-
-    async def entries(self, start, end):
-        if start == self._fail_at:
-            self._fail_at = None
-            self.calls.append((start, end))
-            raise httpx.ConnectError("boom")
-        return await super().entries(start, end)
-
-
-async def test_bootstrap_until_done_resumes_from_cursor(ix, sup, bs, cfg, conn, monkeypatch, caplog):
-    monkeypatch.setattr(ingest, "BOOTSTRAP_RETRY_BASE_S", 0.01)
-    src = FailOnceSource([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT], fail_at=2)
-    with caplog.at_level("WARNING"):
-        assert await bootstrap_until_done(src, cfg, ix, sup, bs, conn, asyncio.Event())
-    assert src.calls == [(0, 1), (2, 3), (2, 3)]
-    assert await get_cursor(conn, INFO.log_id) == (4, True)
-    assert "bootstrap failed: ConnectError('boom')" in caplog.text
-
-
-async def test_bootstrap_until_done_backoff_doubles_and_caps(ix, sup, bs, cfg, conn, monkeypatch):
-    waits = []
-
-    async def fake_sleep(stop, seconds):
-        waits.append(seconds)
-        if len(waits) == 12:
-            stop.set()
-
-    class Broken(FakeSource):
-        async def tree_size(self):
-            raise httpx.ConnectError("down")
-
-    monkeypatch.setattr(ingest, "_sleep_or_stop", fake_sleep)
-    assert not await bootstrap_until_done(Broken([LEAF_X509]), cfg, ix, sup, bs, conn, asyncio.Event())
-    assert waits == [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]
-
-
-async def test_bootstrap_log_stops_between_batches(ix, sup, bs, cfg, conn):
-    stop = asyncio.Event()
-
-    class StopAfterFirst(FakeSource):
-        async def entries(self, start, end):
-            stop.set()
-            return await super().entries(start, end)
-
-    src = StopAfterFirst([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT])
-    assert not await bootstrap_log(src, cfg, ix, sup, bs, conn, stop)
-    assert src.calls == [(0, 1)]
-    assert await get_cursor(conn, INFO.log_id) == (2, False)
-
+# --- tail logging -----------------------------------------------------------
 
 async def test_tail_log_logs_rate_and_lag(fake, ix, sup, bs, cfg, conn, monkeypatch, caplog):
-    await bootstrapped(conn)
+    await cursor_at(conn)
     monkeypatch.setattr(ingest, "PROGRESS_INTERVAL_S", 0.0)
     stop = asyncio.Event()
     with caplog.at_level("INFO"):

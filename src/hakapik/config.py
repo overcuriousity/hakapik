@@ -14,7 +14,6 @@ DEFAULT_LOG_LISTS = (
 class Config:
     data_dir: Path
     database_url: str
-    bootstrap_days: int = 90
     raw_retention_days: int = 7
     tranco_top_n: int = 100_000
     public_apexes: tuple[str, ...] = ()
