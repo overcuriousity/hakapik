@@ -48,6 +48,8 @@ def normalize(name: str) -> NameRecord:
     except (idna.IDNAError, UnicodeError):
         return invalid()
     labels = fqdn.split(".")
+    if any(not label for label in labels):
+        return invalid()
     if any("_" in label for label in labels):
         return invalid()
     registrable = _registrable(fqdn)

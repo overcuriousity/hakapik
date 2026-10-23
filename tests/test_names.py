@@ -34,3 +34,14 @@ def test_plain_name():
     r = normalize("  WWW.Example.co.uk. ")
     assert r.fqdn == "www.example.co.uk" and r.registrable == "example.co.uk"
     assert r.valid and not r.idn and not r.wildcard
+
+
+def test_empty_labels_invalid():
+    for name in ("example.com..", ".example.com", "a..b.com"):
+        r = normalize(name)
+        assert not r.valid and r.registrable == "", name
+
+
+def test_single_trailing_dot_stays_valid():
+    r = normalize("example.com.")
+    assert r.valid and r.fqdn == "example.com"
