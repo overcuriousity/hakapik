@@ -1,4 +1,4 @@
-"""Operator entry point: bootstrap, tail, stats, sample, prune."""
+"""Operator entry point: tail, stats, sample, prune."""
 
 from __future__ import annotations
 
@@ -42,13 +42,13 @@ async def _with_conn(cfg: Config, fn, commit: bool = True):
 
 
 def _format_stats(rows: list[dict]) -> str:
-    keys = ("log_id", "day", "mode")
+    keys = ("log_id", "day")
     header = [*keys, *STAT_COLUMNS]
     body = [
-        [r["log_id"], str(r["day"]), r["mode"], *(str(r[c]) for c in STAT_COLUMNS)]
+        [r["log_id"], str(r["day"]), *(str(r[c]) for c in STAT_COLUMNS)]
         for r in rows
     ]
-    total = ["TOTAL", "-", "-", *(str(sum(r[c] for r in rows)) for c in STAT_COLUMNS)]
+    total = ["TOTAL", "-", *(str(sum(r[c] for r in rows)) for c in STAT_COLUMNS)]
     table = [header, *body, total]
     widths = [max(len(row[i]) for row in table) for i in range(len(header))]
     return "\n".join(
@@ -84,9 +84,9 @@ def _cmd_prune(cfg: Config, args) -> int:
     return 0
 
 
-def _cmd_ingest(cfg: Config, args) -> int:
+def _cmd_tail(cfg: Config, args) -> int:
     # Per-log rate and lag are logged by ingest itself (no extra network call).
-    asyncio.run(ingest.run(cfg, args.command))
+    asyncio.run(ingest.run(cfg))
     return 0
 
 
@@ -94,8 +94,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hakapik")
     p.add_argument("--config", required=True, type=Path)
     sub = p.add_subparsers(dest="command", required=True)
-    sub.add_parser("bootstrap").set_defaults(func=_cmd_ingest)
-    sub.add_parser("tail").set_defaults(func=_cmd_ingest)
+    sub.add_parser("tail").set_defaults(func=_cmd_tail)
     st = sub.add_parser("stats")
     st.add_argument("--since", type=date.fromisoformat, metavar="YYYY-MM-DD")
     st.set_defaults(func=_cmd_stats)

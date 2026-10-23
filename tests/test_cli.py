@@ -35,21 +35,23 @@ def _cand(i, log_id="L"):
 @needs_db
 async def test_stats_prints_totals_row(capsys, conn, cfg_path):
     today = date.today()
-    await bump_stat(conn, "A", today, "live", entries=3, bytes=10, candidates=1)
-    await bump_stat(conn, "B", today, "live", entries=4, bytes=5, suppressed=2, supp_tranco=2)
-    await bump_stat(conn, "B", today, "bootstrap", entries=6, bytes=1)
-    await bump_stat(conn, "B", today - timedelta(days=30), "live", entries=100)
+    await bump_stat(conn, "A", today, entries=3, bytes=10, candidates=1)
+    await bump_stat(conn, "B", today, entries=4, bytes=5, suppressed=2, supp_tranco=2)
+    await bump_stat(conn, "B", today - timedelta(days=1), entries=6, bytes=1)
+    await bump_stat(conn, "B", today - timedelta(days=30), entries=100)
     await conn.commit()
     assert await run_main(["--config", cfg_path, "stats"]) == 0
     out = capsys.readouterr().out.splitlines()
     header = out[0].split()
-    assert header[:3] == ["log_id", "day", "mode"]
+    assert header[:3] == ["log_id", "day", "entries"]
     assert "supp_tranco" in header and "supp_wildcard" in header
     assert len(out) == 1 + 3 + 1  # header, three rows within 7 days, total
-    assert [line.split()[2] for line in out[1:4]] == ["live", "bootstrap", "live"]
+    assert [line.split()[:2] for line in out[1:4]] == [
+        ["A", str(today)], ["B", str(today - timedelta(days=1))], ["B", str(today)]
+    ]
     total = out[-1].split()
-    assert total[:3] == ["TOTAL", "-", "-"]
-    assert total[3:5] == ["13", "16"]  # entries, bytes (old row excluded)
+    assert total[:2] == ["TOTAL", "-"]
+    assert total[2:4] == ["13", "16"]  # entries, bytes (old row excluded)
     assert total[header.index("supp_tranco")] == "2"
 
 
@@ -111,22 +113,21 @@ def test_missing_config_returns_1(tmp_path, capsys):
     assert "nope.toml" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("mode", ["bootstrap", "tail"])
-def test_bootstrap_tail_dispatch(mode, cfg_path, monkeypatch):
+def test_tail_dispatch(cfg_path, monkeypatch):
     calls = []
 
-    async def fake_run(cfg, m):
-        calls.append(m)
+    async def fake_run(cfg):
+        calls.append(cfg.data_dir)
 
     monkeypatch.setattr(cli.ingest, "run", fake_run)
-    assert main(["--config", cfg_path, mode]) == 0
-    assert calls == [mode]
+    assert main(["--config", cfg_path, "tail"]) == 0
+    assert len(calls) == 1
 
 
 def test_main_quiets_httpx_request_logging(cfg_path, monkeypatch):
     import logging
 
-    async def fake_run(cfg, m):
+    async def fake_run(cfg):
         pass
 
     monkeypatch.setattr(cli.ingest, "run", fake_run)

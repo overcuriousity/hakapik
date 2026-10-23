@@ -25,21 +25,21 @@ async def _count(conn, table):
 
 
 async def test_cursor_and_stat_roundtrip(conn):
-    await set_cursor(conn, "L", 10, False)
-    assert await get_cursor(conn, "L") == (10, False)
-    await bump_stat(conn, "L", date(2026, 10, 23), "live", entries=5)
-    await bump_stat(conn, "L", date(2026, 10, 23), "live", entries=2)
-    assert (await read_stat(conn, "L", date(2026, 10, 23), "live"))["entries"] == 7
+    await set_cursor(conn, "L", 10)
+    assert await get_cursor(conn, "L") == 10
+    await bump_stat(conn, "L", date(2026, 10, 23), entries=5)
+    await bump_stat(conn, "L", date(2026, 10, 23), entries=2)
+    assert (await read_stat(conn, "L", date(2026, 10, 23)))["entries"] == 7
 
 
 async def test_get_cursor_absent(conn):
-    assert await get_cursor(conn, "nope") == (0, False)
+    assert await get_cursor(conn, "nope") is None
 
 
 async def test_set_cursor_upserts(conn):
-    await set_cursor(conn, "L", 1, False)
-    await set_cursor(conn, "L", 99, True)
-    assert await get_cursor(conn, "L") == (99, True)
+    await set_cursor(conn, "L", 1)
+    await set_cursor(conn, "L", 99)
+    assert await get_cursor(conn, "L") == 99
     assert await _count(conn, "log_cursor") == 1
 
 
@@ -68,19 +68,19 @@ async def test_read_stat_absent_is_zeros(conn):
 
 async def test_bump_stat_unknown_column(conn):
     with pytest.raises(ValueError):
-        await bump_stat(conn, "L", date(2026, 10, 23), "live", bogus=1)
+        await bump_stat(conn, "L", date(2026, 10, 23), bogus=1)
 
 
-async def test_stat_rows_are_per_mode(conn):
+async def test_stat_rows_are_per_log_and_day(conn):
     d = date(2026, 10, 23)
-    await bump_stat(conn, "L", d, "bootstrap", entries=10, supp_tranco=1)
-    await bump_stat(conn, "L", d, "live", entries=3, supp_wildcard=2)
-    assert (await read_stat(conn, "L", d, "bootstrap"))["entries"] == 10
-    assert (await read_stat(conn, "L", d, "live"))["supp_wildcard"] == 2
-    both = await read_stat(conn, "L", d)
-    assert (both["entries"], both["supp_tranco"], both["supp_wildcard"]) == (13, 1, 2)
+    await bump_stat(conn, "L", d, entries=10, supp_tranco=1)
+    await bump_stat(conn, "L", d, entries=3, supp_wildcard=2)
+    await bump_stat(conn, "M", d, entries=1)
+    stat = await read_stat(conn, "L", d)
+    assert (stat["entries"], stat["supp_tranco"], stat["supp_wildcard"]) == (13, 1, 2)
     rows = await read_stats(conn, d)
-    assert [(r["log_id"], r["mode"]) for r in rows] == [("L", "bootstrap"), ("L", "live")]
+    assert [(r["log_id"], r["entries"]) for r in rows] == [("L", 13), ("M", 1)]
+    assert "mode" not in rows[0]
 
 
 async def test_migrate_creates_indexes(conn):

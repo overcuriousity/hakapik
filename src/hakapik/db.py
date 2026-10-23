@@ -19,7 +19,6 @@ _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS log_cursor (
         log_id text PRIMARY KEY,
         next_index bigint NOT NULL,
-        bootstrap_done boolean NOT NULL,
         updated_at timestamptz NOT NULL DEFAULT now()
     )""",
     """CREATE TABLE IF NOT EXISTS raw_batch (
@@ -45,7 +44,6 @@ _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS ingest_stat (
         log_id text NOT NULL,
         day date NOT NULL,
-        mode text NOT NULL,
         entries bigint NOT NULL DEFAULT 0,
         bytes bigint NOT NULL DEFAULT 0,
         parse_failed bigint NOT NULL DEFAULT 0,
@@ -56,7 +54,7 @@ _SCHEMA = [
         supp_public_apex bigint NOT NULL DEFAULT 0,
         supp_wildcard bigint NOT NULL DEFAULT 0,
         candidates bigint NOT NULL DEFAULT 0,
-        PRIMARY KEY (log_id, day, mode)
+        PRIMARY KEY (log_id, day)
     )""",
     "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
     "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
@@ -97,31 +95,23 @@ async def migrate(conn: psycopg.AsyncConnection) -> None:
     await conn.commit()
 
 
-async def get_cursor(conn: psycopg.AsyncConnection, log_id: str) -> tuple[int, bool]:
+async def get_cursor(conn: psycopg.AsyncConnection, log_id: str) -> int | None:
+    """The log's next index, or None if the log has no cursor row yet."""
     cur = await conn.execute(
-        "SELECT next_index, bootstrap_done FROM log_cursor WHERE log_id = %s",
-        (log_id,),
+        "SELECT next_index FROM log_cursor WHERE log_id = %s", (log_id,)
     )
     row = await cur.fetchone()
-    return (0, False) if row is None else (row[0], row[1])
+    return None if row is None else row[0]
 
 
-async def bootstrapped_logs(conn: psycopg.AsyncConnection) -> set[str]:
-    cur = await conn.execute("SELECT log_id FROM log_cursor WHERE bootstrap_done")
-    return {r[0] for r in await cur.fetchall()}
-
-
-async def set_cursor(
-    conn: psycopg.AsyncConnection, log_id: str, next_index: int, bootstrap_done: bool
-) -> None:
+async def set_cursor(conn: psycopg.AsyncConnection, log_id: str, next_index: int) -> None:
     await conn.execute(
-        """INSERT INTO log_cursor (log_id, next_index, bootstrap_done)
-           VALUES (%s, %s, %s)
+        """INSERT INTO log_cursor (log_id, next_index)
+           VALUES (%s, %s)
            ON CONFLICT (log_id) DO UPDATE SET
              next_index = EXCLUDED.next_index,
-             bootstrap_done = EXCLUDED.bootstrap_done,
              updated_at = now()""",
-        (log_id, next_index, bootstrap_done),
+        (log_id, next_index),
     )
 
 
@@ -158,9 +148,9 @@ async def add_raw_batch(
 
 
 async def bump_stat(
-    conn: psycopg.AsyncConnection, log_id: str, day: date, mode: str, **increments: int
+    conn: psycopg.AsyncConnection, log_id: str, day: date, **increments: int
 ) -> None:
-    """Add ``increments`` to the (log_id, day, mode) row; mode is bootstrap|live."""
+    """Add ``increments`` to the (log_id, day) row."""
     unknown = set(increments) - set(STAT_COLUMNS)
     if unknown:
         raise ValueError(f"unknown ingest_stat columns: {sorted(unknown)}")
@@ -168,33 +158,30 @@ async def bump_stat(
         return
     cols = list(increments)  # validated against STAT_COLUMNS, safe to interpolate
     sql = (
-        f"INSERT INTO ingest_stat (log_id, day, mode, {', '.join(cols)}) "
-        f"VALUES (%s, %s, %s, {', '.join(['%s'] * len(cols))}) "
-        "ON CONFLICT (log_id, day, mode) DO UPDATE SET "
+        f"INSERT INTO ingest_stat (log_id, day, {', '.join(cols)}) "
+        f"VALUES (%s, %s, {', '.join(['%s'] * len(cols))}) "
+        "ON CONFLICT (log_id, day) DO UPDATE SET "
         + ", ".join(f"{c} = ingest_stat.{c} + EXCLUDED.{c}" for c in cols)
     )
-    await conn.execute(sql, (log_id, day, mode, *increments.values()))
+    await conn.execute(sql, (log_id, day, *increments.values()))
 
 
-async def read_stat(
-    conn: psycopg.AsyncConnection, log_id: str, day: date, mode: str | None = None
-) -> dict:
-    """Counts for one log and day: one mode's row, or summed over modes if None."""
-    sums = ", ".join(f"coalesce(sum({c}), 0)::bigint" for c in STAT_COLUMNS)
+async def read_stat(conn: psycopg.AsyncConnection, log_id: str, day: date) -> dict:
+    """Counts for one log and day (zeros if there is no row)."""
+    cols = ", ".join(STAT_COLUMNS)
     cur = await conn.execute(
-        f"SELECT {sums} FROM ingest_stat "
-        "WHERE log_id = %s AND day = %s AND (%s::text IS NULL OR mode = %s)",
-        (log_id, day, mode, mode),
+        f"SELECT {cols} FROM ingest_stat WHERE log_id = %s AND day = %s",
+        (log_id, day),
     )
     row = await cur.fetchone()
-    return dict(zip(STAT_COLUMNS, row))
+    return dict(zip(STAT_COLUMNS, row or (0,) * len(STAT_COLUMNS)))
 
 
 async def read_stats(conn: psycopg.AsyncConnection, since: date) -> list[dict]:
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
-            f"SELECT log_id, day, mode, {', '.join(STAT_COLUMNS)} FROM ingest_stat "
-            "WHERE day >= %s ORDER BY log_id, day, mode",
+            f"SELECT log_id, day, {', '.join(STAT_COLUMNS)} FROM ingest_stat "
+            "WHERE day >= %s ORDER BY log_id, day",
             (since,),
         )
         return await cur.fetchall()
