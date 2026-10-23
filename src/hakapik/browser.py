@@ -15,7 +15,7 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import urldefrag, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
@@ -26,12 +26,13 @@ from hakapik.warc import Exchange, build_warc
 
 log = logging.getLogger(__name__)
 
-# The UAs' Chrome version is replaced by the running browser's exact version
-# so the claimed client matches the real one (TLS fingerprint included).
+# Real Chrome's reduced UAs; "0" is replaced by the running browser's major
+# version so the claimed client matches the real one (TLS fingerprint
+# included). Client hints are set to agree, see _HINTS and prepare_page.
 PROFILES: dict[str, dict] = {
-    # playwright devices["Pixel 7"]
+    # viewport and touch from playwright devices["Pixel 7"]
     "mobile": {
-        "user_agent": "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+        "user_agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/0.0.0.0 Mobile Safari/537.36",
         "viewport": {"width": 412, "height": 839},
         "device_scale_factor": 2.625,
@@ -48,7 +49,16 @@ PROFILES: dict[str, dict] = {
     },
 }
 
+# UA-CH metadata per profile; brands and full versions come from Chromium.
+_HINTS: dict[str, dict] = {
+    "mobile": {"platform": "Android", "platformVersion": "14.0.0", "architecture": "",
+               "model": "K", "mobile": True, "bitness": "", "wow64": False},
+    "desktop": {"platform": "Windows", "platformVersion": "15.0.0", "architecture": "x86",
+                "model": "", "mobile": False, "bitness": "64", "wow64": False},
+}
+
 MAX_CHAIN = 50
+DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
 _BLANK = ("about:blank", "chrome-error:")
 
 
@@ -111,7 +121,7 @@ class _Recorder:
         self.tasks: list[asyncio.Task] = []
         self.blocked: set = set()
         self.chain: list[str] = []
-        self.nav_response = None  # last non-redirect main-frame document response
+        self.nav_responses: dict = {}  # URL -> last non-redirect main-frame response
         self.open = True
 
     def watch(self, context, page):
@@ -147,7 +157,11 @@ class _Recorder:
         req = resp.request
         if (req.is_navigation_request() and req.frame == page.main_frame
                 and not (300 <= resp.status < 400 and "location" in resp.headers)):
-            self.nav_response = resp
+            self.nav_responses[urldefrag(resp.url).url] = resp
+
+    def response_for(self, url: str | None):
+        """The document response for ``url``, never another document's."""
+        return self.nav_responses.get(urldefrag(url).url) if url else None
 
     def _spawn(self, failed: bool, req):
         if self.open and req not in self.blocked:
@@ -159,18 +173,19 @@ class _Recorder:
         resp = None if failed else await req.response()
         req_headers = tuple((h["name"], h["value"]) for h in await req.headers_array())
         status, status_text, resp_headers, body, ip = 0, "", (), b"", None
+        unavailable = False
         if resp is not None:
             status, status_text = resp.status, resp.status_text
             resp_headers = tuple((h["name"], h["value"]) for h in await resp.headers_array())
             try:
                 body = await resp.body()
-            except PlaywrightError:  # redirects and evicted bodies have none
-                body = b""
+            except PlaywrightError:  # redirects have none; evicted bodies are marked
+                unavailable = not (300 <= status < 400 and "location" in resp.headers)
             ip = ((await resp.server_addr()) or {}).get("ipAddress")
         return Exchange(url=req.url, method=req.method, request_headers=req_headers,
                         request_body=req.post_data_buffer, status=status,
                         status_text=status_text, response_headers=resp_headers,
-                        body=body, server_ip=ip, at=at)
+                        body=body, server_ip=ip, at=at, body_unavailable=unavailable)
 
     async def exchanges(self, timeout_s: float) -> list[Exchange]:
         """Stop recording and return what finished within ``timeout_s``."""
@@ -198,6 +213,8 @@ class Browser:
         self.version: str | None = None
         self._pw = None
         self._browser = None
+        self._brands: list[dict] = []
+        self._full_versions: list[dict] = []
 
     async def __aenter__(self) -> "Browser":
         self._pw = await async_playwright().start()
@@ -210,7 +227,30 @@ class Browser:
             await self._pw.stop()
             raise
         self.version = self._browser.version
+        try:
+            self._brands, self._full_versions = await self._chromium_brands()
+        except BaseException:
+            await self.__aexit__(None, None, None)
+            raise
         return self
+
+    async def _chromium_brands(self) -> tuple[list[dict], list[dict]]:
+        """Chromium's own brand lists (GREASE included), as navigator.userAgentData
+        reports them. userAgentData needs a secure context: a routed https page,
+        no network involved."""
+        context = await self._browser.new_context()
+        try:
+            async def blank(route):
+                await route.fulfill(body="", content_type="text/html")
+
+            await context.route("https://brands.invalid/", blank)
+            page = await context.new_page()
+            await page.goto("https://brands.invalid/")
+            v = await page.evaluate(
+                "navigator.userAgentData.getHighEntropyValues(['fullVersionList'])")
+            return v["brands"], v["fullVersionList"]
+        finally:
+            await context.close()
 
     async def __aexit__(self, *exc):
         try:
@@ -220,8 +260,25 @@ class Browser:
 
     def _profile(self, profile: str) -> dict:
         p = dict(PROFILES[profile])
-        p["user_agent"] = re.sub(r"Chrome/[\d.]+", f"Chrome/{self.version}", p["user_agent"])
+        major = self.version.split(".")[0]
+        p["user_agent"] = re.sub(r"Chrome/[\d.]+", f"Chrome/{major}.0.0.0", p["user_agent"])
         return p
+
+    async def prepare_page(self, context, page, profile: str):
+        """CDP session for ``page`` with network events on and client hints
+        that agree with the profile's UA. Call before the page navigates.
+
+        Playwright already overrides the UA for every page of the context, but
+        its UA-CH metadata has no brands and guesses the rest from the UA.
+        """
+        cdp = await context.new_cdp_session(page)
+        await cdp.send("Network.enable")
+        await cdp.send("Emulation.setUserAgentOverride", {
+            "userAgent": self._profile(profile)["user_agent"],
+            "userAgentMetadata": {"brands": self._brands,
+                                  "fullVersionList": self._full_versions,
+                                  "fullVersion": self.version, **_HINTS[profile]}})
+        return cdp
 
     @staticmethod
     async def _bounded(coro, deadline: float):
@@ -243,9 +300,12 @@ class Browser:
     async def capture(self, url: str, profile: str, *, click_through: bool = False) -> Capture:
         settings = self._profile(profile)
         started = _now()
+        loop = asyncio.get_running_loop()
         context = await self._browser.new_context(**settings, accept_downloads=False)
         rec = _Recorder()
-        error = status = server_ip = final_url = None
+        popups: list[asyncio.Task] = []
+        error = status = server_ip = final_url = deadline = None
+        load_timeout = False
         screenshot = dom = None
         cert_chain: tuple[bytes, ...] = ()
         exchanges: list[Exchange] = []
@@ -257,27 +317,36 @@ class Browser:
             await context.route("**/favicon.ico", no_favicon)
             page = await context.new_page()
             rec.watch(context, page)
-            cdp = await context.new_cdp_session(page)
-            await cdp.send("Network.enable")
+            cdp = await self.prepare_page(context, page, profile)
+            # Pages the site opens itself get the same client hints (best effort:
+            # a popup's first request may leave before this lands).
+            context.on("page", lambda p: popups.append(
+                asyncio.ensure_future(self.prepare_page(context, p, profile))))
             try:
                 await page.goto(url, wait_until="load", timeout=self.nav_timeout_s * 1000)
+            except PlaywrightTimeout as e:
+                # Kits often hang on dead trackers: if the document arrived, it is
+                # evidence like any other, only "load" never fired.
+                load_timeout = bool(rec.nav_responses)
+                error = "load timeout" if load_timeout else _error_text(e)
             except Exception as e:  # anything the page or network does
                 error = _error_text(e)
-            if error is None:
+            navigated = error is None or load_timeout
+            if navigated:
                 await asyncio.sleep(self.settle_s)  # JS and meta-refresh redirects
-            deadline = asyncio.get_running_loop().time() + self.nav_timeout_s
+            deadline = loop.time() + self.nav_timeout_s
             bounded = functools.partial(self._bounded, deadline=deadline)
-            if error is None:
+            if navigated:
                 # Freeze: a page that keeps navigating never yields a frame or DOM.
                 await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
                 await bounded(cdp.send("Page.stopLoading"))
             if not page.url.startswith(_BLANK):
                 final_url = page.url
-            if rec.nav_response is not None:
-                status = rec.nav_response.status
-                addr = await bounded(rec.nav_response.server_addr())
+            if (resp := rec.response_for(final_url)) is not None:
+                status = resp.status
+                addr = await bounded(resp.server_addr())
                 server_ip = (addr or {}).get("ipAddress")
-            if error is None:
+            if navigated:
                 screenshot = await bounded(page.screenshot(
                     type="png", timeout=self.nav_timeout_s * 1000))
             content = await bounded(page.content())
@@ -290,14 +359,23 @@ class Browser:
             log.warning("capture of %s failed", url, exc_info=True)
             error = error or _error_text(e)
         finally:
-            exchanges = await rec.exchanges(self.nav_timeout_s)
+            # In-flight exchanges get what is left of the post-navigation
+            # deadline, but at least DRAIN_FLOOR_S: their bodies come from the
+            # network side, so a hung renderer does not stall them.
+            drain = (self.nav_timeout_s if deadline is None
+                     else max(deadline - loop.time(), DRAIN_FLOOR_S))
+            exchanges = await rec.exchanges(drain)
+            for t in popups:
+                t.cancel()
+            await asyncio.gather(*popups, return_exceptions=True)
             try:
                 await context.close()
             except PlaywrightError:
                 log.debug("context close failed", exc_info=True)
         finished = _now()
+        outcome = classify(None if load_timeout else error, status)
         page_result = PageResult(
-            profile=profile, outcome=classify(error, status), http_status=status,
+            profile=profile, outcome=outcome, http_status=status,
             final_url=final_url, server_ip=server_ip, redirects=tuple(rec.chain),
             error=error, started_at=_rfc3339(started), finished_at=_rfc3339(finished))
         warc = build_warc(exchanges, {

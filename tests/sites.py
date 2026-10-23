@@ -18,6 +18,13 @@ PAGES = {
     "/js": (200, [], b'<html><body><script>location.href = "/";</script></body></html>'),
     "/loop": (200, [], b'<html><head><meta http-equiv="refresh" content="0;url=/loop">'
                        b'</head><body>loop</body></html>'),
+    "/stall": (200, [], b'<html><body>stalled<img src="/never"></body></html>'),
+    "/push": (200, [], b'<html><body>push<script>history.pushState({}, "", "/pushed");'
+                       b'</script></body></html>'),
+    "/uad": (200, [], b'<html><body>wait<script>navigator.userAgentData.getHighEntropyValues('
+                      b'["architecture", "model", "platformVersion", "fullVersionList"])'
+                      b'.then(v => { document.body.textContent = JSON.stringify(v); });'
+                      b'</script></body></html>'),
     "/apk": (200, [("Content-Type", "application/vnd.android.package-archive"),
                    ("Content-Disposition", 'attachment; filename="app.apk"')], b"PK\x03\x04" * 64),
 }
@@ -28,6 +35,8 @@ class Site:
         self.port = port
         self.paths_requested: list[str] = []
         self.user_agents: list[str] = []
+        self.headers: list[dict[str, str]] = []  # lower-cased names, per request
+        self.release = threading.Event()  # lets /never return
 
     def url(self, path: str) -> str:
         return f"http://127.0.0.1:{self.port}{path}"
@@ -38,6 +47,10 @@ def _handler(site: Site):
         def do_GET(self):
             site.paths_requested.append(self.path)
             site.user_agents.append(self.headers.get("User-Agent", ""))
+            site.headers.append({k.lower(): v for k, v in self.headers.items()})
+            if self.path == "/never":  # a dead tracker: no answer until teardown
+                site.release.wait(30)
+                return
             status, headers, body = PAGES.get(self.path, (404, [], b"<html>not found</html>"))
             self.send_response(status)
             if not any(n == "Content-Type" for n, _ in headers):
@@ -67,6 +80,7 @@ def site():
     try:
         yield s
     finally:
+        s.release.set()
         server.shutdown()
         server.server_close()
         thread.join()

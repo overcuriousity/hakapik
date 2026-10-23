@@ -12,11 +12,12 @@ def _records(data):
 
 
 def _ex(url, status, body, ip, response_headers=(("Content-Type", "text/html"),),
-        request_headers=(("User-Agent", "test"),)):
+        request_headers=(("User-Agent", "test"),), body_unavailable=False):
     return Exchange(url=url, method="GET", request_headers=request_headers,
                     request_body=None, status=status, status_text="OK",
                     response_headers=response_headers, body=body, server_ip=ip,
-                    at=datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC))
+                    at=datetime(2026, 10, 24, 12, 0, 0, tzinfo=UTC),
+                    body_unavailable=body_unavailable)
 
 
 def test_warc_roundtrip():
@@ -52,10 +53,28 @@ def test_warc_drops_pseudo_headers_and_truncates():
     assert all(not n.startswith(":") for n, _ in req.http_headers.headers)
     assert all(not n.startswith(":") for n, _ in resp.http_headers.headers)
     assert resp.rec_headers.get_header("WARC-IP-Address") is None
+    assert req.http_headers.get_header("Host") == "a.test"  # restated from :authority
     assert resp.rec_headers.get_header("WARC-Truncated") == "length"
     # the browser hands over decoded bodies: the stored body is the decoded one
     assert blocks[2] == b"x" * MAX_BODY
     assert resp.http_headers.get_header("Content-Encoding") is None
+    assert resp.http_headers.get_header("X-Hakapik-Orig-Content-Encoding") == "gzip"
+    assert resp.http_headers.get_header("Content-Length") == str(MAX_BODY)
+
+
+def test_warc_keeps_existing_host_header():
+    ex = _ex("https://a.test/", 200, b"", None,
+             request_headers=((":authority", "a.test"), ("host", "b.test")))
+    req = _records(build_warc([ex], {}))[1][0]
+    assert [v for n, v in req.http_headers.headers if n.lower() == "host"] == ["b.test"]
+
+
+def test_warc_marks_unavailable_body():
+    ex = _ex("https://a.test/", 200, b"", None, body_unavailable=True)
+    resp = _records(build_warc([ex], {}))[2][0]
+    assert resp.rec_headers.get_header("WARC-Truncated") == "unspecified"
+    ok = _records(build_warc([_ex("https://a.test/", 200, b"", None)], {}))[2][0]
+    assert ok.rec_headers.get_header("WARC-Truncated") is None
 
 
 def test_warc_failed_request_has_no_response_record():

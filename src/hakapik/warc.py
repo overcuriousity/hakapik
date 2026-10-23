@@ -23,7 +23,11 @@ _ORIG = "X-Hakapik-Orig-"
 
 @dataclass(frozen=True)
 class Exchange:
-    """One request and its response; ``status == 0`` means no response came."""
+    """One request and its response; ``status == 0`` means no response came.
+
+    ``body_unavailable``: a response arrived but the browser could not hand
+    over its body; the record says so instead of storing a silent empty body.
+    """
     url: str
     method: str
     request_headers: tuple[tuple[str, str], ...]
@@ -34,6 +38,7 @@ class Exchange:
     body: bytes
     server_ip: str | None
     at: datetime
+    body_unavailable: bool = False
 
 
 def _date(at: datetime) -> str:
@@ -42,6 +47,15 @@ def _date(at: datetime) -> str:
 
 def _plain(headers) -> list[tuple[str, str]]:
     return [(n, v) for n, v in headers if not n.startswith(":")]
+
+
+def _request_headers(headers) -> list[tuple[str, str]]:
+    """HTTP/2 carries the host as ``:authority``; HTTP/1.1 readers expect Host."""
+    plain = _plain(headers)
+    authority = next((v for n, v in headers if n == ":authority"), None)
+    if authority and not any(n.lower() == "host" for n, _ in plain):
+        plain.insert(0, ("Host", authority))
+    return plain
 
 
 def build_warc(exchanges: list[Exchange], info: dict[str, str]) -> bytes:
@@ -58,7 +72,7 @@ def build_warc(exchanges: list[Exchange], info: dict[str, str]) -> bytes:
             ex.url, "request", payload=io.BytesIO(req_body), length=len(req_body),
             warc_headers_dict={"WARC-Date": date},
             http_headers=StatusAndHeaders(f"{ex.method} {target} HTTP/1.1",
-                                          _plain(ex.request_headers),
+                                          _request_headers(ex.request_headers),
                                           is_http_request=True))
         w.write_record(req)
         if not ex.status:
@@ -70,6 +84,8 @@ def build_warc(exchanges: list[Exchange], info: dict[str, str]) -> bytes:
             warc_headers["WARC-IP-Address"] = ex.server_ip
         if len(ex.body) > MAX_BODY:
             warc_headers["WARC-Truncated"] = "length"
+        elif ex.body_unavailable:
+            warc_headers["WARC-Truncated"] = "unspecified"
         headers = [(_ORIG + n if n.lower() in _FRAMING else n, v)
                    for n, v in _plain(ex.response_headers)]
         headers.append(("Content-Length", str(len(body))))
