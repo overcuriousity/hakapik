@@ -3,9 +3,11 @@
 One Chromium serves many captures; each capture gets a fresh context (no
 shared cookies or cache). A capture records the main-frame URL chain, the
 final status and server address, a viewport screenshot, the DOM, the served
-certificate chain and a WARC of every exchange. Nothing a page does makes
-``capture`` raise or hang: every page-facing step is bounded and failures
-become the outcome.
+certificate chain and a WARC of every exchange. With click-through it also
+follows up to three login elements one hop deep (PhishIntention found 7% of
+phishing only behind such a click). Nothing a page does makes ``capture``
+raise or hang: every page-facing step is bounded and failures become the
+outcome.
 """
 
 import asyncio
@@ -58,8 +60,28 @@ _HINTS: dict[str, dict] = {
 }
 
 MAX_CHAIN = 50
+MAX_CLICKS = 3
+MAX_LABEL = 200
+LOGIN_PATTERN = re.compile(r"log ?in|sign ?in|anmelden|einloggen|connexion|se connecter|"
+                           r"iniciar sesi[oó]n|accedi|inloggen", re.IGNORECASE)
 DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
 _BLANK = ("about:blank", "chrome-error:")
+
+# Visible login elements in document order: with n < 0 their labels, else
+# the n-th element itself (null if there is none).
+_LOGIN_JS = """([pattern, n]) => {
+  const re = new RegExp(pattern, "i");
+  const found = [];
+  for (const el of document.querySelectorAll("a, button, input[type=submit], [role=button]")) {
+    if (!el.getClientRects().length
+        || !el.checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) continue;
+    const text = String((el.tagName === "INPUT" ? el.value : el.innerText) || "")
+      .replace(/\\s+/g, " ").trim();
+    if (re.test(text)) found.push([el, text.slice(0, %d)]);
+  }
+  if (n < 0) return found.slice(0, %d).map(f => f[1]);
+  return n < found.length ? found[n][0] : null;
+}""" % (MAX_LABEL, MAX_CLICKS)
 
 
 @dataclass(frozen=True)
@@ -114,54 +136,81 @@ def _error_text(e: Exception) -> str:
     return msg if isinstance(e, PlaywrightError) else f"{type(e).__name__}: {msg}"
 
 
+def _safe(fn, *args):
+    """An event handler; an exception in it would surface inside playwright's
+    dispatcher."""
+    def handler(x):
+        try:
+            fn(*args, x)
+        except Exception:
+            log.warning("event handler %s failed", fn.__name__, exc_info=True)
+    return handler
+
+
+class _Nav:
+    """One page's main-frame URL chain and document responses."""
+
+    def __init__(self):
+        self.chain: list[str] = []
+        self.responses: dict = {}  # URL -> last non-redirect main-frame response
+        self.failure: str | None = None  # error of the last failed navigation
+
+    def add(self, url: str):
+        if len(self.chain) < MAX_CHAIN and not url.startswith(_BLANK):
+            self.chain.append(url)
+
+    def response_for(self, url: str | None):
+        """The document response for ``url``, never another document's."""
+        return self.responses.get(urldefrag(url).url) if url else None
+
+
 class _Recorder:
-    """Collects one context's exchanges and its page's main-frame chain."""
+    """Collects one context's exchanges and each of its pages' navigations."""
 
     def __init__(self):
         self.tasks: list[asyncio.Task] = []
         self.blocked: set = set()
-        self.chain: list[str] = []
-        self.nav_responses: dict = {}  # URL -> last non-redirect main-frame response
+        self.navs: dict = {}  # page -> _Nav
         self.open = True
 
-    def watch(self, context, page):
-        def safe(fn, *args):
-            # An exception here would surface inside playwright's dispatcher.
-            def handler(x):
-                try:
-                    fn(*args, x)
-                except Exception:
-                    log.warning("event handler %s failed", fn.__name__, exc_info=True)
-            return handler
+    def watch(self, context):
+        context.on("requestfinished", _safe(self._spawn, False))
+        context.on("requestfailed", _safe(self._spawn, True))
+        context.on("requestfailed", _safe(self._on_failed))
+        context.on("request", _safe(self._on_request))
+        context.on("response", _safe(self._on_response))
 
-        context.on("requestfinished", safe(self._spawn, False))
-        context.on("requestfailed", safe(self._spawn, True))
-        page.on("request", safe(self._on_request, page))
-        page.on("framenavigated", safe(self._on_navigated, page))
-        page.on("response", safe(self._on_response, page))
+    def nav(self, page) -> _Nav:
+        """``page``'s navigations; pages the site opens are tracked on their own."""
+        if page not in self.navs:
+            self.navs[page] = _Nav()
+            page.on("framenavigated", _safe(self._on_navigated, page))
+        return self.navs[page]
 
-    def _add(self, url: str):
-        if len(self.chain) < MAX_CHAIN and not url.startswith(_BLANK):
-            self.chain.append(url)
+    def _main_nav(self, req) -> _Nav | None:
+        if not req.is_navigation_request():
+            return None
+        frame = req.frame
+        return self.nav(frame.page) if frame.parent_frame is None else None
 
-    def _on_request(self, page, req):
-        if req.is_navigation_request() and req.frame == page.main_frame:
-            self._add(req.url)  # every hop, HTTP redirects included
+    def _on_request(self, req):
+        if nav := self._main_nav(req):
+            nav.add(req.url)  # every hop, HTTP redirects included
+
+    def _on_failed(self, req):
+        if nav := self._main_nav(req):
+            nav.failure = req.failure
 
     def _on_navigated(self, page, frame):
         # Same-document navigations have no request of their own.
-        if frame == page.main_frame and (not self.chain or self.chain[-1] != frame.url):
-            self._add(frame.url)
+        nav = self.navs[page]
+        if frame == page.main_frame and (not nav.chain or nav.chain[-1] != frame.url):
+            nav.add(frame.url)
 
-    def _on_response(self, page, resp):
-        req = resp.request
-        if (req.is_navigation_request() and req.frame == page.main_frame
+    def _on_response(self, resp):
+        if ((nav := self._main_nav(resp.request))
                 and not (300 <= resp.status < 400 and "location" in resp.headers)):
-            self.nav_responses[urldefrag(resp.url).url] = resp
-
-    def response_for(self, url: str | None):
-        """The document response for ``url``, never another document's."""
-        return self.nav_responses.get(urldefrag(url).url) if url else None
+            nav.responses[urldefrag(resp.url).url] = resp
 
     def _spawn(self, failed: bool, req):
         if self.open and req not in self.blocked:
@@ -297,29 +346,111 @@ class Browser:
             log.debug("capture step failed: %s", e)
             return None
 
+    async def _click(self, context, rec: _Recorder, url: str, profile: str, n: int,
+                     label: str, deadline: float) -> ClickCapture:
+        """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks its
+        n-th login element and captures where that leads, all by ``deadline``.
+
+        The landing page is frozen, hence the new page. If the click opened a
+        popup, the first popup is captured instead of the page. Nothing on the
+        clicked page is clicked. A failed click is outcome "error".
+        """
+        loop = asyncio.get_running_loop()
+        started = _now()
+        bounded = functools.partial(self._bounded, deadline=deadline)
+
+        def left() -> float:
+            return max(deadline - loop.time(), 0.001)
+
+        error = status = server_ip = final_url = None
+        load_timeout = clicked = False
+        screenshot = dom = None
+        nav = _Nav()
+        try:
+            page = await asyncio.wait_for(context.new_page(), left())
+            nav = rec.nav(page)
+            popups: list = []
+            page.on("popup", lambda p: popups.append(p))
+            cdp = await asyncio.wait_for(self.prepare_page(context, page, profile), left())
+            try:
+                await page.goto(url, wait_until="load", timeout=left() * 1000)
+            except PlaywrightTimeout:
+                if not nav.responses:
+                    raise
+            await asyncio.sleep(min(self.settle_s, left()))
+            handle = await asyncio.wait_for(
+                page.evaluate_handle(_LOGIN_JS, [LOGIN_PATTERN.pattern, n]), left())
+            if (element := handle.as_element()) is None:
+                raise LookupError(f"login element {n + 1} not found again")
+            await asyncio.wait_for(element.click(timeout=left() * 1000), left())
+            clicked = True
+        except Exception as e:  # anything the page does; the hop's budget included
+            error = f"click failed: {_error_text(e)}"
+        if clicked:
+            target = page
+            try:
+                await asyncio.wait_for(
+                    page.wait_for_load_state("load", timeout=left() * 1000), left())
+                await asyncio.sleep(min(self.settle_s, left()))
+                if popups:
+                    # both or neither: the freeze must reach the captured page
+                    target, cdp = popups[0], await asyncio.wait_for(
+                        context.new_cdp_session(popups[0]), left())
+                    await asyncio.wait_for(
+                        target.wait_for_load_state("load", timeout=left() * 1000), left())
+            except (PlaywrightError, TimeoutError):
+                load_timeout = True  # evidence all the same, as on the landing page
+                error = "load timeout"
+            nav = rec.nav(target)
+            if target.url.startswith("chrome-error:"):
+                error = nav.failure or "navigation failed"
+                load_timeout = False
+            else:
+                await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
+                await bounded(cdp.send("Page.stopLoading"))
+                screenshot = await bounded(target.screenshot(type="png", timeout=left() * 1000))
+            if not target.url.startswith(_BLANK):
+                final_url = target.url
+            if (resp := nav.response_for(final_url)) is not None:
+                status = resp.status
+                server_ip = ((await bounded(resp.server_addr())) or {}).get("ipAddress")
+            content = await bounded(target.content())
+            dom = content.encode("utf-8") if content is not None else None
+            outcome = classify(None if load_timeout else error, status)
+        else:
+            outcome = "error"
+        return ClickCapture(label=label, screenshot=screenshot, dom=dom, page=PageResult(
+            profile=f"{profile}-click{n + 1}", outcome=outcome, http_status=status,
+            final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),
+            error=error, started_at=_rfc3339(started), finished_at=_rfc3339(_now())))
+
     async def capture(self, url: str, profile: str, *, click_through: bool = False) -> Capture:
         settings = self._profile(profile)
         started = _now()
         loop = asyncio.get_running_loop()
         context = await self._browser.new_context(**settings, accept_downloads=False)
         rec = _Recorder()
+        nav = _Nav()  # replaced by the page's once it exists
         popups: list[asyncio.Task] = []
         error = status = server_ip = final_url = deadline = None
         load_timeout = False
         screenshot = dom = None
         cert_chain: tuple[bytes, ...] = ()
         exchanges: list[Exchange] = []
+        clicks: list[ClickCapture] = []
         try:
             async def no_favicon(route):  # spec 5.5: the site never sees one
                 rec.blocked.add(route.request)
                 await route.abort()
 
             await context.route("**/favicon.ico", no_favicon)
+            rec.watch(context)
             page = await context.new_page()
-            rec.watch(context, page)
+            nav = rec.nav(page)
             cdp = await self.prepare_page(context, page, profile)
             # Pages the site opens itself get the same client hints (best effort:
-            # a popup's first request may leave before this lands).
+            # a popup's first request may leave before this lands). Our own click
+            # pages get them twice, with the same values.
             context.on("page", lambda p: popups.append(
                 asyncio.ensure_future(self.prepare_page(context, p, profile))))
             try:
@@ -327,7 +458,7 @@ class Browser:
             except PlaywrightTimeout as e:
                 # Kits often hang on dead trackers: if the document arrived, it is
                 # evidence like any other, only "load" never fired.
-                load_timeout = bool(rec.nav_responses)
+                load_timeout = bool(nav.responses)
                 error = "load timeout" if load_timeout else _error_text(e)
             except Exception as e:  # anything the page or network does
                 error = _error_text(e)
@@ -342,7 +473,7 @@ class Browser:
                 await bounded(cdp.send("Page.stopLoading"))
             if not page.url.startswith(_BLANK):
                 final_url = page.url
-            if (resp := rec.response_for(final_url)) is not None:
+            if (resp := nav.response_for(final_url)) is not None:
                 status = resp.status
                 addr = await bounded(resp.server_addr())
                 server_ip = (addr or {}).get("ipAddress")
@@ -355,6 +486,16 @@ class Browser:
                 origin = f"https://{urlsplit(final_url).netloc}"
                 cert = await bounded(cdp.send("Network.getCertificate", {"origin": origin}))
                 cert_chain = tuple(base64.b64decode(c) for c in (cert or {}).get("tableNames", ()))
+            labels = []
+            if click_through and navigated and dom is not None:
+                found = await bounded(page.evaluate(_LOGIN_JS, [LOGIN_PATTERN.pattern, -1]))
+                labels = [str(x)[:MAX_LABEL] for x in found[:MAX_CLICKS]] if isinstance(
+                    found, list) else []
+            for n, label in enumerate(labels):
+                # Each hop has its own budget; the drain below gets what is
+                # left of the last one.
+                deadline = loop.time() + self.nav_timeout_s + self.settle_s
+                clicks.append(await self._click(context, rec, url, profile, n, label, deadline))
         except Exception as e:  # a crashed page or target; still a result
             log.warning("capture of %s failed", url, exc_info=True)
             error = error or _error_text(e)
@@ -376,10 +517,10 @@ class Browser:
         outcome = classify(None if load_timeout else error, status)
         page_result = PageResult(
             profile=profile, outcome=outcome, http_status=status,
-            final_url=final_url, server_ip=server_ip, redirects=tuple(rec.chain),
+            final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),
             error=error, started_at=_rfc3339(started), finished_at=_rfc3339(finished))
         warc = build_warc(exchanges, {
             "software": "hakapik", "url": url, "profile": profile,
             "browser": f"Chromium {self.version}", "user-agent": settings["user_agent"]})
         return Capture(page=page_result, screenshot=screenshot, dom=dom, warc=warc,
-                       cert_chain=cert_chain, clicks=())
+                       cert_chain=cert_chain, clicks=tuple(clicks))

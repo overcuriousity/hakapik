@@ -141,3 +141,57 @@ async def test_status_belongs_to_final_url(site, browser):
     c = await browser.capture(site.url("/push"), "mobile")
     assert c.page.final_url == site.url("/pushed")
     assert c.page.http_status is None and c.page.server_ip is None
+
+
+@module_loop
+async def test_click_through_reaches_login_form(site, browser):
+    c = await browser.capture(site.url("/"), "desktop", click_through=True)
+    assert len(c.clicks) == 1 and c.clicks[0].label.lower() == "sign in"
+    click = c.clicks[0]
+    assert click.page.final_url == site.url("/login") and b'type="password"' in click.dom
+    assert click.page.profile == "desktop-click1" and click.page.outcome == "live"
+    assert click.page.http_status == 200 and click.screenshot.startswith(b"\x89PNG")
+    # the landing page itself is unchanged, and the click's exchanges share its WARC
+    assert c.page.final_url == site.url("/") and b"Welcome" in c.dom
+    uris = [r.rec_headers.get_header("WARC-Target-URI")
+            for r in ArchiveIterator(io.BytesIO(c.warc)) if r.rec_type == "response"]
+    assert site.url("/login") in uris
+
+
+@module_loop
+async def test_click_through_capped_at_three(site, browser):
+    c = await browser.capture(site.url("/many"), "desktop", click_through=True)
+    assert [k.page.profile for k in c.clicks] == ["desktop-click1", "desktop-click2",
+                                                  "desktop-click3"]
+    assert [k.page.final_url for k in c.clicks] == [site.url(f"/login?n={i}") for i in range(3)]
+    assert all(k.label == "Log in" for k in c.clicks)
+
+
+@module_loop
+async def test_click_through_follows_popup(site, browser):
+    c = await browser.capture(site.url("/popup"), "desktop", click_through=True)
+    assert len(c.clicks) == 1 and c.clicks[0].page.final_url == site.url("/login")
+    assert b'type="password"' in c.clicks[0].dom
+
+
+@module_loop
+async def test_no_click_through_by_default(site, browser):
+    c = await browser.capture(site.url("/"), "desktop")
+    assert c.clicks == ()
+    assert "/login" not in site.paths_requested
+
+
+@module_loop
+async def test_click_through_element_gone_is_error(site, browser):
+    # the login link is only there on the first visit of this context
+    c = await browser.capture(site.url("/once"), "desktop", click_through=True)
+    assert len(c.clicks) == 1 and c.clicks[0].label == "Login"
+    assert c.clicks[0].page.outcome == "error" and "not found" in c.clicks[0].page.error
+    assert c.clicks[0].dom is None
+
+
+@module_loop
+async def test_click_through_to_dead_host(site, browser):
+    c = await browser.capture(site.url("/dead"), "desktop", click_through=True)
+    assert c.clicks[0].page.outcome == "dns_fail" and c.clicks[0].page.final_url is None
+    assert "ERR_NAME_NOT_RESOLVED" in c.clicks[0].page.error

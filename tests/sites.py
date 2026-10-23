@@ -25,6 +25,13 @@ PAGES = {
                       b'["architecture", "model", "platformVersion", "fullVersionList"])'
                       b'.then(v => { document.body.textContent = JSON.stringify(v); });'
                       b'</script></body></html>'),
+    "/many": (200, [], b'<html><body>' + b''.join(
+        b'<p><a href="/login?n=%d">Log in</a></p>' % i for i in range(5)) + b'</body></html>'),
+    "/popup": (200, [], b'<html><body><a href="/login" target="_blank">Login</a></body></html>'),
+    "/once": (200, [], b'<html><body><script>if (!document.cookie.includes("seen")) {'
+                       b'document.cookie = "seen=1"; document.write(\'<a href="/login">Login</a>\');'
+                       b'}</script></body></html>'),
+    "/dead": (200, [], b'<html><body><a href="http://nonexistent.invalid/">Sign in</a></body></html>'),
     "/apk": (200, [("Content-Type", "application/vnd.android.package-archive"),
                    ("Content-Disposition", 'attachment; filename="app.apk"')], b"PK\x03\x04" * 64),
 }
@@ -51,7 +58,7 @@ def _handler(site: Site):
             if self.path == "/never":  # a dead tracker: no answer until teardown
                 site.release.wait(30)
                 return
-            status, headers, body = PAGES.get(self.path, (404, [], b"<html>not found</html>"))
+            status, headers, body = PAGES.get(self.path.split("?")[0], (404, [], b"<html>not found</html>"))
             self.send_response(status)
             if not any(n == "Content-Type" for n, _ in headers):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
