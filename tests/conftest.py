@@ -8,6 +8,8 @@ import pytest_asyncio
 
 from hakapik.db import connect, migrate
 
+pytest_plugins = ["sites"]  # the local test site and shared browser fixtures
+
 
 def _test_db_url() -> str:
     """Return HAKAPIK_TEST_DB, skipping if unset and failing if unsafe.
