@@ -13,8 +13,7 @@ first-seen:
 - drops renewals, wildcards, top-list apexes and shared-hosting apexes,
 - mirrors raw entries into a content-addressed blob store with a Postgres
   index, and emits the remaining first-seen names as fetch candidates,
-- reports per-log, per-day volumes so the later stages can be sized from
-  measurements rather than estimates.
+- reports per-log, per-day volumes (`hakapik stats`).
 
 The design and the literature it rests on are in
 `docs/superpowers/specs/2026-10-23-hakapik-design.md`; the implementation
@@ -54,5 +53,5 @@ Database tests need a Postgres database whose name ends in `_test`; see
 
 ## Status
 
-Ingest and first-seen are implemented and reviewed. The measurement run that
-sizes the next stages (fetch, embed, cluster, score, feed) is in progress.
+Ingest and first-seen are implemented and reviewed. Next: resolve and fetch.
+No measuring run gates the later stages; their sizes are configuration.
