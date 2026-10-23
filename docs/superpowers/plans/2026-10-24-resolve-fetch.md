@@ -6,7 +6,7 @@
 
 **Architecture:** Postgres holds the job queue (`fetch_job`, claimed with `FOR UPDATE SKIP LOCKED` and a lease) and the append-only results (`attempt`, `dns_answer`, `artifact`, `blob`, `manifest`). The worker role (`hakapik.worker`) takes a `Job`, resolves the name with dnspython, renders it with Playwright Chromium, writes blobs, and returns an Ed25519-signed result envelope. The head (`hakapik.store`) verifies the signature and every blob hash before writing anything. `hakapik fetch` runs the head's scheduler and its own worker role in one process; `hakapik enqueue` adds names by hand, so no tail is needed.
 
-**Tech Stack:** Python 3.13, uv, psycopg 3, playwright (Chromium, `channel="chromium"`), dnspython, warcio, cryptography (Ed25519), pytest, pytest-asyncio.
+**Tech Stack:** Python 3.13, uv, psycopg 3, playwright (Chromium, `channel="chromium"`), dnspython, warcio, cryptography (Ed25519), maxminddb, pytest, pytest-asyncio, mmdb-writer (tests only).
 
 **Spec:** `docs/superpowers/specs/2026-10-23-hakapik-design.md` (sections 5.2 re-check rule, 5.4, 5.5, 6, 7, 8, and 11 items 6 and 7). Literature numbers: `docs/literature/README.md`.
 
@@ -48,14 +48,15 @@ src/hakapik/
   browser.py         # Browser, Capture, profiles, classify(), click-through (Task 6, 7)
   worker.py          # run_job: the worker role (Task 8)
   store.py           # register_node, store_result, write_manifest (Task 9)
-  fetchloop.py       # run_fetch: head scheduler + own worker role (Task 10)
-  cli.py             # + enqueue, fetch, show (Task 11)
+  asn.py             # AsnDb over a GeoLite2-ASN .mmdb (Task 10)
+  fetchloop.py       # run_fetch: head scheduler + own worker role (Task 11)
+  cli.py             # + enqueue, fetch, show (Task 12)
 tests/
   conftest.py        # + new tables in the DROP list
   dnsserver.py       # tiny UDP DNS responder for resolver tests (Task 5)
   sites.py           # local HTTP test site for browser tests (Task 6)
   test_protocol.py test_jobs.py test_recheck.py test_resolve.py test_warc.py
-  test_browser.py test_worker.py test_store.py test_fetchloop.py test_cli_fetch.py
+  test_browser.py test_worker.py test_store.py test_asn.py test_fetchloop.py test_cli_fetch.py
 ```
 
 ---
@@ -68,7 +69,7 @@ tests/
 
 **Interfaces:**
 - Produces: `Config` fields (all optional in TOML):
-  `fetch_workers: int = 2`, `fetch_per_ip_interval_s: float | None = None`, `fetch_daily_cap: int | None = None`, `fetch_proxy: str | None = None`, `egress_address: str | None = None`, `resolver_nameservers: tuple[str, ...] = ()`, `retry_ladder_s: tuple[int, ...] = (0, 120, 600, 3600, 21600, 86400)`, `recheck_days: int = 30`, `queue_cap: int | None = None`, `ageout_hours: float = 24.0`, `nav_timeout_s: float = 30.0`, `lease_s: int = 600`.
+  `fetch_workers: int = 2`, `fetch_per_ip_interval_s: float | None = None`, `fetch_daily_cap: int | None = None`, `fetch_proxy: str | None = None`, `egress_address: str | None = None`, `resolver_nameservers: tuple[str, ...] = ()`, `retry_ladder_s: tuple[int, ...] = (0, 120, 600, 3600, 21600, 86400)`, `recheck_days: int = 30`, `queue_cap: int | None = None`, `ageout_hours: float = 24.0`, `nav_timeout_s: float = 30.0`, `lease_s: int = 600`, `asn_mmdb: Path | None = None` (path to a GeoLite2-ASN `.mmdb` the operator supplies).
 - Produces: the tables below, created by `migrate()`; `CandidateRow` gains `reason: str = "first_seen"`, and its `log_id`, `log_index`, `cert_key`, `first_seen_ms` become `| None`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -143,6 +144,7 @@ CREATE TABLE IF NOT EXISTS attempt (
   started_at timestamptz NOT NULL, finished_at timestamptz NOT NULL,
   outcome text NOT NULL, http_status int, final_url text, error text,
   envelope_sha256 text NOT NULL REFERENCES blob(sha256),
+  asn bigint, asn_org text, asn_db_sha256 text REFERENCES blob(sha256),   -- head-side enrichment (Task 10)
   UNIQUE (job_id, step));
 CREATE TABLE IF NOT EXISTS dns_answer (
   id bigserial PRIMARY KEY, attempt_id bigint NOT NULL REFERENCES attempt(id),
@@ -552,7 +554,8 @@ async def test_ip_spacer_waits(): ...                         # interval 0.2: se
 async def register_node(conn, node_id: str, public_key: bytes) -> None   # insert; same key again is a no-op;
                                                                           # a different key for a known id raises ValueError
 class ResultRejected(Exception)
-async def store_result(conn, bs: BlobStore, envelope: bytes, ladder: tuple[int, ...]) -> int | None
+async def store_result(conn, bs: BlobStore, envelope: bytes, ladder: tuple[int, ...],
+                       asn_db: AsnDb | None = None) -> int | None   # asn_db used from Task 10 on
 async def write_manifest(conn, bs: BlobStore, candidate_id: int) -> str  # returns the new manifest's sha256
 ```
 
@@ -598,21 +601,70 @@ async def test_register_node_conflicting_key_raises(conn): ...
 
 ---
 
-### Task 10: Fetch loop
+### Task 10: ASN enrichment (spec 5.5)
+
+**Files:**
+- Create: `src/hakapik/asn.py`
+- Modify: `src/hakapik/store.py`
+- Test: `tests/test_asn.py`, `tests/test_store.py`
+- `uv add maxminddb`; `uv add --dev mmdb-writer netaddr`
+
+**Interfaces:**
+- Produces:
+```python
+@dataclass(frozen=True) class AsnHit:
+    asn: int; org: str | None
+class AsnDb:
+    @classmethod
+    def load(cls, path: Path, bs: BlobStore) -> AsnDb
+        # copies the .mmdb file into bs (media type application/vnd.maxmind.mmdb) and keeps its sha256,
+        # so every recorded ASN points at the exact snapshot that produced it
+    sha256: str
+    build_epoch: int                         # from the file's metadata, logged at load
+    def lookup(self, ip: str) -> AsnHit | None   # None for unknown, private or malformed addresses
+```
+- `store_result(..., asn_db)`: the looked-up address is the mobile page's `server_ip`, or failing that the first address from `addresses(result.dns, fqdn)`. The attempt row gets `asn`, `asn_org`, and `asn_db_sha256` (`asn_db.sha256`; `blob` row inserted). With no `asn_db` or no address, the three columns are null.
+
+The ASN is head-side enrichment, not part of the signed worker result: it derives from the IP, not from the vantage, and keeping the database on the head means workers need no data file.
+
+The operator supplies the file (GeoLite2-ASN from MaxMind, under its own licence and account) and refreshes it by replacing the file; `run_fetch` loads it at start. If `asn_mmdb` is unset or the file is missing, `run_fetch` logs one warning and stores null ASNs.
+
+- [ ] **Step 1: Write the failing tests** (build a tiny `.mmdb` in `tmp_path` with `mmdb_writer.MMDBWriter(ip_version=6, database_type="GeoLite2-ASN", ipv4_compatible=True)`, mapping `1.2.3.0/24` to `{"autonomous_system_number": 64500, "autonomous_system_organization": "Example AS"}`)
+
+```python
+def test_lookup_hit_and_miss(tmp_path):
+    db = AsnDb.load(_mmdb(tmp_path), BlobStore(tmp_path / "blobs"))
+    assert db.lookup("1.2.3.4") == AsnHit(64500, "Example AS")
+    assert db.lookup("8.8.8.8") is None and db.lookup("not-an-ip") is None
+def test_snapshot_stored_in_blobstore(tmp_path):
+    bs = BlobStore(tmp_path / "blobs"); db = AsnDb.load(_mmdb(tmp_path), bs)
+    assert hashlib.sha256(bs.path(db.sha256).read_bytes()).hexdigest() == db.sha256
+async def test_store_records_asn(conn, tmp_path):
+    # result whose mobile page has server_ip 1.2.3.4 -> attempt.asn == 64500, asn_db_sha256 == db.sha256
+async def test_store_without_asn_db_leaves_nulls(conn, tmp_path): ...
+```
+
+- [ ] **Step 2: Run, verify FAIL. Step 3: Implement. Step 4: Run `uv run pytest tests/test_asn.py tests/test_store.py -v -W error`, verify PASS.**
+
+- [ ] **Step 5: Commit** — `git commit -m "feat: ASN enrichment from a versioned GeoLite2-ASN snapshot"`
+
+---
+
+### Task 11: Fetch loop
 
 **Files:**
 - Create: `src/hakapik/fetchloop.py`
 - Test: `tests/test_fetchloop.py`
 
 **Interfaces:**
-- Consumes: everything above; `ConnPool` from `ingest.py`.
+- Consumes: everything above, including `AsnDb` (Task 10); `ConnPool` from `ingest.py`.
 - Produces:
 ```python
 async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=None,
                     once: bool = False) -> None
 ```
 
-On start: `migrate`, `NodeKey.load_or_create(cfg.data_dir / "node.key")`, and `register_node` for the head's own key, so the head is its own trusted worker. Defaults when not injected: `Resolver(cfg.resolver_nameservers)` and `Browser(proxy=cfg.fetch_proxy, nav_timeout_s=cfg.nav_timeout_s)`.
+On start: `migrate`, `NodeKey.load_or_create(cfg.data_dir / "node.key")`, and `register_node` for the head's own key, so the head is its own trusted worker. Loads `AsnDb` from `cfg.asn_mmdb` if set and present (else one warning) and passes it to every `store_result`. Defaults when not injected: `Resolver(cfg.resolver_nameservers)` and `Browser(proxy=cfg.fetch_proxy, nav_timeout_s=cfg.nav_timeout_s)`.
 
 Each iteration:
 1. `sweep(ageout_hours, queue_cap)`.
@@ -641,7 +693,7 @@ async def test_daily_cap_blocks_claims(conn, tmp_path): ...   # fetch_daily_cap=
 
 ---
 
-### Task 11: CLI and docs
+### Task 12: CLI and docs
 
 **Files:**
 - Modify: `src/hakapik/cli.py`, `README.md`, `docs/testing.md`, `hakapik.example.toml`
@@ -670,6 +722,7 @@ def test_show_after_enqueue(cfg_file, capsys): ...   # lists reason manual, stat
 README:
 - Quick start gains `uv run playwright install chromium --no-shell`, `hakapik enqueue example.com`, `hakapik fetch`, `hakapik show example.com`.
 - One paragraph: `fetch` contacts the sites from this machine's address (or `fetch_proxy`), and rate limits are off unless configured.
+- ASN: set `asn_mmdb` to a GeoLite2-ASN file (MaxMind account; refresh by replacing the file); without it ASNs are null.
 - Status: resolve and fetch implemented.
 
 `docs/testing.md`: browser tests need the Chromium install and skip without it.
@@ -691,7 +744,6 @@ Run: `uv run pytest -W error` → all pass, browser tests not skipped on this ma
 
 ## Not in this plan (and where it goes)
 
-- ASN of the resolved address (spec 5.5 lists it beside the IP): needs an IP-to-ASN source (an offline table such as iptoasn, or Team Cymru over DNS). It goes to the T0 plan with the other infrastructure features; the IP is stored here.
 
 - T0 ranking: `fetch_job.priority` is the hook; it stays 0 until the T0 plan.
 - Parked and hosting-default classification: an attempt reaching such a page is `live` here. The fingerprint stage appends the classification as new rows.
