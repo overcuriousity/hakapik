@@ -1,7 +1,7 @@
 # Testing
 
 Run `uv run pytest -W error`; tests that need Postgres skip unless
-`HAKAPIK_TEST_DB` is set. The `conn` fixture truncates every table, so it
+`HAKAPIK_TEST_DB` is set. The `conn` fixture drops and recreates every table, so it
 refuses (fails the test) any database whose name does not end in `_test`:
 never point it at the live `hakapik` database. Create the test database once
 with `docker exec hakapik-postgres-1 psql -U hakapik -d hakapik -c 'CREATE DATABASE hakapik_test'`

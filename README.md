@@ -32,15 +32,16 @@ uv sync
 docker compose up -d                       # Postgres 17
 cp hakapik.example.toml hakapik.toml       # set data_dir and database_url
 curl -sSL https://tranco-list.eu/top-1m.csv.zip | funzip > "$DATA_DIR/tranco.csv"
-uv run hakapik --config hakapik.toml bootstrap   # index the last N days
-uv run hakapik --config hakapik.toml tail        # follow all logs live
-uv run hakapik --config hakapik.toml stats       # per-log, per-day volumes
+uv run hakapik --config hakapik.toml tail     # follow all logs live
+uv run hakapik --config hakapik.toml stats    # per-log, per-day volumes
 uv run hakapik --config hakapik.toml sample --n 200 --out candidates.csv
-uv run hakapik --config hakapik.toml prune       # apply raw-entry retention
+uv run hakapik --config hakapik.toml prune    # apply raw-entry retention
 ```
 
-`bootstrap` must finish for a log before `tail` emits candidates for it;
-`tail` skips logs that were never bootstrapped and says so.
+There is no history backfill. `tail` starts each log it has not seen before
+at the log's current tree size and emits candidates from its first batch on;
+the first-seen index fills from the live stream, so early candidates include
+names that are not actually new, and that share falls as the index grows.
 
 ## Tests
 
