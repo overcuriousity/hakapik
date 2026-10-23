@@ -1,5 +1,7 @@
 import hashlib
 
+import pytest
+
 from hakapik.blobstore import BlobStore
 
 
@@ -18,3 +20,11 @@ def test_blobstore_open_reads_back_and_leaves_no_temp_files(tmp_path):
     with bs.open(h) as f:
         assert f.read() == b"payload"
     assert [p.name for p in bs.path(h).parent.iterdir()] == [h]
+
+
+@pytest.mark.parametrize(
+    "bad", ["", "ab", "../" + "a" * 61, "A" * 64, "g" * 64, "a" * 63, "a" * 65, "a" * 63 + "\n"]
+)
+def test_blobstore_path_rejects_non_digest(tmp_path, bad):
+    with pytest.raises(ValueError):
+        BlobStore(tmp_path).path(bad)

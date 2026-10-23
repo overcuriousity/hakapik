@@ -3,6 +3,7 @@
 No function here commits; the caller owns the transaction.
 """
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import date
@@ -11,6 +12,8 @@ import psycopg
 from psycopg.rows import dict_row
 
 from hakapik.blobstore import BlobStore
+
+_log = logging.getLogger(__name__)
 
 _SCHEMA = [
     """CREATE TABLE IF NOT EXISTS log_cursor (
@@ -219,7 +222,11 @@ async def prune_raw(
         )
         if await cur.fetchone():
             continue
-        path = bs.path(sha)
+        try:
+            path = bs.path(sha)
+        except ValueError:
+            _log.warning("raw_batch row holds an invalid blob digest %r; not unlinking", sha)
+            continue
         try:
             os.chmod(path, 0o644)
             path.unlink()

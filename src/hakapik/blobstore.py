@@ -7,9 +7,12 @@ clarity but is not recorded here; callers record it in Postgres.
 
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import BinaryIO
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
 class BlobStore:
@@ -17,6 +20,12 @@ class BlobStore:
         self.root = Path(root)
 
     def path(self, hexdigest: str) -> Path:
+        """Path of a blob; ``hexdigest`` must be 64 lowercase hex characters.
+
+        Validated because callers (``prune_raw``) build paths from DB values.
+        """
+        if not isinstance(hexdigest, str) or not _HEX64.fullmatch(hexdigest):
+            raise ValueError(f"not a SHA-256 hex digest: {hexdigest!r}")
         return self.root / hexdigest[:2] / hexdigest[2:4] / hexdigest
 
     def put(self, data: bytes, media_type: str) -> str:
