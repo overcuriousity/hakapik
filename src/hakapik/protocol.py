@@ -98,18 +98,53 @@ def result_to_json(r: AttemptResult) -> bytes:
     return canonical_json(dataclasses.asdict(r))
 
 
-def _rebuild(cls, d: dict):
-    """Build ``cls`` from ``d``, turning lists back into tuples (strict keys)."""
-    d = {k: tuple(v) if isinstance(v, list) else v for k, v in d.items()}
-    return cls(**d)
+# Field kinds: s=str, i=int, T=list of str, O=outcome; trailing "?" allows null.
+_SPECS = {
+    DnsAnswer: dict(qname="s", rrtype="s", rcode="s", ttl="i?", answers="T",
+                    resolver="s", queried_at="s"),
+    PageResult: dict(profile="s", outcome="O", http_status="i?", final_url="s?",
+                     server_ip="s?", redirects="T", error="s?", started_at="s",
+                     finished_at="s"),
+    BlobRef: dict(profile="s", kind="s", sha256="s", size="i", media_type="s"),
+}
+_TOP = dict(job_id="i", step="i", node_id="s", egress_address="s?", started_at="s",
+            finished_at="s", outcome="O", error="s?")
+
+
+def _check(name: str, kind: str, v):
+    if v is None and kind.endswith("?"):
+        return None
+    k = kind.rstrip("?")
+    if k == "s" and isinstance(v, str):
+        return v
+    if k == "i" and isinstance(v, int) and not isinstance(v, bool):
+        return v
+    if k == "O" and v in OUTCOMES:
+        return v
+    if k == "T" and isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return tuple(v)
+    raise ValueError(f"bad value for {name}: {v!r}")
+
+
+def _build(cls, d, spec):
+    if not isinstance(d, dict) or set(d) != set(spec):
+        raise ValueError(f"bad fields for {cls.__name__}")
+    return {k: _check(k, spec[k], d[k]) for k in spec}
 
 
 def result_from_json(b: bytes) -> AttemptResult:
-    d = json.loads(b)
-    d["dns"] = tuple(_rebuild(DnsAnswer, x) for x in d["dns"])
-    d["pages"] = tuple(_rebuild(PageResult, x) for x in d["pages"])
-    d["blobs"] = tuple(_rebuild(BlobRef, x) for x in d["blobs"])
-    return AttemptResult(**d)
+    try:
+        d = json.loads(b)
+    except RecursionError as e:
+        raise ValueError("payload nested too deeply") from e
+    if not isinstance(d, dict) or set(d) != set(_TOP) | {"dns", "pages", "blobs"}:
+        raise ValueError("bad fields for AttemptResult")
+    kw = _build(AttemptResult, {k: d[k] for k in _TOP}, _TOP)
+    for name, cls in (("dns", DnsAnswer), ("pages", PageResult), ("blobs", BlobRef)):
+        if not isinstance(d[name], list):
+            raise ValueError(f"{name} must be a list")
+        kw[name] = tuple(cls(**_build(cls, x, _SPECS[cls])) for x in d[name])
+    return AttemptResult(**kw)
 
 
 def _node_id(public_key: bytes) -> str:
@@ -167,7 +202,7 @@ def open_envelope(env: bytes,
         sig = base64.b64decode(sig_b64, validate=True)
     except BadEnvelope:
         raise
-    except (ValueError, KeyError, TypeError, binascii.Error) as e:
+    except (ValueError, KeyError, TypeError, RecursionError, binascii.Error) as e:
         raise BadEnvelope(f"malformed envelope: {e}") from e
     pub = public_key_for(node_id)
     if pub is None:
@@ -178,7 +213,7 @@ def open_envelope(env: bytes,
         raise BadEnvelope(f"bad signature or key: {e!r}") from e
     try:
         r = result_from_json(payload)
-    except (ValueError, KeyError, TypeError) as e:
+    except (ValueError, KeyError, TypeError, RecursionError) as e:
         raise BadEnvelope(f"malformed payload: {e}") from e
     if r.node_id != node_id:
         raise BadEnvelope("payload node_id does not match envelope node_id")

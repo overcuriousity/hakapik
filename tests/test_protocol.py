@@ -121,3 +121,55 @@ def test_signed_garbage_payload_rejected(tmp_path):
 
 def test_canonical_json_is_stable():
     assert canonical_json({"b": 1, "a": "ü"}) == b'{"a":"\\u00fc","b":1}'
+
+
+def _signed(tmp_path, payload: bytes):
+    k = NodeKey.load_or_create(tmp_path / "node.key")
+    env = canonical_json({
+        "node_id": k.node_id,
+        "payload": base64.b64encode(payload).decode(),
+        "signature": base64.b64encode(k.sign(payload)).decode(),
+    })
+    return env, {k.node_id: k.public_key}.get, k
+
+
+def _mutated(nid, **over):
+    d = json.loads(result_to_json(_result(node_id=nid)))
+    d.update(over)
+    return json.dumps(d).encode()
+
+
+@pytest.mark.parametrize("over", [
+    {"dns": [1]}, {"pages": ["x"]}, {"blobs": [None]}, {"dns": "abc"},
+    {"pages": {"a": 1}}, {"outcome": "bogus"}, {"job_id": "7"}, {"job_id": True},
+    {"step": 1.5}, {"node_id": 5}, {"error": 3}, {"egress_address": []},
+    {"dns": [{"qname": "a"}]},
+])
+def test_signed_wrong_shapes_rejected(tmp_path, over):
+    k = NodeKey.load_or_create(tmp_path / "node.key")
+    env, pk, _ = _signed(tmp_path, _mutated(k.node_id, **over))
+    with pytest.raises(BadEnvelope):
+        open_envelope(env, pk)
+
+
+def test_signed_nested_field_types_rejected(tmp_path):
+    k = NodeKey.load_or_create(tmp_path / "node.key")
+    base = json.loads(result_to_json(_result(node_id=k.node_id)))
+    cases = [
+        ("pages", 0, "outcome", "bogus"), ("pages", 0, "http_status", "200"),
+        ("pages", 0, "redirects", "abc"), ("pages", 0, "redirects", [1]),
+        ("dns", 0, "ttl", True), ("dns", 0, "answers", [1]),
+        ("blobs", 0, "size", "12"), ("blobs", 0, "sha256", None),
+    ]
+    for sec, i, f, v in cases:
+        d = json.loads(json.dumps(base))
+        d[sec][i][f] = v
+        env, pk, _ = _signed(tmp_path, json.dumps(d).encode())
+        with pytest.raises(BadEnvelope):
+            open_envelope(env, pk)
+
+
+def test_deeply_nested_payload_rejected(tmp_path):
+    env, pk, _ = _signed(tmp_path, b"[" * 100000 + b"]" * 100000)
+    with pytest.raises(BadEnvelope):
+        open_envelope(env, pk)
