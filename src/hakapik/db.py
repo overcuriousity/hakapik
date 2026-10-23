@@ -200,9 +200,14 @@ async def add_candidates(
 ) -> None:
     async with conn.cursor() as cur:
         await cur.executemany(
-            """INSERT INTO candidate
-                 (fqdn, registrable, log_id, log_index, cert_key, first_seen_ms, reason)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+            """WITH c AS (
+                 INSERT INTO candidate
+                   (fqdn, registrable, log_id, log_index, cert_key, first_seen_ms, reason)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s)
+                 RETURNING id, fqdn, registrable, created_at)
+               INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
+               SELECT id, fqdn, registrable, created_at FROM c
+               ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING""",
             [
                 (r.fqdn, r.registrable, r.log_id, r.log_index, r.cert_key, r.first_seen_ms, r.reason)
                 for r in rows
