@@ -32,6 +32,17 @@ PAGES = {
                        b'document.cookie = "seen=1"; document.write(\'<a href="/login">Login</a>\');'
                        b'}</script></body></html>'),
     "/dead": (200, [], b'<html><body><a href="http://nonexistent.invalid/">Sign in</a></body></html>'),
+    "/stall-login": (200, [], b'<html><body><a href="/login">Sign in</a><img src="/never">'
+                              b'</body></html>'),
+    # the first visit of a context shows one label, later visits another
+    "/relabel": (200, [], b'<html><body><script>document.write(document.cookie.includes("seen")'
+                          b' ? \'<a href="/login">Log in</a>\' : \'<a href="/login">Sign in</a>\');'
+                          b'document.cookie = "seen=1";</script></body></html>'),
+    # later visits swap the order of the two login links
+    "/swap": (200, [], b'<html><body><script>const a = \'<a href="/login?via=log">Log in</a>\','
+                       b' b = \'<a href="/login?via=sign">Sign in</a>\';'
+                       b'document.write(document.cookie.includes("seen") ? b + a : a + b);'
+                       b'document.cookie = "seen=1";</script></body></html>'),
     "/apk": (200, [("Content-Type", "application/vnd.android.package-archive"),
                    ("Content-Disposition", 'attachment; filename="app.apk"')], b"PK\x03\x04" * 64),
 }

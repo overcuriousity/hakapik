@@ -68,8 +68,9 @@ DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
 _BLANK = ("about:blank", "chrome-error:")
 
 # Visible login elements in document order: with n < 0 their labels, else
-# the n-th element itself (null if there is none).
-_LOGIN_JS = """([pattern, n]) => {
+# the n-th element if its label is still ``label``, else the first element
+# with that label, else null.
+_LOGIN_JS = """([pattern, n, label]) => {
   const re = new RegExp(pattern, "i");
   const found = [];
   for (const el of document.querySelectorAll("a, button, input[type=submit], [role=button]")) {
@@ -80,7 +81,9 @@ _LOGIN_JS = """([pattern, n]) => {
     if (re.test(text)) found.push([el, text.slice(0, %d)]);
   }
   if (n < 0) return found.slice(0, %d).map(f => f[1]);
-  return n < found.length ? found[n][0] : null;
+  if (n < found.length && found[n][1] === label) return found[n][0];
+  const same = found.find(f => f[1] === label);
+  return same ? same[0] : null;
 }""" % (MAX_LABEL, MAX_CLICKS)
 
 
@@ -254,6 +257,10 @@ class _Recorder:
         return out
 
 
+class _ClickFailed(Exception):
+    """A click hop that cannot click; its message is the reason."""
+
+
 class Browser:
     def __init__(self, *, proxy: str | None, nav_timeout_s: float, settle_s: float = 3.0):
         self.proxy = proxy
@@ -348,22 +355,28 @@ class Browser:
 
     async def _click(self, context, rec: _Recorder, url: str, profile: str, n: int,
                      label: str, deadline: float) -> ClickCapture:
-        """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks its
-        n-th login element and captures where that leads, all by ``deadline``.
+        """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks the
+        login element labelled ``label`` (the n-th, unless the page moved it)
+        and captures where that leads, all by ``deadline``.
 
-        The landing page is frozen, hence the new page. If the click opened a
-        popup, the first popup is captured instead of the page. Nothing on the
-        clicked page is clicked. A failed click is outcome "error".
+        The landing page is frozen, hence the new page. Navigation steps leave
+        a third of nav_timeout_s for the evidence; the replay of ``url`` waits
+        for DOMContentLoaded only, at most a third of nav_timeout_s, so a dead
+        tracker cannot use up the hop. If the click opened a popup, the first
+        one is captured instead of the page. Nothing on the clicked page is
+        clicked. A failed click is outcome "error".
         """
         loop = asyncio.get_running_loop()
         started = _now()
         bounded = functools.partial(self._bounded, deadline=deadline)
+        reserve = self.nav_timeout_s / 3
 
-        def left() -> float:
-            return max(deadline - loop.time(), 0.001)
+        def left() -> float:  # for navigation steps: the evidence keeps its reserve
+            return max(deadline - reserve - loop.time(), 0.001)
 
-        error = status = server_ip = final_url = None
-        load_timeout = clicked = False
+        notes: list[str] = []  # evidence kept all the same, as on the landing page
+        nav_error = status = server_ip = final_url = None
+        clicked = False
         screenshot = dom = None
         nav = _Nav()
         try:
@@ -373,52 +386,66 @@ class Browser:
             page.on("popup", lambda p: popups.append(p))
             cdp = await asyncio.wait_for(self.prepare_page(context, page, profile), left())
             try:
-                await page.goto(url, wait_until="load", timeout=left() * 1000)
+                await page.goto(url, wait_until="domcontentloaded",
+                                timeout=min(left(), reserve) * 1000)
             except PlaywrightTimeout:
                 if not nav.responses:
                     raise
             await asyncio.sleep(min(self.settle_s, left()))
             handle = await asyncio.wait_for(
-                page.evaluate_handle(_LOGIN_JS, [LOGIN_PATTERN.pattern, n]), left())
+                page.evaluate_handle(_LOGIN_JS, [LOGIN_PATTERN.pattern, n, label]), left())
             if (element := handle.as_element()) is None:
-                raise LookupError(f"login element {n + 1} not found again")
+                raise _ClickFailed("element changed")
+            popups.clear()  # only a popup of the click counts, not the landing's own
             await asyncio.wait_for(element.click(timeout=left() * 1000), left())
             clicked = True
+        except _ClickFailed as e:
+            nav_error = f"click failed: {e}"
         except Exception as e:  # anything the page does; the hop's budget included
-            error = f"click failed: {_error_text(e)}"
+            nav_error = f"click failed: {_error_text(e)}"
         if clicked:
             target = page
             try:
                 await asyncio.wait_for(
                     page.wait_for_load_state("load", timeout=left() * 1000), left())
-                await asyncio.sleep(min(self.settle_s, left()))
-                if popups:
-                    # both or neither: the freeze must reach the captured page
-                    target, cdp = popups[0], await asyncio.wait_for(
-                        context.new_cdp_session(popups[0]), left())
+            except (PlaywrightError, TimeoutError):
+                notes.append("load timeout")
+            await asyncio.sleep(min(self.settle_s, left()))
+            if popups:
+                target = popups[0]
+                try:
+                    cdp = await asyncio.wait_for(context.new_cdp_session(target), left())
+                except (PlaywrightError, TimeoutError) as e:
+                    cdp = None
+                    notes.append(f"popup not frozen: {_error_text(e)}")
+                try:
                     await asyncio.wait_for(
                         target.wait_for_load_state("load", timeout=left() * 1000), left())
-            except (PlaywrightError, TimeoutError):
-                load_timeout = True  # evidence all the same, as on the landing page
-                error = "load timeout"
+                except (PlaywrightError, TimeoutError):
+                    notes.append("popup load timeout")
             nav = rec.nav(target)
             if target.url.startswith("chrome-error:"):
-                error = nav.failure or "navigation failed"
-                load_timeout = False
+                nav_error = nav.failure or "navigation failed"
             else:
-                await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
-                await bounded(cdp.send("Page.stopLoading"))
-                screenshot = await bounded(target.screenshot(type="png", timeout=left() * 1000))
+                if cdp is not None:
+                    await bounded(cdp.send("Emulation.setScriptExecutionDisabled",
+                                           {"value": True}))
+                    await bounded(cdp.send("Page.stopLoading"))
+                screenshot = await bounded(target.screenshot(
+                    type="png", timeout=max(deadline - loop.time(), 0.001) * 1000))
             if not target.url.startswith(_BLANK):
                 final_url = target.url
+            elif not nav_error:  # e.g. a popup that never got a document
+                nav_error = "no document"
             if (resp := nav.response_for(final_url)) is not None:
                 status = resp.status
                 server_ip = ((await bounded(resp.server_addr())) or {}).get("ipAddress")
             content = await bounded(target.content())
             dom = content.encode("utf-8") if content is not None else None
-            outcome = classify(None if load_timeout else error, status)
+            outcome = classify(nav_error, status)
         else:
             outcome = "error"
+        error = "; ".join(([nav_error] if nav_error else []) + notes) or None
         return ClickCapture(label=label, screenshot=screenshot, dom=dom, page=PageResult(
             profile=f"{profile}-click{n + 1}", outcome=outcome, http_status=status,
             final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),
@@ -431,7 +458,7 @@ class Browser:
         context = await self._browser.new_context(**settings, accept_downloads=False)
         rec = _Recorder()
         nav = _Nav()  # replaced by the page's once it exists
-        popups: list[asyncio.Task] = []
+        hint_tasks: list[asyncio.Task] = []  # prepare_page of pages the site opens
         error = status = server_ip = final_url = deadline = None
         load_timeout = False
         screenshot = dom = None
@@ -451,7 +478,7 @@ class Browser:
             # Pages the site opens itself get the same client hints (best effort:
             # a popup's first request may leave before this lands). Our own click
             # pages get them twice, with the same values.
-            context.on("page", lambda p: popups.append(
+            context.on("page", lambda p: hint_tasks.append(
                 asyncio.ensure_future(self.prepare_page(context, p, profile))))
             try:
                 await page.goto(url, wait_until="load", timeout=self.nav_timeout_s * 1000)
@@ -488,14 +515,25 @@ class Browser:
                 cert_chain = tuple(base64.b64decode(c) for c in (cert or {}).get("tableNames", ()))
             labels = []
             if click_through and navigated and dom is not None:
-                found = await bounded(page.evaluate(_LOGIN_JS, [LOGIN_PATTERN.pattern, -1]))
+                found = await bounded(
+                    page.evaluate(_LOGIN_JS, [LOGIN_PATTERN.pattern, -1, None]))
                 labels = [str(x)[:MAX_LABEL] for x in found[:MAX_CLICKS]] if isinstance(
                     found, list) else []
             for n, label in enumerate(labels):
                 # Each hop has its own budget; the drain below gets what is
                 # left of the last one.
                 deadline = loop.time() + self.nav_timeout_s + self.settle_s
-                clicks.append(await self._click(context, rec, url, profile, n, label, deadline))
+                hop_started = _now()
+                try:
+                    click = await self._click(context, rec, url, profile, n, label, deadline)
+                except Exception as e:  # one hop's bug never costs the landing or other hops
+                    log.warning("click hop %d of %s failed", n + 1, url, exc_info=True)
+                    click = ClickCapture(label=label, screenshot=None, dom=None, page=PageResult(
+                        profile=f"{profile}-click{n + 1}", outcome="error", http_status=None,
+                        final_url=None, server_ip=None, redirects=(),
+                        error=f"click failed: {_error_text(e)}",
+                        started_at=_rfc3339(hop_started), finished_at=_rfc3339(_now())))
+                clicks.append(click)
         except Exception as e:  # a crashed page or target; still a result
             log.warning("capture of %s failed", url, exc_info=True)
             error = error or _error_text(e)
@@ -506,9 +544,9 @@ class Browser:
             drain = (self.nav_timeout_s if deadline is None
                      else max(deadline - loop.time(), DRAIN_FLOOR_S))
             exchanges = await rec.exchanges(drain)
-            for t in popups:
+            for t in hint_tasks:
                 t.cancel()
-            await asyncio.gather(*popups, return_exceptions=True)
+            await asyncio.gather(*hint_tasks, return_exceptions=True)
             try:
                 await context.close()
             except PlaywrightError:

@@ -186,7 +186,8 @@ async def test_click_through_element_gone_is_error(site, browser):
     # the login link is only there on the first visit of this context
     c = await browser.capture(site.url("/once"), "desktop", click_through=True)
     assert len(c.clicks) == 1 and c.clicks[0].label == "Login"
-    assert c.clicks[0].page.outcome == "error" and "not found" in c.clicks[0].page.error
+    assert c.clicks[0].page.outcome == "error"
+    assert c.clicks[0].page.error == "click failed: element changed"
     assert c.clicks[0].dom is None
 
 
@@ -195,3 +196,44 @@ async def test_click_through_to_dead_host(site, browser):
     c = await browser.capture(site.url("/dead"), "desktop", click_through=True)
     assert c.clicks[0].page.outcome == "dns_fail" and c.clicks[0].page.final_url is None
     assert "ERR_NAME_NOT_RESOLVED" in c.clicks[0].page.error
+
+
+@module_loop
+async def test_click_through_after_landing_load_timeout(site, browser):
+    # a dead tracker keeps "load" from firing on the landing page and every replay
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        c = await b.capture(site.url("/stall-login"), "desktop", click_through=True)
+    assert c.page.outcome == "live" and "load timeout" in c.page.error
+    assert c.clicks[0].page.outcome == "live" and c.clicks[0].page.final_url == site.url("/login")
+    assert b'type="password"' in c.clicks[0].dom
+
+
+@module_loop
+async def test_click_through_label_changed_is_error(site, browser):
+    c = await browser.capture(site.url("/relabel"), "desktop", click_through=True)
+    assert c.clicks[0].label == "Sign in" and c.clicks[0].page.outcome == "error"
+    assert c.clicks[0].page.error == "click failed: element changed"
+
+
+@module_loop
+async def test_click_through_finds_moved_label(site, browser):
+    c = await browser.capture(site.url("/swap"), "desktop", click_through=True)
+    assert [(k.label, k.page.final_url) for k in c.clicks] == [
+        ("Log in", site.url("/login?via=log")), ("Sign in", site.url("/login?via=sign"))]
+
+
+@module_loop
+async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
+    real = browser._click
+
+    async def flaky(context, rec, url, profile, n, label, deadline):
+        if n == 0:
+            raise RuntimeError("boom")
+        return await real(context, rec, url, profile, n, label, deadline)
+
+    monkeypatch.setattr(browser, "_click", flaky)
+    c = await browser.capture(site.url("/many"), "desktop", click_through=True)
+    assert c.page.outcome == "live" and c.page.error is None
+    assert [k.page.outcome for k in c.clicks] == ["error", "live", "live"]
+    assert c.clicks[0].page.error == "click failed: RuntimeError: boom"
+    assert c.clicks[0].page.profile == "desktop-click1" and c.clicks[0].label == "Log in"
