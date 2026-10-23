@@ -1,13 +1,17 @@
 import asyncio
+import dataclasses
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
+import hakapik.ingest as ingest
 from hakapik.blobstore import BlobStore
 from hakapik.config import Config
 from hakapik.ct.leaf import parse_rfc6962_leaf
 from hakapik.ct.loglist import LogInfo
+from hakapik.db import connect as real_connect
 from hakapik.db import get_cursor, read_stat, set_cursor
 from hakapik.firstseen import FirstSeenIndex
 from hakapik.ingest import (
@@ -282,3 +286,80 @@ def test_missing_tranco_falls_back_to_empty_set(tmp_path, caplog):
     assert "tranco.csv" in caplog.text
     assert s.reason(normalize("www.google.com")) is None
     assert s.reason(normalize("example.net")) == "public_apex"
+
+
+# --- run() lifecycle -------------------------------------------------------
+
+class SlowFakeSource(FakeSource):
+    """Yields to the loop on every fetch so sibling tasks overlap."""
+
+    async def entries(self, start, end):
+        await asyncio.sleep(0.05)
+        return await super().entries(start, end)
+
+
+@pytest.fixture
+def two_logs(monkeypatch, tmp_path, conn):
+    a = SlowFakeSource([LEAF_X509], dataclasses.replace(INFO, log_id="logA"))
+    b = SlowFakeSource([LEAF_X509, LEAF_PRECERT], dataclasses.replace(INFO, log_id="logB"))
+    by_id = {s.info.log_id: s for s in (a, b)}
+
+    async def fake_lists(urls, client):
+        return [a.info, b.info]
+
+    monkeypatch.setattr(ingest, "fetch_log_lists", fake_lists)
+    monkeypatch.setattr(ingest, "make_source", lambda info, client: by_id[info.log_id])
+    cfg = Config(data_dir=tmp_path, database_url=os.environ["HAKAPIK_TEST_DB"], batch_size=1)
+    return cfg, a, b
+
+
+async def test_run_survives_one_log_failing_to_connect(two_logs, monkeypatch, conn):
+    cfg, a, b = two_logs
+    calls = 0
+
+    async def flaky_connect(url):
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # 1st is migrate; 2nd is log A's task
+            raise OSError("too many connections")
+        return await real_connect(url)
+
+    monkeypatch.setattr(ingest, "connect", flaky_connect)
+    await ingest.run(cfg, "bootstrap")
+    await conn.rollback()
+    assert await get_cursor(conn, "logA") == (0, False)
+    assert await get_cursor(conn, "logB") == (2, True)
+    assert b.calls == [(0, 0), (1, 1)]
+    with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
+        assert ix.get(EXPECTED_FQDN) is not None
+        for fqdn in EXPECTED_NEW_FQDNS:
+            assert ix.get(fqdn) is not None
+
+
+async def test_run_tail_skips_log_not_bootstrapped(two_logs, conn, caplog):
+    cfg, a, b = two_logs
+    # Neither log is bootstrapped: run(tail) must skip both and return.
+    with caplog.at_level("ERROR"):
+        await asyncio.wait_for(ingest.run(cfg, "tail"), timeout=5)
+    await conn.rollback()
+    assert a.calls == [] and b.calls == []
+    assert await get_cursor(conn, "logA") == (0, False)
+    assert caplog.text.count("not bootstrapped") == 2
+
+
+class GappySource(FakeSource):
+    """Returns entries whose indices skip: start, then start+2 (non-contiguous)."""
+
+    async def entries(self, start, end):
+        self.calls.append((start, end))
+        out = [e for e in self._entries[start : end + 1] if (e[0] - start) % 2 == 0]
+        return out
+
+
+async def test_bootstrap_advances_by_last_returned_index(ix, sup, bs, conn, tmp_path):
+    src = GappySource([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT, LEAF_X509])
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=3)
+    await bootstrap_log(src, cfg, ix, sup, bs, conn)
+    # 0..2 returns indices 0 and 2 -> next is 3 (not 0 + 2); 3..4 returns 3 only.
+    assert src.calls == [(0, 2), (3, 4), (4, 4)]
+    assert await get_cursor(conn, INFO.log_id) == (5, True)

@@ -139,6 +139,28 @@ async def process_batch(
 ) -> int:
     """Ingest entries start..end; return how many entries the log returned.
 
+    See ``_process_batch`` for the details.
+    """
+    n, _ = await _process_batch(
+        src, start, end, mode=mode, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
+    )
+    return n
+
+
+async def _process_batch(
+    src: LogSource,
+    start: int,
+    end: int,
+    *,
+    mode: Literal["bootstrap", "live"],
+    ix: FirstSeenIndex,
+    sup: Suppressor,
+    bs: BlobStore,
+    conn,
+    stats: StatCounter,
+) -> tuple[int, int]:
+    """Ingest entries start..end; return (entries returned, next cursor index).
+
     The log may return fewer entries than asked for (always a prefix starting
     at ``start``); the cursor then advances past what was returned only. On
     success the batch's counts are also added to ``stats`` (a running total).
@@ -147,7 +169,7 @@ async def process_batch(
     try:
         entries = await src.entries(start, end)
         if not entries:
-            return 0
+            return 0, start
         _, bootstrap_done = await get_cursor(conn, log_id)
         emit = mode == "live" and bootstrap_done
         batch = StatCounter(entries=len(entries))
@@ -201,7 +223,7 @@ async def process_batch(
     for fqdn, (ts_ms, index) in new_fqdns.items():
         ix.first_seen(fqdn, ts_ms, log_id, index)
     stats.add(batch)
-    return len(entries)
+    return len(entries), last + 1
 
 
 async def bootstrap_log(
@@ -221,12 +243,12 @@ async def bootstrap_log(
     stats = StatCounter()
     while pos < size:
         end = min(pos + cfg.batch_size, size) - 1
-        n = await process_batch(
+        n, pos_next = await _process_batch(
             src, pos, end, mode="bootstrap", ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
         )
         if n == 0:
             raise RuntimeError(f"log returned no entries for {pos}..{end}")
-        pos += n
+        pos = pos_next  # same value the batch wrote to the cursor
     try:
         await set_cursor(conn, src.info.log_id, pos, True)
         await conn.commit()
@@ -306,26 +328,46 @@ async def run(cfg: Config, mode: Literal["bootstrap", "tail"]) -> None:
     finally:
         await conn.close()
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        logs = await fetch_log_lists(cfg.log_lists, client)
-        root.info("%d active logs", len(logs))
-        with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            logs = await fetch_log_lists(cfg.log_lists, client)
+            root.info("%d active logs", len(logs))
+            with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
 
-            async def one(info) -> None:
-                src = make_source(info, client)
-                log = _logger(src)
-                conn = await connect(cfg.database_url)
-                try:
-                    if mode == "bootstrap":
-                        await bootstrap_log(src, cfg, ix, sup, bs, conn)
-                    else:
-                        if not (await get_cursor(conn, info.log_id))[1]:
-                            log.warning("tailing a log that was never bootstrapped")
+                async def one(info) -> None:
+                    # Never raises: a failing log must not end gather() early,
+                    # which would close the shared index and client under the
+                    # sibling tasks still using them.
+                    log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
+                    conn = None
+                    try:
+                        src = make_source(info, client)
+                        conn = await connect(cfg.database_url)
+                        if mode == "bootstrap":
+                            await bootstrap_log(src, cfg, ix, sup, bs, conn)
+                            return
+                        _, done = await get_cursor(conn, info.log_id)
                         await conn.rollback()
+                        if not done:
+                            log.error(
+                                "log %s not bootstrapped; skipping (run bootstrap first)",
+                                info.description,
+                            )
+                            return
                         await tail_log(src, cfg, ix, sup, bs, conn, stop)
-                except Exception:
-                    log.exception("log task failed (%s)", info.description)
-                finally:
-                    await conn.close()
+                    except Exception:
+                        log.exception("log task failed (%s)", info.description)
+                    finally:
+                        if conn is not None:
+                            await conn.close()
 
-            await asyncio.gather(*(one(info) for info in logs))
+                results = await asyncio.gather(
+                    *(one(info) for info in logs), return_exceptions=True
+                )
+                for info, res in zip(logs, results):
+                    if isinstance(res, BaseException):
+                        root.error("log task %s escaped: %r", info.log_id, res)
+    finally:
+        if mode == "tail":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.remove_signal_handler(sig)
