@@ -55,5 +55,57 @@ def test_non_ascii_fqdn_rejected_and_not_written(tmp_path):
             ix.first_seen("prüfung.de", 1, "L", 1)
         with pytest.raises(ValueError):
             ix.get("prüfung.de")
+        assert "prüfung.de".encode() not in ix._fqdn  # the rejected key itself
         assert ix.get("pruefung.de") is None
         assert ix.get("xn--prfung-t2a.de") is None
+
+
+@pytest.mark.parametrize("ts_ms, index", [(-1, 0), (0, -1), (2**64, 0), (0, 2**64)])
+def test_out_of_u64_range_rejected_and_not_written(tmp_path, ts_ms, index):
+    with FirstSeenIndex(tmp_path / "idx") as ix:
+        with pytest.raises(ValueError, match="64-bit"):
+            ix.first_seen("a.example", ts_ms, "L", index)
+        assert ix.get("a.example") is None
+
+
+def test_u64_bounds_roundtrip(tmp_path):
+    with FirstSeenIndex(tmp_path / "idx") as ix:
+        assert ix.first_seen("a.example", 0, "L", 2**64 - 1)
+        assert ix.get("a.example") == (0, "L", 2**64 - 1)
+
+
+def test_use_after_close_raises(tmp_path):
+    ix = FirstSeenIndex(tmp_path / "idx")
+    ix.close()
+    with pytest.raises(ValueError, match="closed"):
+        ix.first_seen("a.example", 1, "L", 1)
+    with pytest.raises(ValueError, match="closed"):
+        ix.get("a.example")
+    with pytest.raises(ValueError, match="closed"):
+        ix.seen_cert(b"k")
+    with pytest.raises(ValueError, match="closed"):
+        ix.has_cert(b"k")
+
+
+def test_close_closes_every_handle_when_a_column_family_close_raises(tmp_path):
+    ix = FirstSeenIndex(tmp_path / "idx")
+    calls = []
+    real_cert, real_db = ix._cert, ix._db
+
+    class Boom:
+        def close(self):
+            calls.append("fqdn")
+            raise RuntimeError("boom")
+
+    class Spy:
+        def __init__(self, inner, name):
+            self.inner, self.name = inner, name
+
+        def close(self):
+            calls.append(self.name)
+            self.inner.close()
+
+    ix._fqdn, ix._cert, ix._db = Boom(), Spy(real_cert, "cert"), Spy(real_db, "db")
+    with pytest.raises(RuntimeError, match="boom"):
+        ix.close()
+    assert calls == ["fqdn", "cert", "db"]

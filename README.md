@@ -42,6 +42,11 @@ uv run hakapik --config hakapik.toml fetch    # --once for a single pass
 uv run hakapik --config hakapik.toml show example.com
 ```
 
+A database created before the bootstrap was removed has `log_cursor.bootstrap_done`
+(NOT NULL) and `ingest_stat.mode`, which the current code does not write; migration
+does not drop them. Recreate such a database (`docker compose down -v`, or drop
+`log_cursor` and `ingest_stat`) before running `tail`.
+
 There is no history backfill. `tail` starts each log it has not seen before
 at the log's current tree size and emits candidates from its first batch on;
 the first-seen index fills from the live stream, so early candidates include

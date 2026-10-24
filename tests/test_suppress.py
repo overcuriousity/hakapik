@@ -54,3 +54,19 @@ def test_ordinary_name_is_candidate(sup):
 @pytest.mark.parametrize("name", ["*.pages.dev", "*.github.io"])
 def test_wildcard_over_public_apex_is_wildcard(sup, name):
     assert sup.reason(normalize(name)) == "wildcard"
+
+
+def test_blank_lines_and_header_do_not_count_toward_top_n(tmp_path):
+    csv = tmp_path / "t.csv"
+    csv.write_text("rank,domain\n\n1,a.com\n\n\n2,b.com\n3,c.com\n")
+    s = Suppressor.from_files(csv, top_n=2, public_apexes=[])
+    assert s.top_listed("a.com") and s.top_listed("b.com")
+    assert not s.top_listed("c.com")
+    assert not s.top_listed("domain")
+
+
+def test_public_apexes_are_sanitised(tmp_path):
+    s = Suppressor.from_files(FIXTURE, top_n=1, public_apexes=[" Example-Host.COM. ", "*.shared.net", "", " "])
+    assert s.reason(normalize("example-host.com")) == "public_apex"
+    assert s.reason(normalize("shared.net")) == "public_apex"
+    assert s.reason(normalize("x.example-host.com")) is None

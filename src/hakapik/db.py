@@ -56,11 +56,6 @@ _SCHEMA = [
         candidates bigint NOT NULL DEFAULT 0,
         PRIMARY KEY (log_id, day)
     )""",
-    "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
-    "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
-    "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)",
-    # Stage two; the column changes to stage-one tables are in _UPGRADES.
-    "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)",
     """CREATE TABLE IF NOT EXISTS fetch_job (
         id bigserial PRIMARY KEY,
         candidate_id bigint NOT NULL REFERENCES candidate(id),
@@ -73,9 +68,6 @@ _SCHEMA = [
         claimed_until timestamptz,
         created_at timestamptz NOT NULL DEFAULT now()
     )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'",
-    "CREATE INDEX IF NOT EXISTS fetch_job_due ON fetch_job (priority DESC, due_at DESC) WHERE state = 'open'",
-    "CREATE INDEX IF NOT EXISTS fetch_job_fqdn ON fetch_job (fqdn)",
     """CREATE TABLE IF NOT EXISTS node (
         node_id text PRIMARY KEY,
         public_key bytea NOT NULL,
@@ -133,6 +125,25 @@ _SCHEMA = [
         created_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE (candidate_id, version)
     )""",
+]
+
+# (index name, DDL). CREATE INDEX IF NOT EXISTS takes a SHARE lock on the table
+# even when the index exists, which conflicts with writers, and migrate() runs
+# on every command start; so each runs only while pg_indexes lacks the index.
+_INDEXES = [
+    ("candidate_log_index",
+     "CREATE INDEX candidate_log_index ON candidate (log_id, log_index)"),
+    ("raw_batch_created_at",
+     "CREATE INDEX raw_batch_created_at ON raw_batch (created_at)"),
+    ("raw_batch_blob_sha256",
+     "CREATE INDEX raw_batch_blob_sha256 ON raw_batch (blob_sha256)"),
+    ("candidate_fqdn", "CREATE INDEX candidate_fqdn ON candidate (fqdn)"),
+    ("fetch_job_open_fqdn",
+     "CREATE UNIQUE INDEX fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'"),
+    ("fetch_job_due",
+     "CREATE INDEX fetch_job_due ON fetch_job (priority DESC, due_at DESC) "
+     "WHERE state = 'open'"),
+    ("fetch_job_fqdn", "CREATE INDEX fetch_job_fqdn ON fetch_job (fqdn)"),
 ]
 
 # Changes to tables that may predate stage two, as (table, column, change, DDL).
@@ -202,6 +213,13 @@ async def migrate(conn: psycopg.AsyncConnection) -> None:
             needed = row is not None and row[0] == "NO"
         if needed:
             await conn.execute(stmt)
+    cur = await conn.execute(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+    )
+    existing = {r[0] for r in await cur.fetchall()}
+    for name, stmt in _INDEXES:
+        if name not in existing:
+            await conn.execute(stmt)
     await conn.commit()
 
 
@@ -223,6 +241,22 @@ async def set_cursor(conn: psycopg.AsyncConnection, log_id: str, next_index: int
              updated_at = now()""",
         (log_id, next_index),
     )
+
+
+async def init_cursor(
+    conn: psycopg.AsyncConnection, log_id: str, next_index: int
+) -> bool:
+    """Create the log's cursor row; True if created, False if one already exists.
+
+    Unlike ``set_cursor`` this never overwrites, so a log's first cursor cannot
+    clobber one written by another process in the meantime.
+    """
+    cur = await conn.execute(
+        """INSERT INTO log_cursor (log_id, next_index) VALUES (%s, %s)
+           ON CONFLICT (log_id) DO NOTHING""",
+        (log_id, next_index),
+    )
+    return cur.rowcount == 1
 
 
 async def add_candidates(
@@ -269,7 +303,11 @@ async def add_raw_batch(
 async def bump_stat(
     conn: psycopg.AsyncConnection, log_id: str, day: date, **increments: int
 ) -> None:
-    """Add ``increments`` to the (log_id, day) row."""
+    """Add ``increments`` to the (log_id, day) row.
+
+    With no increments this does nothing, and in particular creates no row:
+    ``read_stat`` reports zeros for an absent row anyway.
+    """
     unknown = set(increments) - set(STAT_COLUMNS)
     if unknown:
         raise ValueError(f"unknown ingest_stat columns: {sorted(unknown)}")

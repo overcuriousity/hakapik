@@ -1,3 +1,5 @@
+import pytest
+
 from hakapik.names import normalize
 
 
@@ -51,3 +53,30 @@ def test_index_key_separates_wildcard_from_apex():
     w, a = normalize("*.Example.com."), normalize("example.com")
     assert w.fqdn == a.fqdn == "example.com"
     assert w.key == "*.example.com" and a.key == "example.com"
+
+
+def test_invalid_record_keeps_stripped_lowercased_input():
+    # documented on NameRecord: fqdn of an invalid record is not canonical
+    r = normalize("  Bad_Label!.COM. ")
+    assert not r.valid and r.fqdn == "bad_label!.com" and r.registrable == ""
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "", " ", ".", "*", "*.", "*.*.example.com",
+        "1.2.3.4", "localhost", "x.example.invalidtld",
+        "example.com/x", "exa mple.com",
+        "-a.example.com", "a-.example.com", "xn--.example.com",
+        "a" * 64 + ".example.com",  # label over 63 octets
+        ".".join(["a" * 63] * 4 + ["com"]),  # name over 253 octets
+    ],
+)
+def test_unusable_names_are_invalid(name):
+    r = normalize(name)
+    assert not r.valid and r.registrable == ""
+
+
+def test_fullwidth_letters_fold_to_ascii():
+    r = normalize("ｅxample.com")  # UTS 46 mapping
+    assert r.valid and r.fqdn == "example.com" and not r.idn

@@ -28,3 +28,29 @@ def test_blobstore_open_reads_back_and_leaves_no_temp_files(tmp_path):
 def test_blobstore_path_rejects_non_digest(tmp_path, bad):
     with pytest.raises(ValueError):
         BlobStore(tmp_path).path(bad)
+
+
+def test_blobstore_put_fsyncs_the_directory_after_the_rename(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    synced_dirs = []
+    real = os.fsync
+
+    def spy(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            synced_dirs.append(os.readlink(f"/proc/self/fd/{fd}"))
+        real(fd)
+
+    monkeypatch.setattr(os, "fsync", spy)
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"durable", "x")
+    assert synced_dirs == [str(bs.path(h).parent)]
+
+
+def test_blobstore_put_restores_mode_of_existing_blob(tmp_path):
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"abc", "x")
+    bs.path(h).chmod(0o666)
+    assert bs.put(b"abc", "x") == h
+    assert (bs.path(h).stat().st_mode & 0o777) == 0o444

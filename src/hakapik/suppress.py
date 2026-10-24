@@ -26,17 +26,25 @@ class Suppressor:
         cls, tranco_csv: Path, top_n: int, public_apexes: Iterable[str]
     ) -> Suppressor:
         tranco: set[str] = set()
+        taken = 0
         with open(tranco_csv, newline="") as fh:
-            for i, row in enumerate(csv.reader(fh)):
-                if i >= top_n:
-                    break
-                if len(row) < 2:
+            for row in csv.reader(fh):
+                # Data rows are "rank,domain". Blank lines and a header row
+                # (non-numeric rank) are skipped and do not count toward top_n.
+                if len(row) < 2 or not row[0].strip().isdigit():
                     continue
+                if taken >= top_n:
+                    break
+                taken += 1
                 domain = row[1].strip().lower()
                 domain = domain.removeprefix("www.")
                 if domain:
                     tranco.add(domain)
-        public = _private_suffixes() | {p.strip().lower() for p in public_apexes}
+        # Operator input: tolerate case, spaces, a trailing dot and a "*." prefix.
+        configured = {
+            a for p in public_apexes if (a := p.strip().lower().removeprefix("*.").strip("."))
+        }
+        public = _private_suffixes() | configured
         return cls(frozenset(tranco), frozenset(public))
 
     def top_listed(self, registrable: str) -> bool:

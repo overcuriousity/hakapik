@@ -15,6 +15,15 @@ _EXTRACT = tldextract.TLDExtract(
 
 @dataclass(frozen=True)
 class NameRecord:
+    """A normalised name.
+
+    For a valid record ``fqdn`` is the canonical IDNA (A-label, lowercase,
+    no trailing dot, no ``*.``) form. For an invalid one (``valid=False``) it
+    is only the stripped, lowercased input, which may be non-ASCII or
+    arbitrary text: use it for logs, never as an index key (``FirstSeenIndex``
+    rejects non-ASCII keys).
+    """
+
     fqdn: str
     registrable: str
     wildcard: bool
@@ -35,9 +44,9 @@ def _registrable(fqdn: str) -> str:
     ext = _EXTRACT(fqdn)
     if not ext.suffix:
         return ""
-    if hasattr(ext, "top_domain_under_public_suffix"):
-        return ext.top_domain_under_public_suffix
-    return ext.registered_domain  # older tldextract
+    # tldextract>=5.4 (pinned in pyproject) always has this property; the older
+    # registered_domain alias is deprecated and warns.
+    return ext.top_domain_under_public_suffix
 
 
 def normalize(name: str) -> NameRecord:
@@ -58,8 +67,6 @@ def normalize(name: str) -> NameRecord:
         return invalid()
     labels = fqdn.split(".")
     if any(not label for label in labels):
-        return invalid()
-    if any("_" in label for label in labels):
         return invalid()
     registrable = _registrable(fqdn)
     if not registrable:

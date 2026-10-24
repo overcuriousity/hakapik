@@ -15,6 +15,14 @@ from typing import BinaryIO
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class BlobStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -33,6 +41,10 @@ class BlobStore:
         digest = hashlib.sha256(data).hexdigest()
         dest = self.path(digest)
         if dest.exists():
+            # Content-addressed, so the bytes are right; the mode is not
+            # guaranteed if someone touched the file.
+            if (dest.stat().st_mode & 0o777) != 0o444:
+                os.chmod(dest, 0o444)
             return digest
         dest.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
@@ -43,6 +55,7 @@ class BlobStore:
                 os.fsync(f.fileno())
             os.chmod(tmp, 0o444)
             os.replace(tmp, dest)
+            _fsync_dir(dest.parent)  # make the rename itself durable
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise
