@@ -36,6 +36,18 @@ async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> lis
     return [Job(r[0], r[1], r[2], r[3], r[4], f"https://{r[2]}/") for r in rows]
 
 
+async def extend_lease(
+    conn: psycopg.AsyncConnection, job_id: int, step: int, lease_s: int
+) -> bool:
+    """Push a running job's lease to now() + lease_s; False if it moved on or closed."""
+    cur = await conn.execute(
+        """UPDATE fetch_job SET claimed_until = now() + make_interval(secs => %s)
+           WHERE id = %s AND state = 'open' AND step = %s""",
+        (lease_s, job_id, step),
+    )
+    return cur.rowcount == 1
+
+
 async def advance_job(
     conn: psycopg.AsyncConnection, job_id: int, step: int, ladder: tuple[int, ...]
 ) -> None:

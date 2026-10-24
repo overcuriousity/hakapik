@@ -9,6 +9,7 @@ from hakapik.jobs import (
     attempts_today,
     claim_jobs,
     enqueue_manual,
+    extend_lease,
     last_fetched,
     sweep,
 )
@@ -204,3 +205,16 @@ async def test_sweep_takes_fractional_ageout_hours(conn):
     assert await sweep(conn, 0.5, None) == 1
     assert (await _job(conn, old))[1] == "aged_out"
     assert (await _job(conn, young))[1] == "open"
+
+
+async def test_extend_lease_only_for_the_running_step(conn):
+    jid = await _add(conn, "a.example.com")
+    await claim_jobs(conn, 1, 1)
+    assert await extend_lease(conn, jid, 0, 600) is True
+    cur = await conn.execute(
+        "SELECT claimed_until - now() > interval '590 seconds' FROM fetch_job WHERE id = %s",
+        (jid,))
+    assert (await cur.fetchone())[0]
+    assert await extend_lease(conn, jid, 1, 600) is False  # stale step
+    await conn.execute("UPDATE fetch_job SET state = 'done' WHERE id = %s", (jid,))
+    assert await extend_lease(conn, jid, 0, 600) is False  # closed

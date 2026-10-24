@@ -186,6 +186,11 @@ class NodeKey:
 
 
 KEY_LOCK_WAIT_S = 5.0  # how long to wait for another process creating the key
+# link() errors meaning "no hard link here": not permitted, not supported, not
+# implemented, or too many links. (EXDEV cannot occur: the temporary file is
+# in the key's own directory.)
+_NO_LINK_ERRNOS = (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS,
+                   errno.EMLINK)
 
 
 def _create_key(path: Path, seed: bytes) -> None:
@@ -209,7 +214,7 @@ def _create_key(path: Path, seed: bytes) -> None:
         except FileExistsError:
             return
         except OSError as e:
-            if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP):
+            if e.errno not in _NO_LINK_ERRNOS:
                 raise
             # No hard links on this filesystem. rename() would overwrite, so
             # an exclusively created lock file decides who renames.
@@ -225,16 +230,25 @@ def _create_key(path: Path, seed: bytes) -> None:
         os.close(dfd)
 
 
-def _rename_under_lock(tmp: str, path: Path) -> bool:
-    """Rename ``tmp`` to ``path`` unless another process creates it; True if renamed."""
+def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
+    """Rename ``tmp`` to ``path`` unless another process creates it; True if renamed.
+
+    The lock file holds its creator's PID. A waiter whose wait expires removes
+    a lock whose creator is gone (a crash) and tries once more.
+    """
     lock = path.with_name(path.name + ".lock")
     try:
-        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        lfd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         # Another process holds the lock: its key appears whole, by rename.
         deadline = time.monotonic() + KEY_LOCK_WAIT_S
         while not path.exists():
             if time.monotonic() > deadline:
+                if not retried and _lock_owner_dead(lock):
+                    log.warning("removing %s left by a process that is gone", lock)
+                    with contextlib.suppress(FileNotFoundError):
+                        os.unlink(lock)
+                    return _rename_under_lock(tmp, path, retried=True)
                 raise RuntimeError(
                     f"node key {path} not created while {lock} exists; if no other "
                     "hakapik process is starting, a crash left the lock: delete it"
@@ -242,12 +256,31 @@ def _rename_under_lock(tmp: str, path: Path) -> bool:
             time.sleep(0.05)
         return False
     try:
+        with os.fdopen(lfd, "w") as f:
+            f.write(str(os.getpid()))
         if path.exists():
             return False
         os.rename(tmp, path)
         return True
     finally:
         os.unlink(lock)
+
+
+def _lock_owner_dead(lock: Path) -> bool:
+    """True only if the lock names a PID that no longer exists."""
+    try:
+        pid = int(lock.read_text())
+    except (OSError, ValueError):
+        return False  # unreadable: cannot tell, so not known dead
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False  # e.g. EPERM: it exists under another user
+    return False
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:

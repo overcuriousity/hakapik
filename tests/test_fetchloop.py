@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import logging
+import threading
 
 import pytest
 from conftest import _test_db_url
@@ -10,7 +11,7 @@ from hakapik import fetchloop
 from hakapik.asn import AsnDb
 from hakapik.config import Config
 from hakapik.fetchloop import run_fetch
-from hakapik.jobs import enqueue_manual
+from hakapik.jobs import claim_jobs, enqueue_manual
 from hakapik.protocol import DnsAnswer, NodeKey
 from hakapik.store import ResultRejected
 
@@ -288,3 +289,84 @@ async def test_asn_db_is_closed_when_fetch_ends(conn, tmp_path, asn_mmdb, monkey
     monkeypatch.setattr(AsnDb, "close", lambda self: (closed.append(self), real_close(self))[1])
     await _once(_cfg(tmp_path, asn_mmdb=asn_mmdb()))
     assert len(closed) == 1
+
+
+async def test_heartbeat_keeps_a_slow_job_leased_then_stops(conn, tmp_path, monkeypatch):
+    # lease_s = 1 and a capture that takes longer: without the heartbeat the
+    # job would be claimable again while it runs.
+    gate, started = asyncio.Event(), asyncio.Event()
+    beats = []
+    real_extend = fetchloop.extend_lease
+
+    async def counting_extend(*a, **k):
+        beats.append(True)
+        return await real_extend(*a, **k)
+
+    class SlowBrowser(FakeBrowser):
+        async def capture(self, url, profile, *, click_through=False):
+            started.set()
+            await gate.wait()
+            return await super().capture(url, profile, click_through=click_through)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", counting_extend)
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=SlowBrowser(), once=True))
+    await asyncio.wait_for(started.wait(), 10)
+    await asyncio.sleep(2.5)  # well past the first lease
+    assert await claim_jobs(conn, 5, 1) == []  # a second claimer finds nothing due
+    await conn.rollback()
+    assert await _count(conn, "fetch_job", "claimed_until > now()") == 1
+    assert len(beats) >= 3
+    gate.set()
+    await asyncio.wait_for(task, 10)
+    assert await _count(conn, "attempt") == 1
+    after = len(beats)
+    await asyncio.sleep(0.8)  # more than two ticks
+    assert len(beats) == after
+
+
+async def test_heartbeat_failure_is_logged_and_retried(conn, tmp_path, monkeypatch, caplog):
+    gate, started = asyncio.Event(), asyncio.Event()
+    calls = []
+    real_extend = fetchloop.extend_lease
+
+    async def flaky_extend(*a, **k):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("db hiccup")
+        return await real_extend(*a, **k)
+
+    class SlowBrowser(FakeBrowser):
+        async def capture(self, url, profile, *, click_through=False):
+            started.set()
+            await gate.wait()
+            return await super().capture(url, profile, click_through=click_through)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", flaky_extend)
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=SlowBrowser(), once=True))
+    await asyncio.wait_for(started.wait(), 10)
+    while len(calls) < 2:
+        await asyncio.sleep(0.05)
+    gate.set()
+    await asyncio.wait_for(task, 10)
+    assert await _count(conn, "attempt", "outcome = 'live'") == 1
+    assert any("lease extension failed" in r.getMessage() and r.exc_info
+               for r in caplog.records)
+
+
+async def test_node_key_is_loaded_off_the_event_loop(conn, tmp_path, monkeypatch):
+    threads = []
+    real = NodeKey.load_or_create.__func__
+
+    def recording(cls, path):
+        threads.append(threading.current_thread())
+        return real(cls, path)
+
+    monkeypatch.setattr(NodeKey, "load_or_create", classmethod(recording))
+    await _once(_cfg(tmp_path))
+    assert threads and threads[0] is not threading.main_thread()

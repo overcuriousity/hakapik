@@ -4,8 +4,9 @@ Each iteration sweeps the queue, checks the optional daily cap, leases due
 jobs up to the free worker slots and runs each as its own task:
 ``run_job`` -> ``store_result`` in a borrowed connection -> commit. The claim
 and sweep transactions are committed at once (jobs use the transaction's
-fixed now()). A task that fails leaves its job leased; it is claimed again
-after the lease expires. Signal handling belongs to the caller: setting
+fixed now()). While a task runs, a heartbeat extends its job's lease every
+lease_s / 3, so a running job is never claimed again. A task that fails
+leaves its job leased; it is claimed again after the lease expires. Signal handling belongs to the caller: setting
 ``stop`` ends claiming, and running tasks finish before ``run_fetch`` returns.
 """
 
@@ -24,7 +25,7 @@ from hakapik.browser import Browser
 from hakapik.config import Config
 from hakapik.db import connect, lock_blob, migrate
 from hakapik.ingest import ConnPool
-from hakapik.jobs import attempts_today, claim_jobs, sweep
+from hakapik.jobs import attempts_today, claim_jobs, extend_lease, sweep
 from hakapik.protocol import Job, NodeKey, open_envelope
 from hakapik.resolve import Resolver
 from hakapik.store import ResultRejected, register_node, store_result
@@ -62,6 +63,23 @@ async def _load_asn(cfg: Config, bs: BlobStore, conn) -> AsnDb | None:
     return asn
 
 
+async def _heartbeat(pool: ConnPool, job: Job, lease_s: int) -> None:
+    """Extend ``job``'s lease every lease_s / 3 until cancelled.
+
+    A failed extension is logged and tried again at the next tick; it never
+    ends the job.
+    """
+    while True:
+        await asyncio.sleep(lease_s / 3)
+        try:
+            async with pool.borrow() as c:
+                await extend_lease(c, job.job_id, job.step, lease_s)
+                await c.commit()
+        except Exception:
+            log.warning("job %d %s: lease extension failed; retrying next tick",
+                        job.job_id, job.fqdn, exc_info=True)
+
+
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
     with contextlib.suppress(TimeoutError):
         await asyncio.wait_for(stop.wait(), seconds)
@@ -76,7 +94,8 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
     and closed here, as is the ASN database.
     """
     bs = BlobStore(cfg.data_dir / "blobs")
-    key = NodeKey.load_or_create(cfg.data_dir / "node.key")
+    # In a thread: creating the key may wait for another process (protocol.py).
+    key = await asyncio.to_thread(NodeKey.load_or_create, cfg.data_dir / "node.key")
     conn = await connect(cfg.database_url)
     try:
         await migrate(conn)
@@ -99,6 +118,7 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
             async def one(job: Job) -> None:
                 # Never raises: a failed job stays leased until its lease expires.
                 log.info("claimed job %d %s step %d", job.job_id, job.fqdn, job.step)
+                beat = asyncio.create_task(_heartbeat(pool, job, cfg.lease_s))
                 try:
                     env = await run_job(job, resolver=resolver, browser=browser, bs=bs,
                                         key=key, egress_address=cfg.egress_address,
@@ -121,6 +141,10 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                              "duplicate" if attempt_id is None else attempt_id)
                 except Exception:
                     log.exception("job %d %s failed", job.job_id, job.fqdn)
+                finally:
+                    beat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await beat
 
             await _loop(cfg, stop, once, pool, one)
     finally:

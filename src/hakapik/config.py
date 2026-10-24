@@ -106,10 +106,13 @@ def load_config(path: Path) -> Config:
     ):
         raise ValueError("retry_ladder_s must be non-empty, start at 0 and strictly increase")
     cfg = Config(**raw)
-    # Worst-case job: capture budget (landing plus up to 3 click hops,
-    # 4 * nav_timeout_s) + 2 * resolver_query_deadline_s (the resolve round,
-    # then the PTR round; queries within a round run concurrently) + 60 s
-    # margin. A shorter lease lets a running job be claimed again mid-run.
+    # A sanity floor only: a lease shorter than one resolve and capture makes
+    # no sense. The formula: capture budget (4 * nav_timeout_s) + 2 *
+    # resolver_query_deadline_s (the resolve round, then the PTR round) + 60 s
+    # margin. It omits the per-IP spacer wait, blob writes and the full
+    # mobile + desktop + click capture; what keeps a running job from being
+    # claimed again is fetchloop's heartbeat, which extends the lease every
+    # lease_s / 3 while the job runs.
     if cfg.lease_s < 4 * cfg.nav_timeout_s + 2 * cfg.resolver_query_deadline_s + 60:
         raise ValueError(
             "lease_s must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s + 60")

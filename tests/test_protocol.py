@@ -2,6 +2,7 @@ import base64
 import errno
 import json
 import os
+import subprocess
 import threading
 
 import pytest
@@ -198,12 +199,61 @@ def test_no_link_rename_does_not_replace_a_key_that_appeared(tmp_path, monkeypat
     assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
 
 
-def test_no_link_stale_lock_is_reported(tmp_path, monkeypatch):
+def test_no_link_lock_without_a_pid_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(protocol.os, "link", _no_link)
     monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
     (tmp_path / "node.key.lock").touch()
     with pytest.raises(RuntimeError, match="node.key.lock"):
         NodeKey.load_or_create(tmp_path / "node.key")
+
+
+@pytest.mark.parametrize("code", [errno.ENOSYS, errno.EMLINK, errno.ENOTSUP])
+def test_every_missing_link_errno_takes_the_fallback(tmp_path, monkeypatch, code):
+    def no_link(a, b):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(protocol.os, "link", no_link)
+    p = tmp_path / "node.key"
+    NodeKey.load_or_create(p)
+    assert len(p.read_bytes()) == 32 and sorted(x.name for x in tmp_path.iterdir()) == [
+        "node.key"]
+
+
+def test_no_link_lock_of_a_dead_process_is_removed(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    (tmp_path / "node.key.lock").write_text(str(gone.pid))
+    p = tmp_path / "node.key"
+    with caplog.at_level("WARNING", logger="hakapik.protocol"):
+        NodeKey.load_or_create(p)
+    assert len(p.read_bytes()) == 32
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
+    assert any("node.key.lock" in r.getMessage() for r in caplog.records)
+
+
+def test_no_link_lock_of_a_live_process_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
+    (tmp_path / "node.key.lock").write_text(str(os.getpid()))
+    with pytest.raises(RuntimeError, match="node.key.lock"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    assert (tmp_path / "node.key.lock").exists()
+
+
+def test_no_link_lock_holds_its_creators_pid(tmp_path, monkeypatch):
+    seen = []
+    real_rename = os.rename
+
+    def rename(a, b):
+        seen.append((tmp_path / "node.key.lock").read_text())
+        real_rename(a, b)
+
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    monkeypatch.setattr(protocol.os, "rename", rename)
+    NodeKey.load_or_create(tmp_path / "node.key")
+    assert seen == [str(os.getpid())]
 
 
 def test_other_link_errors_are_raised(tmp_path, monkeypatch):

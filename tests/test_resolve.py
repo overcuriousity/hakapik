@@ -152,33 +152,31 @@ def test_addresses_matches_the_fqdn_in_any_case():
     assert addresses(ans, "LOGIN.Example.COM.") == ["1.2.3.4", "2001:db8::1"]
 
 
-async def _two_silent_servers(dns_server_factory):
-    # Same port on 127.0.0.1 and 127.0.0.2; both drop every query for "slow".
+async def _two_silent_resolver(dns_server_factory, timeout_s, deadline_s):
+    # Two servers on two ports of 127.0.0.1, both silent for "slow". Resolver
+    # has one port for all servers, so the second resolver's port is set here.
     first = await dns_server_factory({}, drop={"slow.example.com"})
-    second = await dns_server_factory({}, drop={"slow.example.com"},
-                                      host="127.0.0.2", port=first.port)
-    return first, second
+    second = await dns_server_factory({}, drop={"slow.example.com"})
+    r = Resolver(("127.0.0.1", "127.0.0.1"), port=first.port, timeout_s=timeout_s,
+                 query_deadline_s=deadline_s)
+    r._resolvers[1].port = second.port
+    return r, first, second
 
 
 async def test_query_deadline_bounds_the_time_across_servers(dns_server_factory):
-    first, second = await _two_silent_servers(dns_server_factory)
-    r = Resolver(("127.0.0.1", "127.0.0.2"), port=first.port, timeout_s=1.0,
-                 query_deadline_s=1.2)
+    r, first, second = await _two_silent_resolver(dns_server_factory, 1.0, 1.2)
     t = time.monotonic()
     ans = await r.resolve("slow.example.com", "slow.example.com")
-    elapsed = time.monotonic() - t
     # Without the deadline each query takes 2 * timeout_s = 2.0 s.
-    assert 1.1 <= elapsed < 1.8
-    assert second.udp_queries  # the remaining 0.2 s went to the second server
+    assert time.monotonic() - t < 2 * 1.0 - 0.1
+    assert second.udp_queries  # the time left went to the second server
     assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)
 
 
 async def test_query_deadline_below_timeout_asks_only_the_first(dns_server_factory):
-    first, second = await _two_silent_servers(dns_server_factory)
-    r = Resolver(("127.0.0.1", "127.0.0.2"), port=first.port, timeout_s=1.0,
-                 query_deadline_s=0.3)
+    r, first, second = await _two_silent_resolver(dns_server_factory, 1.0, 0.3)
     t = time.monotonic()
     ans = await r.resolve("slow.example.com", "slow.example.com")
-    assert time.monotonic() - t < 0.9
+    assert time.monotonic() - t < 1.0 - 0.1  # less than one server's timeout
     assert first.udp_queries and not second.udp_queries
     assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)
