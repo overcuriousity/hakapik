@@ -257,6 +257,77 @@ async def test_click_through_follows_popup(site, browser, caplog):
 
 
 @session_loop
+async def test_click_popup_is_the_clicks_not_the_pages_own(site, browser):
+    # The replayed page opens a popup of its own before the click; only a
+    # target that did not exist when the click started counts.
+    c = await browser.capture(site.url("/popup-own"), "desktop", click_through=True)
+    assert len(c.clicks) == 1 and c.clicks[0].page.final_url == site.url("/login")
+    assert c.clicks[0].page.http_status == 200
+
+
+@session_loop
+async def test_click_waits_for_a_navigation_that_commits_during_the_settle(
+        site, browser, monkeypatch):
+    # The click starts no navigation itself: a timer does, 0.3 s later. The
+    # new document's load (a 1.5 s image) ends after the settle; the evidence
+    # is taken after it.
+    monkeypatch.setattr(browser, "settle_s", 0.5)
+    c = await browser.capture(site.url("/late-nav"), "desktop", click_through=True)
+    click = c.clicks[0]
+    assert click.page.final_url == site.url("/onload") and click.page.outcome == "live"
+    assert b"image arrived" in click.dom and click.page.error is None
+
+
+@session_loop
+async def test_hop_budget_bounds_a_hanging_click_target(site, browser):
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        t = time.monotonic()
+        c = await b.capture(site.url("/hang-login"), "desktop", click_through=True)
+        elapsed = time.monotonic() - t
+    assert c.page.outcome == "live" and len(c.clicks) == 1
+    # landing: settle + evidence; the hop: nav_timeout_s + settle_s; drain floor
+    assert elapsed < 0.5 + 2 + (2 + 0.5) + 2 + 1
+    click = c.clicks[0]
+    assert click.page.outcome == "timeout" and "TimeoutError" in click.page.error
+    assert "/hang" in site.paths_requested
+
+
+@session_loop
+async def test_click_pages_are_closed_after_their_hop(site, browser, monkeypatch):
+    real = browser._click
+    open_pages = []
+
+    async def counting(context, *args):
+        open_pages.append(len(context.pages))
+        return await real(context, *args)
+
+    monkeypatch.setattr(browser, "_click", counting)
+    c = await browser.capture(site.url("/many"), "desktop", click_through=True)
+    assert open_pages == [1, 1, 1]  # only the landing page is open when a hop starts
+    bodies = {r.rec_headers.get_header("WARC-Target-URI"): r.content_stream().read()
+              for r in ArchiveIterator(io.BytesIO(c.warc)) if r.rec_type == "response"}
+    assert all(b'type="password"' in bodies[site.url(f"/login?n={i}")] for i in range(3))
+
+
+@session_loop
+async def test_popup_requests_agree_with_the_profile(site, browser):
+    # Pages the site opens get the profile's client hints once playwright
+    # reports them. Before that (browser.py, capture) only the UA string and
+    # the brands are certain; a request after it carries the full hints.
+    c = await browser.capture(site.url("/popup-hints"), "desktop", click_through=True)
+    assert c.clicks[0].page.final_url == site.url("/hinted")
+    sent = list(zip(site.paths_requested, site.headers))
+    replay = [h for p, h in sent if p == "/popup-hints"][-1]  # with the Accept-CH hints
+    first = next(h for p, h in sent if p == "/hinted")
+    later = next(h for p, h in sent if p == "/late-pic")
+    for name in ("user-agent", "sec-ch-ua", "sec-ch-ua-mobile"):
+        assert first[name] == replay[name]
+    hints = [n for n in replay if n.startswith("sec-ch-ua") or n == "user-agent"]
+    assert len(hints) == 8 and {n: later.get(n) for n in hints} == {n: replay[n] for n in hints}
+    assert later["sec-ch-ua-platform-version"] == '"15.0.0"'
+
+
+@session_loop
 async def test_no_click_through_by_default(site, browser):
     c = await browser.capture(site.url("/"), "desktop")
     assert c.clicks == ()
@@ -319,6 +390,38 @@ async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
     assert [k.page.outcome for k in c.clicks] == ["error", "live", "live"]
     assert c.clicks[0].page.error == "click failed: RuntimeError: boom"
     assert c.clicks[0].page.profile == "desktop-click1" and c.clicks[0].label == "Log in"
+
+
+class _FakeRoute:
+    def __init__(self, request):
+        self.request = request
+        self.calls = []
+
+    async def abort(self, *args):
+        self.calls.append("abort")
+
+    async def fallback(self):
+        self.calls.append("fallback")
+
+
+async def test_freeze_hold_resolves_a_route_it_cannot_judge():
+    # A route handler that raises leaves its request hanging: an unexpected
+    # error in judging a request lets it through instead.
+    class Page:
+        main_frame = object()
+
+        async def route(self, pattern, handler):
+            self.hold = handler
+
+    class Request:
+        def is_navigation_request(self):
+            raise RuntimeError("unexpected")
+
+    page = Page()
+    await Browser._freeze(page, None, Recorder(), asyncio.get_running_loop().time() + 5)
+    route = _FakeRoute(Request())
+    await page.hold(route)
+    assert route.calls == ["fallback"]
 
 
 @session_loop

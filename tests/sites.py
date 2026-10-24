@@ -62,6 +62,26 @@ PAGES = {
     # loads, then sends itself to a host that does not resolve
     "/to-dead": (200, [], b'<html><body>going<script>setTimeout(() => { location.href = '
                           b'"http://nonexistent.invalid/"; }, 100);</script></body></html>'),
+    # the login link navigates from a timer (0.3 s); the target's load waits on a slow image
+    "/late-nav": (200, [], b'<html><body><a href="#" onclick="setTimeout(() => { location.href'
+                           b' = \'/onload\'; }, 300); return false;">Sign in</a></body></html>'),
+    # says on load whether its image arrived or loading was stopped first
+    "/onload": (200, [], b'<html><body>form<img src="/slow-img"><script>addEventListener("load",'
+                         b' () => document.body.append("image " + (document.images[0].naturalWidth'
+                         b' ? "arrived" : "stopped")));</script></body></html>'),
+    "/slow-img": (200, [("Content-Type", "image/gif")],
+                  b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01"
+                  b"\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"),
+    # opens a popup of its own on every visit; the login link opens another
+    "/popup-own": (200, [], b'<html><body><script>window.open("/?own");</script>'
+                            b'<a href="/login" target="_blank">Login</a></body></html>'),
+    "/hang-login": (200, [], b'<html><body><a href="/hang">Sign in</a></body></html>'),
+    # asks for high-entropy client hints; its login popup loads an image
+    "/popup-hints": (200, [("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, "
+                                         "Sec-CH-UA-Arch, Sec-CH-UA-Full-Version-List")],
+                     b'<html><body><a href="/hinted" target="_blank">Login</a></body></html>'),
+    "/hinted": (200, [], b'<html><body>hinted<script>setTimeout(() => fetch("/late-pic"), 300);'
+                         b'</script></body></html>'),
     "/fetch-big": (200, [], b'<html><body>big<script>fetch("/big");</script></body></html>'),
     # a favicon the page asks for itself, as a link and as an image
     "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
@@ -95,6 +115,8 @@ def _handler(site: Site):
             if self.path in ("/never", "/hang"):
                 site.release.wait(30)
                 return
+            if self.path == "/slow-img":  # a 1x1 GIF after 1.5 s
+                site.release.wait(1.5)
             if self.path == "/big":  # one byte over the WARC's cap, made per request
                 status, headers, body = 200, [("Content-Type", "application/octet-stream")], \
                     b"x" * (MAX_BODY + 1)
