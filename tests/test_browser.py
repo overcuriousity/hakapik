@@ -8,8 +8,9 @@ import pytest
 from warcio.archiveiterator import ArchiveIterator
 
 from hakapik.blobstore import BlobStore
-from hakapik.browser import PROFILES, Browser, _Recorder, classify
+from hakapik.browser import PROFILES, Browser, classify
 from hakapik.protocol import DnsAnswer, Job, NodeKey
+from hakapik.recorder import Recorder
 from hakapik.worker import IpSpacer, run_job
 
 # The shared browser fixture lives on the module loop; tests using it must too.
@@ -247,7 +248,7 @@ async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
 async def test_freeze_holds_against_later_meta_refresh(site, browser):
     # a refresh already scheduled at the freeze must not fire afterwards
     context = await browser._browser.new_context()
-    rec = _Recorder()
+    rec = Recorder()
     try:
         rec.watch(context)
         page = await context.new_page()
@@ -270,7 +271,7 @@ async def test_freeze_stops_a_refresh_loop(site, browser):
     # The race hits about every second freeze; five in a row must all hold.
     for _ in range(5):
         context = await browser._browser.new_context()
-        rec = _Recorder()
+        rec = Recorder()
         try:
             rec.watch(context)
             page = await context.new_page()

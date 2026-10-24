@@ -17,13 +17,14 @@ import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import urldefrag, urlsplit
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from playwright.async_api import async_playwright
 
 from hakapik.protocol import PageResult
+from hakapik.recorder import BLANK, Nav, Recorder
 from hakapik.warc import Exchange, build_warc
 
 log = logging.getLogger(__name__)
@@ -59,13 +60,11 @@ _HINTS: dict[str, dict] = {
                 "model": "", "mobile": False, "bitness": "64", "wow64": False},
 }
 
-MAX_CHAIN = 50
 MAX_CLICKS = 3
 MAX_LABEL = 200
 LOGIN_PATTERN = re.compile(r"log ?in|sign ?in|anmelden|einloggen|connexion|se connecter|"
                            r"iniciar sesi[oó]n|accedi|inloggen", re.IGNORECASE)
 DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
-_BLANK = ("about:blank", "chrome-error:")
 
 # Visible login elements in document order: with n < 0 their labels, else
 # the n-th element if its label is still ``label``, else the first element
@@ -137,124 +136,6 @@ def _error_text(e: Exception) -> str:
     if isinstance(e, PlaywrightTimeout):
         return f"TimeoutError: {msg}"
     return msg if isinstance(e, PlaywrightError) else f"{type(e).__name__}: {msg}"
-
-
-def _safe(fn, *args):
-    """An event handler; an exception in it would surface inside playwright's
-    dispatcher."""
-    def handler(x):
-        try:
-            fn(*args, x)
-        except Exception:
-            log.warning("event handler %s failed", fn.__name__, exc_info=True)
-    return handler
-
-
-class _Nav:
-    """One page's main-frame URL chain and document responses."""
-
-    def __init__(self):
-        self.chain: list[str] = []
-        self.responses: dict = {}  # URL -> last non-redirect main-frame response
-        self.failure: str | None = None  # error of the last failed navigation
-
-    def add(self, url: str):
-        if len(self.chain) < MAX_CHAIN and not url.startswith(_BLANK):
-            self.chain.append(url)
-
-    def response_for(self, url: str | None):
-        """The document response for ``url``, never another document's."""
-        return self.responses.get(urldefrag(url).url) if url else None
-
-
-class _Recorder:
-    """Collects one context's exchanges and each of its pages' navigations."""
-
-    def __init__(self):
-        self.tasks: list[asyncio.Task] = []
-        self.blocked: set = set()
-        self.navs: dict = {}  # page -> _Nav
-        self.open = True
-
-    def watch(self, context):
-        context.on("requestfinished", _safe(self._spawn, False))
-        context.on("requestfailed", _safe(self._spawn, True))
-        context.on("requestfailed", _safe(self._on_failed))
-        context.on("request", _safe(self._on_request))
-        context.on("response", _safe(self._on_response))
-
-    def nav(self, page) -> _Nav:
-        """``page``'s navigations; pages the site opens are tracked on their own."""
-        if page not in self.navs:
-            self.navs[page] = _Nav()
-            page.on("framenavigated", _safe(self._on_navigated, page))
-        return self.navs[page]
-
-    def _main_nav(self, req) -> _Nav | None:
-        if not req.is_navigation_request():
-            return None
-        frame = req.frame
-        return self.nav(frame.page) if frame.parent_frame is None else None
-
-    def _on_request(self, req):
-        if nav := self._main_nav(req):
-            nav.add(req.url)  # every hop, HTTP redirects included
-
-    def _on_failed(self, req):
-        if nav := self._main_nav(req):
-            nav.failure = req.failure
-
-    def _on_navigated(self, page, frame):
-        # Same-document navigations have no request of their own.
-        nav = self.navs[page]
-        if frame == page.main_frame and (not nav.chain or nav.chain[-1] != frame.url):
-            nav.add(frame.url)
-
-    def _on_response(self, resp):
-        if ((nav := self._main_nav(resp.request))
-                and not (300 <= resp.status < 400 and "location" in resp.headers)):
-            nav.responses[urldefrag(resp.url).url] = resp
-
-    def _spawn(self, failed: bool, req):
-        if self.open and req not in self.blocked:
-            self.tasks.append(asyncio.ensure_future(self._exchange(req, failed)))
-
-    async def _exchange(self, req, failed: bool) -> Exchange:
-        start = req.timing.get("startTime", -1)
-        at = datetime.fromtimestamp(start / 1000, UTC) if start > 0 else _now()
-        resp = None if failed else await req.response()
-        req_headers = tuple((h["name"], h["value"]) for h in await req.headers_array())
-        status, status_text, resp_headers, body, ip = 0, "", (), b"", None
-        unavailable = False
-        if resp is not None:
-            status, status_text = resp.status, resp.status_text
-            resp_headers = tuple((h["name"], h["value"]) for h in await resp.headers_array())
-            try:
-                body = await resp.body()
-            except PlaywrightError:  # redirects have none; evicted bodies are marked
-                unavailable = not (300 <= status < 400 and "location" in resp.headers)
-            ip = ((await resp.server_addr()) or {}).get("ipAddress")
-        return Exchange(url=req.url, method=req.method, request_headers=req_headers,
-                        request_body=req.post_data_buffer, status=status,
-                        status_text=status_text, response_headers=resp_headers,
-                        body=body, server_ip=ip, at=at, body_unavailable=unavailable)
-
-    async def exchanges(self, timeout_s: float) -> list[Exchange]:
-        """Stop recording and return what finished within ``timeout_s``."""
-        self.open = False
-        if not self.tasks:
-            return []
-        await asyncio.wait(self.tasks, timeout=timeout_s)
-        for t in self.tasks:
-            t.cancel()
-        results = await asyncio.gather(*self.tasks, return_exceptions=True)
-        out = []
-        for r in results:
-            if isinstance(r, Exchange):
-                out.append(r)
-            elif not isinstance(r, asyncio.CancelledError):
-                log.debug("exchange not recorded: %r", r)
-        return out
 
 
 class _ClickFailed(Exception):
@@ -354,7 +235,7 @@ class Browser:
             return None
 
     @classmethod
-    async def _freeze(cls, page, cdp, rec: _Recorder, deadline: float):
+    async def _freeze(cls, page, cdp, rec: Recorder, deadline: float):
         """Stop ``page`` where it is: a page that keeps navigating never yields
         a frame or DOM. ``cdp`` may be None (then only navigations are held).
 
@@ -381,7 +262,7 @@ class Browser:
             await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
             await bounded(cdp.send("Page.stopLoading"))
 
-    async def _click(self, context, rec: _Recorder, url: str, profile: str, n: int,
+    async def _click(self, context, rec: Recorder, url: str, profile: str, n: int,
                      label: str, deadline: float) -> ClickCapture:
         """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks the
         login element labelled ``label`` (the n-th, unless the page moved it)
@@ -406,7 +287,7 @@ class Browser:
         nav_error = status = server_ip = final_url = None
         clicked = False
         screenshot = dom = None
-        nav = _Nav()
+        nav = Nav()
         try:
             page = await asyncio.wait_for(context.new_page(), left())
             nav = rec.nav(page)
@@ -458,7 +339,7 @@ class Browser:
                 await self._freeze(target, cdp, rec, deadline)
                 screenshot = await bounded(target.screenshot(
                     type="png", timeout=max(deadline - loop.time(), 0.001) * 1000))
-            if not target.url.startswith(_BLANK):
+            if not target.url.startswith(BLANK):
                 final_url = target.url
             elif not nav_error:  # e.g. a popup that never got a document
                 nav_error = "no document"
@@ -481,8 +362,8 @@ class Browser:
         started = _now()
         loop = asyncio.get_running_loop()
         context = await self._browser.new_context(**settings, accept_downloads=False)
-        rec = _Recorder()
-        nav = _Nav()  # replaced by the page's once it exists
+        rec = Recorder()
+        nav = Nav()  # replaced by the page's once it exists
         hint_tasks: list[asyncio.Task] = []  # prepare_page of pages the site opens
         error = status = server_ip = final_url = deadline = None
         load_timeout = False
@@ -521,7 +402,7 @@ class Browser:
             bounded = functools.partial(self._bounded, deadline=deadline)
             if navigated:
                 await self._freeze(page, cdp, rec, deadline)
-            if not page.url.startswith(_BLANK):
+            if not page.url.startswith(BLANK):
                 final_url = page.url
             if (resp := nav.response_for(final_url)) is not None:
                 status = resp.status
