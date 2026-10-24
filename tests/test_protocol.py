@@ -87,7 +87,7 @@ def test_unknown_node_rejected(tmp_path):
 
 def test_node_id_mismatch_rejected(tmp_path):
     k, env = _env(tmp_path, node_id="x" * 32)
-    with pytest.raises(BadEnvelope):
+    with pytest.raises(BadEnvelope, match="node_id does not match"):
         open_envelope(env, {k.node_id: k.public_key}.get)
 
 
@@ -113,7 +113,7 @@ def test_signed_garbage_payload_rejected(tmp_path):
     env = canonical_json({
         "node_id": k.node_id,
         "payload": base64.b64encode(payload).decode(),
-        "signature": base64.b64encode(k._sk.sign(payload)).decode(),
+        "signature": base64.b64encode(k.sign(payload)).decode(),
     })
     with pytest.raises(BadEnvelope):
         open_envelope(env, {k.node_id: k.public_key}.get)
@@ -121,6 +121,64 @@ def test_signed_garbage_payload_rejected(tmp_path):
 
 def test_canonical_json_is_stable():
     assert canonical_json({"b": 1, "a": "ü"}) == b'{"a":"\\u00fc","b":1}'
+
+
+@pytest.mark.parametrize("v", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_non_finite_floats(v):
+    # NaN/Infinity are not JSON; a verifier in another language could not parse them.
+    with pytest.raises(ValueError):
+        canonical_json({"x": v})
+
+
+def test_new_key_is_synced_before_it_is_published(tmp_path, monkeypatch):
+    import os
+
+    import hakapik.protocol as protocol
+
+    events = []
+    real_fsync, real_link = os.fsync, os.link
+    monkeypatch.setattr(protocol.os, "fsync",
+                        lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(protocol.os, "link",
+                        lambda a, b: (events.append("link"), real_link(a, b))[1])
+    NodeKey.load_or_create(tmp_path / "node.key")
+    # The key bytes reach the disk before the name appears; the directory
+    # entry is synced after.
+    assert events[:2] == ["fsync", "link"] and events[2:] == ["fsync"]
+
+
+def test_key_created_without_hard_links(tmp_path, monkeypatch):
+    import errno
+
+    import hakapik.protocol as protocol
+
+    def no_link(a, b):
+        raise OSError(errno.EPERM, "hard links not supported")
+
+    monkeypatch.setattr(protocol.os, "link", no_link)
+    p = tmp_path / "node.key"
+    k = NodeKey.load_or_create(p)
+    assert p.read_bytes() and p.stat().st_mode & 0o777 == 0o600
+    assert NodeKey.load_or_create(p).node_id == k.node_id
+    assert [x.name for x in tmp_path.iterdir()] == ["node.key"]
+
+
+@pytest.mark.parametrize("size", [0, 31, 33])
+def test_key_of_wrong_length_names_the_file(tmp_path, size):
+    p = tmp_path / "node.key"
+    p.write_bytes(b"\x01" * size)
+    with pytest.raises(ValueError, match=f"node.key.*{size} bytes, expected 32"):
+        NodeKey.load_or_create(p)
+
+
+def test_key_readable_by_others_is_reported(tmp_path, caplog):
+    p = tmp_path / "node.key"
+    p.write_bytes(b"\x01" * 32)
+    p.chmod(0o644)
+    with caplog.at_level("WARNING", logger="hakapik.protocol"):
+        NodeKey.load_or_create(p)
+    assert any("node.key" in r.getMessage() and "0o644" in r.getMessage()
+               for r in caplog.records)
 
 
 def _signed(tmp_path, payload: bytes):

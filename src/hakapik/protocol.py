@@ -10,6 +10,7 @@ import binascii
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Callable
@@ -22,6 +23,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
     Ed25519PublicKey,
 )
+
+log = logging.getLogger(__name__)
 
 OUTCOMES = ("dns_fail", "connect_fail", "tls_error", "timeout", "http_error",
             "download", "live", "error")
@@ -90,8 +93,10 @@ class BadEnvelope(Exception):
 
 
 def canonical_json(obj) -> bytes:
+    # allow_nan=False: NaN and Infinity are not JSON, so a verifier in another
+    # language could not parse (or re-hash) a document holding them.
     return json.dumps(obj, sort_keys=True, separators=(",", ":"),
-                      ensure_ascii=True).encode("ascii")
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
 
 
 def result_to_json(r: AttemptResult) -> bytes:
@@ -162,24 +167,59 @@ class NodeKey:
     def load_or_create(cls, path: Path) -> "NodeKey":
         path = Path(path)
         if not path.exists():
-            seed = os.urandom(32)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # mkstemp creates the file 0o600; link() publishes it atomically
-            # and fails rather than overwrite if another process won the race.
-            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-key-")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(seed)
-                try:
-                    os.link(tmp, path)
-                except FileExistsError:
-                    pass
-            finally:
-                os.unlink(tmp)
-        return cls(path.read_bytes())
+            _create_key(path, os.urandom(32))
+        seed = path.read_bytes()
+        if len(seed) != 32:
+            raise ValueError(
+                f"node key {path} is {len(seed)} bytes, expected 32; it is damaged "
+                "(deleting it creates a new key, i.e. a new node id)")
+        mode = path.stat().st_mode & 0o777
+        if mode & 0o077:
+            log.warning("node key %s has mode %s; it should be 0o600", path, oct(mode))
+        return cls(seed)
 
     def sign(self, data: bytes) -> bytes:
         return self._sk.sign(data)
+
+
+def _create_key(path: Path, seed: bytes) -> None:
+    """Write a new key file 0o600; never overwrite one another process wrote first.
+
+    The bytes are fsynced before the name appears, then the directory, so a
+    crash cannot leave a short key under the final name.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # mkstemp creates the file 0o600; link() publishes it atomically and
+    # fails rather than overwrite if another process won the race.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".tmp-key-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(seed)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            return
+        except OSError:
+            # No hard links on this filesystem: create the name exclusively.
+            # A crash mid-write can leave a short file, which load_or_create
+            # reports by name instead of using it.
+            try:
+                kfd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                return
+            with os.fdopen(kfd, "wb") as f:
+                f.write(seed)
+                f.flush()
+                os.fsync(f.fileno())
+    finally:
+        os.unlink(tmp)
+    dfd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:
