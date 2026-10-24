@@ -244,7 +244,10 @@ def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
         deadline = time.monotonic() + KEY_LOCK_WAIT_S
         while not path.exists():
             if time.monotonic() > deadline:
-                if not retried and _lock_owner_dead(lock):
+                owner = None if retried else _dead_lock_owner(lock)
+                if owner is not None and _lock_identity(lock) == owner:
+                    # Re-read just before the unlink: a lock re-created by
+                    # another process meanwhile (new inode or PID) is kept.
                     log.warning("removing %s left by a process that is gone", lock)
                     with contextlib.suppress(FileNotFoundError):
                         os.unlink(lock)
@@ -256,7 +259,12 @@ def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
             time.sleep(0.05)
         return False
     try:
-        with os.fdopen(lfd, "w") as f:
+        try:
+            f = os.fdopen(lfd, "w")
+        except BaseException:
+            os.close(lfd)
+            raise
+        with f:
             f.write(str(os.getpid()))
         if path.exists():
             return False
@@ -266,21 +274,36 @@ def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
         os.unlink(lock)
 
 
-def _lock_owner_dead(lock: Path) -> bool:
-    """True only if the lock names a PID that no longer exists."""
+def _lock_identity(lock: Path) -> tuple[int, int] | None:
+    """(inode, PID) of the lock file, or None if it is gone or holds no PID."""
     try:
+        ino = os.stat(lock).st_ino
         pid = int(lock.read_text())
     except (OSError, ValueError):
-        return False  # unreadable: cannot tell, so not known dead
-    if pid <= 0:
-        return False
+        return None
+    return ino, pid
+
+
+def _dead_lock_owner(lock: Path) -> tuple[int, int] | None:
+    """The lock's (inode, PID) if that PID no longer exists, else None.
+
+    An empty or unreadable lock is never taken as dead, by design: its creator
+    writes the PID right after creating it, so an empty lock means a crash in
+    that instant or a file hakapik did not write; an operator decides.
+    A creator in another PID namespace (e.g. another container sharing the
+    data directory) can look dead here; processes sharing a data_dir must
+    share a PID namespace.
+    """
+    ident = _lock_identity(lock)
+    if ident is None or ident[1] <= 0:
+        return None
     try:
-        os.kill(pid, 0)
+        os.kill(ident[1], 0)
     except ProcessLookupError:
-        return True
+        return ident
     except OSError:
-        return False  # e.g. EPERM: it exists under another user
-    return False
+        return None  # e.g. EPERM: it exists under another user
+    return None
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:

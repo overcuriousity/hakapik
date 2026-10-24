@@ -35,6 +35,12 @@ class Config:
     ageout_hours: float = 24.0
     nav_timeout_s: float = 30.0
     lease_s: int = 600
+    # Overall bound on one job's run (resolve, spacing, captures, blob writes);
+    # the store is not included. 900 s: the real worst case at the defaults is
+    # 5 navigations (mobile, desktop, 3 click hops) * 30 s plus settles and
+    # screenshots, 2 * 10 s of DNS, spacer waits and blob writes, well under
+    # 900 s, which is 4.5 times the default lease floor (200 s).
+    job_timeout_s: float = 900.0
     asn_mmdb: Path | None = None  # GeoLite2-ASN .mmdb supplied by the operator
 
 
@@ -46,7 +52,7 @@ _INT_MIN = {
 }
 _FLOAT_MIN = {
     "fetch_per_ip_interval_s": 0.0, "ageout_hours": 0.0, "nav_timeout_s": 0.0,
-    "orphan_margin_hours": 1.0, "resolver_query_deadline_s": 0.0,
+    "orphan_margin_hours": 1.0, "resolver_query_deadline_s": 0.0, "job_timeout_s": 0.0,
 }
 # Float keys that must be strictly greater than their minimum.
 _FLOAT_POSITIVE = ("resolver_query_deadline_s",)
@@ -113,9 +119,14 @@ def load_config(path: Path) -> Config:
     # mobile + desktop + click capture; what keeps a running job from being
     # claimed again is fetchloop's heartbeat, which extends the lease every
     # lease_s / 3 while the job runs.
-    if cfg.lease_s < 4 * cfg.nav_timeout_s + 2 * cfg.resolver_query_deadline_s + 60:
+    floor = 4 * cfg.nav_timeout_s + 2 * cfg.resolver_query_deadline_s + 60
+    if cfg.lease_s < floor:
         raise ValueError(
             "lease_s must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s + 60")
+    if cfg.job_timeout_s < floor:
+        raise ValueError(
+            "job_timeout_s must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s"
+            " + 60")
     # A worker's blobs are unreferenced until store_result locks and verifies
     # them. A blob the sweep takes before that only gets the result rejected
     # and the job retried (nothing dangling is committed); the margin makes

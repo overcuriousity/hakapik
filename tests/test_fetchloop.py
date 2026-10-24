@@ -11,6 +11,7 @@ from hakapik import fetchloop
 from hakapik.asn import AsnDb
 from hakapik.config import Config
 from hakapik.fetchloop import run_fetch
+from hakapik.db import connect
 from hakapik.jobs import claim_jobs, enqueue_manual
 from hakapik.protocol import DnsAnswer, NodeKey
 from hakapik.store import ResultRejected
@@ -291,7 +292,8 @@ async def test_asn_db_is_closed_when_fetch_ends(conn, tmp_path, asn_mmdb, monkey
     assert len(closed) == 1
 
 
-async def test_heartbeat_keeps_a_slow_job_leased_then_stops(conn, tmp_path, monkeypatch):
+async def test_heartbeat_keeps_a_slow_job_leased_then_stops(conn, tmp_path, monkeypatch,
+                                                            caplog):
     # lease_s = 1 and a capture that takes longer: without the heartbeat the
     # job would be claimable again while it runs.
     gate, started = asyncio.Event(), asyncio.Event()
@@ -325,6 +327,7 @@ async def test_heartbeat_keeps_a_slow_job_leased_then_stops(conn, tmp_path, monk
     after = len(beats)
     await asyncio.sleep(0.8)  # more than two ticks
     assert len(beats) == after
+    assert "lease lost" not in caplog.text
 
 
 async def test_heartbeat_failure_is_logged_and_retried(conn, tmp_path, monkeypatch, caplog):
@@ -370,3 +373,106 @@ async def test_node_key_is_loaded_off_the_event_loop(conn, tmp_path, monkeypatch
     monkeypatch.setattr(NodeKey, "load_or_create", classmethod(recording))
     await _once(_cfg(tmp_path))
     assert threads and threads[0] is not threading.main_thread()
+
+
+class GatedBrowser(FakeBrowser):
+    """Captures wait for ``gate``; ``started`` is set at the first capture."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate, self.started = asyncio.Event(), asyncio.Event()
+
+    async def capture(self, url, profile, *, click_through=False):
+        self.started.set()
+        await self.gate.wait()
+        return await super().capture(url, profile, click_through=click_through)
+
+
+def _count_extends(monkeypatch):
+    calls = []
+    real = fetchloop.extend_lease
+
+    async def counting(*a, **k):
+        t = asyncio.get_running_loop().time()
+        try:
+            return await real(*a, **k)
+        finally:
+            calls.append(asyncio.get_running_loop().time() - t)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", counting)
+    return calls
+
+
+async def _until(pred, timeout=5.0):
+    for _ in range(int(timeout / 0.02)):
+        if pred():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not reached")
+
+
+async def test_hung_job_times_out_stores_nothing_and_stays_leased(conn, tmp_path,
+                                                                  monkeypatch, caplog):
+    calls = _count_extends(monkeypatch)
+    b = GatedBrowser()  # the gate never opens: the capture hangs
+    cfg = _cfg(tmp_path, lease_s=1, job_timeout_s=0.8)
+    await _queue(conn, "a.example.com")
+    await asyncio.wait_for(_once(cfg, browser=b), 10)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("a.example.com" in r.getMessage() and "timed out" in r.getMessage()
+               for r in errors)
+    assert await _count(conn, "attempt") == 0
+    assert await _count(conn, "fetch_job", "step = 0 AND claimed_until > now()") == 1
+    after = len(calls)
+    await asyncio.sleep(0.8)
+    assert len(calls) == after  # the heartbeat stopped with the job
+
+
+async def test_heartbeat_stops_when_another_holder_claims(conn, tmp_path, monkeypatch,
+                                                          caplog):
+    calls = _count_extends(monkeypatch)
+    b = GatedBrowser()
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=b, once=True))
+    await asyncio.wait_for(b.started.wait(), 10)
+    cur = await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() + interval '1 hour' "
+        "RETURNING claimed_until")
+    theirs = (await cur.fetchone())[0]
+    await conn.commit()
+    await _until(lambda: "lease lost" in caplog.text)
+    after = len(calls)
+    await asyncio.sleep(0.8)
+    assert len(calls) == after
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job")
+    assert (await cur.fetchone())[0] == theirs  # never extended
+    await conn.rollback()
+    b.gate.set()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_heartbeat_skips_a_locked_row_instead_of_waiting(conn, tmp_path,
+                                                               monkeypatch, caplog):
+    calls = _count_extends(monkeypatch)
+    b = GatedBrowser()
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=b, once=True))
+    await asyncio.wait_for(b.started.wait(), 10)
+    locker = await connect(_test_db_url())
+    try:
+        await locker.execute("SELECT 1 FROM fetch_job FOR UPDATE")
+        n = len(calls)
+        await _until(lambda: len(calls) >= n + 2)  # ticks keep coming
+        assert all(d < 1.0 for d in calls)  # none waited for the lock
+    finally:
+        await locker.close()
+    n = len(calls)
+    await _until(lambda: len(calls) >= n + 1)
+    assert "lease extension failed" not in caplog.text and "lease lost" not in caplog.text
+    b.gate.set()
+    await asyncio.wait_for(task, 10)
+    assert await _count(conn, "attempt") == 1

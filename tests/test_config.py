@@ -175,3 +175,12 @@ def test_orphan_margin_validated(tmp_path, extra, msg):
 def test_orphan_margin_default_and_override(tmp_path):
     assert load_config(_write(tmp_path, "")).orphan_margin_hours == 24.0
     assert load_config(_write(tmp_path, "orphan_margin_hours = 2\n")).orphan_margin_hours == 2
+
+
+def test_job_timeout_default_and_floor(tmp_path):
+    assert _load(tmp_path, "").job_timeout_s == 900.0
+    # floor at the defaults: 4 * 30 + 2 * 10 + 60 = 200
+    assert _load(tmp_path, "job_timeout_s = 200").job_timeout_s == 200
+    for bad in ("199", "nan", "inf", "-1", "true"):
+        with pytest.raises(ValueError, match="job_timeout_s"):
+            _load(tmp_path, f"job_timeout_s = {bad}\n")

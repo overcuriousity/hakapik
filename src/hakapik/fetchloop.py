@@ -5,8 +5,9 @@ jobs up to the free worker slots and runs each as its own task:
 ``run_job`` -> ``store_result`` in a borrowed connection -> commit. The claim
 and sweep transactions are committed at once (jobs use the transaction's
 fixed now()). While a task runs, a heartbeat extends its job's lease every
-lease_s / 3, so a running job is never claimed again. A task that fails
-leaves its job leased; it is claimed again after the lease expires. Signal handling belongs to the caller: setting
+lease_s / 3, so a running job is never claimed again; ``job_timeout_s`` bounds
+the run. A task that fails or times out leaves its job leased; it is claimed
+again after the lease expires. Signal handling belongs to the caller: setting
 ``stop`` ends claiming, and running tasks finish before ``run_fetch`` returns.
 """
 
@@ -18,6 +19,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import maxminddb
+import psycopg
 
 from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
@@ -25,8 +27,8 @@ from hakapik.browser import Browser
 from hakapik.config import Config
 from hakapik.db import connect, lock_blob, migrate
 from hakapik.ingest import ConnPool
-from hakapik.jobs import attempts_today, claim_jobs, extend_lease, sweep
-from hakapik.protocol import Job, NodeKey, open_envelope
+from hakapik.jobs import Claim, attempts_today, claim_jobs, extend_lease, sweep
+from hakapik.protocol import NodeKey, open_envelope
 from hakapik.resolve import Resolver
 from hakapik.store import ResultRejected, register_node, store_result
 from hakapik.worker import BrowserLike, IpSpacer, ResolverLike, run_job
@@ -63,21 +65,35 @@ async def _load_asn(cfg: Config, bs: BlobStore, conn) -> AsnDb | None:
     return asn
 
 
-async def _heartbeat(pool: ConnPool, job: Job, lease_s: int) -> None:
-    """Extend ``job``'s lease every lease_s / 3 until cancelled.
+async def _heartbeat(pool: ConnPool, claim: Claim, lease_s: int,
+                     stored: asyncio.Event) -> None:
+    """Extend the claim's lease every lease_s / 3 until cancelled or the claim is lost.
 
-    A failed extension is logged and tried again at the next tick; it never
-    ends the job.
+    Each extension is guarded by the token it last wrote, so it never extends
+    another holder's claim. A row locked by this job's own store_result skips
+    the tick instead of waiting; any other failure is logged and tried again
+    at the next tick. Neither ends the job.
     """
+    job, token = claim
     while True:
-        await asyncio.sleep(lease_s / 3)
+        await asyncio.sleep(max(lease_s / 3, 0.05))
         try:
             async with pool.borrow() as c:
-                await extend_lease(c, job.job_id, job.step, lease_s)
+                new = await extend_lease(c, job.job_id, job.step, lease_s, token)
                 await c.commit()
+        except psycopg.errors.LockNotAvailable:
+            continue  # the row is busy (store_result): skip this tick
         except Exception:
             log.warning("job %d %s: lease extension failed; retrying next tick",
                         job.job_id, job.fqdn, exc_info=True)
+            continue
+        if new is None:
+            if not stored.is_set():
+                # store_result's stale check decides what becomes of the result.
+                log.warning("job %d %s: lease lost to another claim; heartbeat stops",
+                            job.job_id, job.fqdn)
+            return
+        token = new
 
 
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
@@ -115,14 +131,23 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                     Browser(proxy=cfg.fetch_proxy, nav_timeout_s=cfg.nav_timeout_s))
             spacer = IpSpacer(cfg.fetch_per_ip_interval_s)
 
-            async def one(job: Job) -> None:
+            async def one(claim: Claim) -> None:
                 # Never raises: a failed job stays leased until its lease expires.
+                job = claim.job
                 log.info("claimed job %d %s step %d", job.job_id, job.fqdn, job.step)
-                beat = asyncio.create_task(_heartbeat(pool, job, cfg.lease_s))
+                stored = asyncio.Event()
+                beat = asyncio.create_task(_heartbeat(pool, claim, cfg.lease_s, stored))
                 try:
-                    env = await run_job(job, resolver=resolver, browser=browser, bs=bs,
-                                        key=key, egress_address=cfg.egress_address,
-                                        spacer=spacer)
+                    try:
+                        async with asyncio.timeout(cfg.job_timeout_s):
+                            env = await run_job(
+                                job, resolver=resolver, browser=browser, bs=bs, key=key,
+                                egress_address=cfg.egress_address, spacer=spacer)
+                    except TimeoutError:
+                        # Nothing is stored; the lease expires and the job is retried.
+                        log.error("job %d %s timed out after %s s; nothing stored",
+                                  job.job_id, job.fqdn, cfg.job_timeout_s)
+                        return
                     # Read before storing: after the commit only the log line
                     # runs, so a job logged as failed below was never stored.
                     outcome = open_envelope(env, {key.node_id: key.public_key}.get).outcome
@@ -131,6 +156,7 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                             attempt_id = await store_result(
                                 c, bs, env, cfg.retry_ladder_s, asn_db=asn_db)
                             await c.commit()
+                            stored.set()
                         except ResultRejected as e:
                             await c.rollback()
                             log.error("job %d %s: result rejected: %s",
@@ -154,11 +180,11 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
 
 
 async def _loop(cfg: Config, stop: asyncio.Event, once: bool, pool: ConnPool,
-                one: Callable[[Job], Awaitable[None]]) -> None:
+                one: Callable[[Claim], Awaitable[None]]) -> None:
     running: set[asyncio.Task] = set()
     try:
         while not stop.is_set():
-            jobs: list[Job] = []
+            jobs: list[Claim] = []
             capped = False
             # The sweep has its own try: a failing sweep must not stop claims.
             try:

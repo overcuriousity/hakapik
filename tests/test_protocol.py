@@ -242,6 +242,47 @@ def test_no_link_lock_of_a_live_process_is_reported(tmp_path, monkeypatch):
     assert (tmp_path / "node.key.lock").exists()
 
 
+def test_no_link_lock_recreated_meanwhile_is_kept(tmp_path, monkeypatch):
+    # The lock looked dead, but another process replaced it before the unlink:
+    # the re-read sees a new identity and the lock stays.
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
+    lock = tmp_path / "node.key.lock"
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    lock.write_text(str(gone.pid))
+    real = protocol._dead_lock_owner
+
+    def then_recreated(path):
+        owner = real(path)
+        path.unlink()
+        path.write_text(str(os.getpid()))
+        return owner
+
+    monkeypatch.setattr(protocol, "_dead_lock_owner", then_recreated)
+    with pytest.raises(RuntimeError, match="node.key.lock"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    assert lock.read_text() == str(os.getpid())
+
+
+def test_no_link_lock_fd_closed_when_fdopen_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    real_fdopen = os.fdopen
+
+    def fdopen(fd, mode="r", *a, **k):
+        if mode == "w":
+            raise OSError("fdopen failed")
+        return real_fdopen(fd, mode, *a, **k)
+
+    before = set(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(protocol.os, "fdopen", fdopen)
+    with pytest.raises(OSError, match="fdopen failed"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    monkeypatch.undo()
+    assert set(os.listdir("/proc/self/fd")) <= before
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_no_link_lock_holds_its_creators_pid(tmp_path, monkeypatch):
     seen = []
     real_rename = os.rename

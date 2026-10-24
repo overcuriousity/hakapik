@@ -7,6 +7,7 @@ transactions short.
 """
 
 from datetime import datetime
+from typing import NamedTuple
 
 import psycopg
 
@@ -18,7 +19,17 @@ class _LostRace(Exception):
     pass
 
 
-async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> list[Job]:
+class Claim(NamedTuple):
+    """A leased job and the claimed_until this claim set: the claim's token.
+
+    The token stays out of ``Job``, which is the worker protocol's wire type.
+    """
+
+    job: Job
+    claimed_until: datetime
+
+
+async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> list[Claim]:
     """Lease up to ``n`` due open jobs, highest priority and newest first."""
     cur = await conn.execute(
         """UPDATE fetch_job SET claimed_until = now() + make_interval(secs => %s)
@@ -29,23 +40,42 @@ async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> lis
              ORDER BY priority DESC, due_at DESC
              LIMIT %s
              FOR UPDATE SKIP LOCKED)
-           RETURNING id, candidate_id, fqdn, registrable, step, priority, due_at""",
+           RETURNING id, candidate_id, fqdn, registrable, step, priority, due_at,
+                     claimed_until""",
         (lease_s, n),
     )
     rows = sorted(await cur.fetchall(), key=lambda r: (-r[5], -r[6].timestamp()))
-    return [Job(r[0], r[1], r[2], r[3], r[4], f"https://{r[2]}/") for r in rows]
+    return [Claim(Job(r[0], r[1], r[2], r[3], r[4], f"https://{r[2]}/"), r[7])
+            for r in rows]
+
+
+LEASE_LOCK_TIMEOUT = "100ms"  # how long extend_lease waits for the job row
 
 
 async def extend_lease(
-    conn: psycopg.AsyncConnection, job_id: int, step: int, lease_s: int
-) -> bool:
-    """Push a running job's lease to now() + lease_s; False if it moved on or closed."""
+    conn: psycopg.AsyncConnection, job_id: int, step: int, lease_s: int,
+    claimed_until: datetime,
+) -> datetime | None:
+    """Push a held lease to now() + lease_s; the new token, or None if not held.
+
+    The lease is held while the job is open at ``step`` and its claimed_until
+    is still ``claimed_until`` (the token this holder last wrote). None means
+    the claim was lost (re-claimed after expiry) or the job moved on.
+
+    Sets lock_timeout for the caller's transaction: if the row is locked
+    (e.g. by this job's own store_result), this raises
+    psycopg.errors.LockNotAvailable after LEASE_LOCK_TIMEOUT instead of
+    waiting; the caller rolls back and tries again later.
+    """
+    await conn.execute(f"SET LOCAL lock_timeout = '{LEASE_LOCK_TIMEOUT}'")
     cur = await conn.execute(
         """UPDATE fetch_job SET claimed_until = now() + make_interval(secs => %s)
-           WHERE id = %s AND state = 'open' AND step = %s""",
-        (lease_s, job_id, step),
+           WHERE id = %s AND state = 'open' AND step = %s AND claimed_until = %s
+           RETURNING claimed_until""",
+        (lease_s, job_id, step, claimed_until),
     )
-    return cur.rowcount == 1
+    row = await cur.fetchone()
+    return None if row is None else row[0]
 
 
 async def advance_job(

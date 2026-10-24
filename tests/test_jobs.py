@@ -1,6 +1,9 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import psycopg
+import pytest
+
 from conftest import _test_db_url
 
 from hakapik.db import CandidateRow, add_candidates, connect
@@ -47,9 +50,11 @@ async def test_claim_newest_first(conn):
     await _add(conn, "a.example.com", 30)
     await _add(conn, "b.example.com", 20)
     newest = await _add(conn, "c.example.com", 10)
-    jobs = await claim_jobs(conn, 1, 60)
-    assert [j.job_id for j in jobs] == [newest]
-    assert jobs[0].url == "https://c.example.com/" and jobs[0].step == 0
+    claims = await claim_jobs(conn, 1, 60)
+    assert [c.job.job_id for c in claims] == [newest]
+    assert claims[0].job.url == "https://c.example.com/" and claims[0].job.step == 0
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (newest,))
+    assert claims[0].claimed_until == (await cur.fetchone())[0]
 
 
 async def test_claim_respects_due_and_lease(conn):
@@ -57,15 +62,15 @@ async def test_claim_respects_due_and_lease(conn):
     await conn.execute("UPDATE fetch_job SET due_at = now() + interval '1 hour'")
     assert await claim_jobs(conn, 5, 60) == []
     await conn.execute("UPDATE fetch_job SET due_at = now()")
-    assert [j.job_id for j in await claim_jobs(conn, 5, 60)] == [future]
+    assert [c.job.job_id for c in await claim_jobs(conn, 5, 60)] == [future]
     assert await claim_jobs(conn, 5, 60) == []
 
 
 async def test_expired_lease_is_reclaimed(conn):
     jid = await _add(conn, "a.example.com")
-    assert [j.job_id for j in await claim_jobs(conn, 1, 1)] == [jid]
+    assert [c.job.job_id for c in await claim_jobs(conn, 1, 1)] == [jid]
     await conn.execute("UPDATE fetch_job SET claimed_until = now() - interval '1 second'")
-    assert [j.job_id for j in await claim_jobs(conn, 1, 1)] == [jid]
+    assert [c.job.job_id for c in await claim_jobs(conn, 1, 1)] == [jid]
 
 
 async def _job(conn, jid):
@@ -191,12 +196,12 @@ async def test_claim_orders_by_priority_then_newest(conn):
         ids[fqdn] = await _add(conn, fqdn, age)
         await conn.execute("UPDATE fetch_job SET priority = %s WHERE id = %s",
                            (prio, ids[fqdn]))
-    jobs = await claim_jobs(conn, 4, 60)
-    assert [j.fqdn for j in jobs] == ["hi-new.example.com", "hi-old.example.com",
+    claims = await claim_jobs(conn, 4, 60)
+    assert [c.job.fqdn for c in claims] == ["hi-new.example.com", "hi-old.example.com",
                                       "lo-new.example.com", "lo-old.example.com"]
     # The limit takes the highest priority first, not the newest.
     await conn.execute("UPDATE fetch_job SET claimed_until = NULL")
-    assert [j.fqdn for j in await claim_jobs(conn, 1, 60)] == ["hi-new.example.com"]
+    assert [c.job.fqdn for c in await claim_jobs(conn, 1, 60)] == ["hi-new.example.com"]
 
 
 async def test_sweep_takes_fractional_ageout_hours(conn):
@@ -207,14 +212,55 @@ async def test_sweep_takes_fractional_ageout_hours(conn):
     assert (await _job(conn, young))[1] == "open"
 
 
-async def test_extend_lease_only_for_the_running_step(conn):
+async def test_extend_lease_only_for_the_holder_of_the_token(conn):
     jid = await _add(conn, "a.example.com")
-    await claim_jobs(conn, 1, 1)
-    assert await extend_lease(conn, jid, 0, 600) is True
-    cur = await conn.execute(
-        "SELECT claimed_until - now() > interval '590 seconds' FROM fetch_job WHERE id = %s",
-        (jid,))
-    assert (await cur.fetchone())[0]
-    assert await extend_lease(conn, jid, 1, 600) is False  # stale step
+    [claim] = await claim_jobs(conn, 1, 1)
+    token = await extend_lease(conn, jid, 0, 600, claim.claimed_until)
+    assert token is not None and token > claim.claimed_until
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (jid,))
+    assert (await cur.fetchone())[0] == token
+    # The old token no longer holds the lease; nor does a stale step.
+    assert await extend_lease(conn, jid, 0, 600, claim.claimed_until) is None
+    assert await extend_lease(conn, jid, 1, 600, token) is None
     await conn.execute("UPDATE fetch_job SET state = 'done' WHERE id = %s", (jid,))
-    assert await extend_lease(conn, jid, 0, 600) is False  # closed
+    assert await extend_lease(conn, jid, 0, 600, token) is None  # closed
+
+
+async def test_extend_lease_after_another_claim_is_a_noop(conn):
+    jid = await _add(conn, "a.example.com")
+    [old] = await claim_jobs(conn, 1, 1)
+    await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() - interval '1 second' WHERE id = %s",
+        (jid,))
+    await conn.commit()
+    [new] = await claim_jobs(conn, 1, 60)  # a second holder after expiry
+    assert await extend_lease(conn, jid, 0, 600, old.claimed_until) is None
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (jid,))
+    assert (await cur.fetchone())[0] == new.claimed_until
+
+
+async def test_extend_lease_after_the_result_was_stored_is_a_noop(conn):
+    # store_result advances the job (advance_job) and commits; a heartbeat
+    # tick that fires after that changes nothing.
+    jid = await _add(conn, "a.example.com")
+    [claim] = await claim_jobs(conn, 1, 60)
+    await advance_job(conn, jid, 0, (0, 120))
+    await conn.commit()
+    assert await extend_lease(conn, jid, 0, 600, claim.claimed_until) is None
+    assert (await _job(conn, jid))[:3] == (1, "open", None)
+
+
+async def test_extend_lease_does_not_wait_for_a_locked_row(conn):
+    jid = await _add(conn, "a.example.com")
+    [claim] = await claim_jobs(conn, 1, 60)
+    await conn.commit()
+    other = await connect(_test_db_url())
+    try:
+        await other.execute("SELECT 1 FROM fetch_job WHERE id = %s FOR UPDATE", (jid,))
+        t = asyncio.get_running_loop().time()
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            await extend_lease(conn, jid, 0, 600, claim.claimed_until)
+        assert asyncio.get_running_loop().time() - t < 2
+        await conn.rollback()
+    finally:
+        await other.close()
