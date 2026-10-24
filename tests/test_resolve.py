@@ -1,9 +1,12 @@
+import time
+
 import dns.asyncresolver
 import dns.resolver
 import dns.reversename
 import pytest
 import pytest_asyncio
 
+from hakapik.protocol import DnsAnswer
 from hakapik.resolve import Resolver, addresses
 
 NAME = "login.example.com"
@@ -141,3 +144,41 @@ async def test_qname_case_and_trailing_dot_are_normalised(dns_server):
     ans = await r.resolve("LOGIN.Example.COM.", "Example.COM.")
     assert {a.qname for a in ans if a.rrtype != "PTR"} == {NAME, "example.com"}
     assert addresses(ans, NAME) == ["1.2.3.4"]
+
+
+def test_addresses_matches_the_fqdn_in_any_case():
+    ans = (DnsAnswer(NAME, "A", "NOERROR", 60, ("1.2.3.4",), "x", "t"),
+           DnsAnswer(NAME, "AAAA", "NOERROR", 60, ("2001:db8::1",), "x", "t"))
+    assert addresses(ans, "LOGIN.Example.COM.") == ["1.2.3.4", "2001:db8::1"]
+
+
+async def _two_silent_servers(dns_server_factory):
+    # Same port on 127.0.0.1 and 127.0.0.2; both drop every query for "slow".
+    first = await dns_server_factory({}, drop={"slow.example.com"})
+    second = await dns_server_factory({}, drop={"slow.example.com"},
+                                      host="127.0.0.2", port=first.port)
+    return first, second
+
+
+async def test_query_deadline_bounds_the_time_across_servers(dns_server_factory):
+    first, second = await _two_silent_servers(dns_server_factory)
+    r = Resolver(("127.0.0.1", "127.0.0.2"), port=first.port, timeout_s=1.0,
+                 query_deadline_s=1.2)
+    t = time.monotonic()
+    ans = await r.resolve("slow.example.com", "slow.example.com")
+    elapsed = time.monotonic() - t
+    # Without the deadline each query takes 2 * timeout_s = 2.0 s.
+    assert 1.1 <= elapsed < 1.8
+    assert second.udp_queries  # the remaining 0.2 s went to the second server
+    assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)
+
+
+async def test_query_deadline_below_timeout_asks_only_the_first(dns_server_factory):
+    first, second = await _two_silent_servers(dns_server_factory)
+    r = Resolver(("127.0.0.1", "127.0.0.2"), port=first.port, timeout_s=1.0,
+                 query_deadline_s=0.3)
+    t = time.monotonic()
+    ans = await r.resolve("slow.example.com", "slow.example.com")
+    assert time.monotonic() - t < 0.9
+    assert first.udp_queries and not second.udp_queries
+    assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)

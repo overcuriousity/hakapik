@@ -276,3 +276,12 @@ async def test_failed_desktop_blob_write_keeps_the_whole_mobile_pass(tmp_path):
     assert {(x.profile, x.kind) for x in r.blobs} == {
         ("mobile", "warc"), ("mobile", "screenshot"), ("mobile", "dom"),
         ("mobile", "certchain")}
+
+
+async def test_failed_click_blob_write_drops_the_desktop_pass(tmp_path):
+    # The click screenshot is the desktop capture's last write: the whole
+    # desktop pass (its page, its click page and their blobs) is dropped.
+    r = await _run_store(tmp_path, FailingStore(tmp_path / "blobs", b"png-c"), FakeBrowser())
+    assert r.outcome == "live" and r.error == repr(OSError("disk full"))
+    assert [p.profile for p in r.pages] == ["mobile"]
+    assert {x.profile for x in r.blobs} == {"mobile"}

@@ -254,8 +254,8 @@ async def test_default_resolver_and_browser_are_built_from_config_and_closed(
     made = {}
 
     class StubResolver(FakeResolver):
-        def __init__(self, nameservers):
-            made["nameservers"] = nameservers
+        def __init__(self, nameservers, *, query_deadline_s):
+            made["nameservers"] = (nameservers, query_deadline_s)
 
     class StubBrowser(FakeBrowser):
         def __init__(self, *, proxy, nav_timeout_s):
@@ -273,10 +273,10 @@ async def test_default_resolver_and_browser_are_built_from_config_and_closed(
     monkeypatch.setattr(fetchloop, "Resolver", StubResolver)
     monkeypatch.setattr(fetchloop, "Browser", StubBrowser)
     cfg = _cfg(tmp_path, resolver_nameservers=("192.0.2.53",),
-               fetch_proxy="socks5://127.0.0.1:9", nav_timeout_s=7)
+               resolver_query_deadline_s=4.5, fetch_proxy="socks5://127.0.0.1:9", nav_timeout_s=7)
     await _queue(conn, "a.example.com")
     await run_fetch(cfg, stop=asyncio.Event(), once=True)
-    assert made["nameservers"] == ("192.0.2.53",)
+    assert made["nameservers"] == (("192.0.2.53",), 4.5)
     assert made["browser"] == ("socks5://127.0.0.1:9", 7)
     assert made["events"] == ["enter", "exit"]
     assert await _count(conn, "attempt", "outcome = 'live'") == 1

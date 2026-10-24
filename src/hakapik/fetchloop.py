@@ -88,7 +88,8 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
     pool = ConnPool(cfg.database_url, min(cfg.max_db_connections, cfg.fetch_workers + 2))
     try:
         if resolver is None:
-            resolver = Resolver(cfg.resolver_nameservers)
+            resolver = Resolver(cfg.resolver_nameservers,
+                                query_deadline_s=cfg.resolver_query_deadline_s)
         async with contextlib.AsyncExitStack() as stack:
             if browser is None:
                 browser = await stack.enter_async_context(

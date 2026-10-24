@@ -7,12 +7,15 @@ node key file.
 
 import base64
 import binascii
+import contextlib
 import dataclasses
+import errno
 import hashlib
 import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -182,11 +185,15 @@ class NodeKey:
         return self._sk.sign(data)
 
 
+KEY_LOCK_WAIT_S = 5.0  # how long to wait for another process creating the key
+
+
 def _create_key(path: Path, seed: bytes) -> None:
     """Write a new key file 0o600; never overwrite one another process wrote first.
 
-    The bytes are fsynced before the name appears, then the directory, so a
-    crash cannot leave a short key under the final name.
+    The key is written and fsynced under a temporary name, then published
+    whole, then the directory is fsynced: no reader or crash ever sees a
+    short key under the final name.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp creates the file 0o600; link() publishes it atomically and
@@ -201,25 +208,46 @@ def _create_key(path: Path, seed: bytes) -> None:
             os.link(tmp, path)
         except FileExistsError:
             return
-        except OSError:
-            # No hard links on this filesystem: create the name exclusively.
-            # A crash mid-write can leave a short file, which load_or_create
-            # reports by name instead of using it.
-            try:
-                kfd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            except FileExistsError:
+        except OSError as e:
+            if e.errno not in (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            # No hard links on this filesystem. rename() would overwrite, so
+            # an exclusively created lock file decides who renames.
+            if not _rename_under_lock(tmp, path):
                 return
-            with os.fdopen(kfd, "wb") as f:
-                f.write(seed)
-                f.flush()
-                os.fsync(f.fileno())
     finally:
-        os.unlink(tmp)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
     dfd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
+
+
+def _rename_under_lock(tmp: str, path: Path) -> bool:
+    """Rename ``tmp`` to ``path`` unless another process creates it; True if renamed."""
+    lock = path.with_name(path.name + ".lock")
+    try:
+        os.close(os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+    except FileExistsError:
+        # Another process holds the lock: its key appears whole, by rename.
+        deadline = time.monotonic() + KEY_LOCK_WAIT_S
+        while not path.exists():
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"node key {path} not created while {lock} exists; if no other "
+                    "hakapik process is starting, a crash left the lock: delete it"
+                ) from None
+            time.sleep(0.05)
+        return False
+    try:
+        if path.exists():
+            return False
+        os.rename(tmp, path)
+        return True
+    finally:
+        os.unlink(lock)
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:

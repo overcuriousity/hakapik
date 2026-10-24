@@ -87,12 +87,23 @@ def test_asn_mmdb_is_a_path(tmp_path):
 
 
 def test_lease_must_cover_worst_case_capture(tmp_path):
-    # 4 * nav_timeout_s + 60: landing, up to 3 click hops, resolve
-    assert _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 180").lease_s == 180
+    # 4 * nav_timeout_s + 2 * resolver_query_deadline_s + 60: landing, up to 3
+    # click hops, the two resolve rounds (names, PTRs), margin
+    assert _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 200").lease_s == 200
     with pytest.raises(ValueError, match="lease_s"):
-        _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 179")
+        _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 199")
     with pytest.raises(ValueError, match="lease_s"):
         _load(tmp_path, "nav_timeout_s = 200.0")
+    with pytest.raises(ValueError, match="resolver_query_deadline_s"):
+        _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 200\nresolver_query_deadline_s = 10.5")
+
+
+def test_resolver_query_deadline_default_and_range(tmp_path):
+    assert _load(tmp_path, "").resolver_query_deadline_s == 10.0
+    assert _load(tmp_path, "resolver_query_deadline_s = 2.5").resolver_query_deadline_s == 2.5
+    for bad in ("0", "-1", "nan", "inf", "true", '"5"'):
+        with pytest.raises(ValueError, match="resolver_query_deadline_s"):
+            _load(tmp_path, f"resolver_query_deadline_s = {bad}\n")
 
 
 def test_fetch_workers_at_least_one(tmp_path):

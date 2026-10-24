@@ -438,3 +438,20 @@ async def test_manifest_alone_verifies_every_envelope(conn, tmp_path, key):
         env = bs.path(a["envelope_sha256"]).read_bytes()
         r = open_envelope(env, {a["node_id"]: pub}.get)
         assert (r.job_id, r.step) == (jid, a["step"])
+
+
+async def test_manifest_names_each_attempts_own_node_key(conn, tmp_path, key):
+    # Two nodes sign the two attempts: each attempt carries its own signer's key.
+    bs, jid, cid = await _setup(conn, tmp_path, key)
+    k2 = NodeKey(b"\x07" * 32)
+    await register_node(conn, k2.node_id, k2.public_key)
+    await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER)
+    await store_result(conn, bs, seal(_result(bs, k2, jid, 1), k2), LADDER)
+    _, _, doc = await _manifest(conn, bs, cid, 2)
+    got = {a["step"]: (a["node_id"], a["node_public_key"]) for a in doc["attempts"]}
+    assert got == {0: (key.node_id, key.public_key.hex()),
+                   1: (k2.node_id, k2.public_key.hex())}
+    for a in doc["attempts"]:
+        env = bs.path(a["envelope_sha256"]).read_bytes()
+        r = open_envelope(env, {a["node_id"]: bytes.fromhex(a["node_public_key"])}.get)
+        assert r.node_id == a["node_id"]

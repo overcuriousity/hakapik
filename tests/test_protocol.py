@@ -1,8 +1,12 @@
 import base64
+import errno
 import json
+import os
+import threading
 
 import pytest
 
+import hakapik.protocol as protocol
 from hakapik.protocol import (
     OUTCOMES,
     AttemptResult,
@@ -131,10 +135,6 @@ def test_canonical_json_rejects_non_finite_floats(v):
 
 
 def test_new_key_is_synced_before_it_is_published(tmp_path, monkeypatch):
-    import os
-
-    import hakapik.protocol as protocol
-
     events = []
     real_fsync, real_link = os.fsync, os.link
     monkeypatch.setattr(protocol.os, "fsync",
@@ -147,20 +147,73 @@ def test_new_key_is_synced_before_it_is_published(tmp_path, monkeypatch):
     assert events[:2] == ["fsync", "link"] and events[2:] == ["fsync"]
 
 
+def _no_link(a, b):
+    raise OSError(errno.EPERM, "hard links not supported")
+
+
 def test_key_created_without_hard_links(tmp_path, monkeypatch):
-    import errno
-
-    import hakapik.protocol as protocol
-
-    def no_link(a, b):
-        raise OSError(errno.EPERM, "hard links not supported")
-
-    monkeypatch.setattr(protocol.os, "link", no_link)
+    monkeypatch.setattr(protocol.os, "link", _no_link)
     p = tmp_path / "node.key"
     k = NodeKey.load_or_create(p)
-    assert p.read_bytes() and p.stat().st_mode & 0o777 == 0o600
+    assert len(p.read_bytes()) == 32 and p.stat().st_mode & 0o777 == 0o600
     assert NodeKey.load_or_create(p).node_id == k.node_id
     assert [x.name for x in tmp_path.iterdir()] == ["node.key"]
+
+
+def test_no_link_waits_for_a_concurrent_creator_and_never_overwrites(tmp_path,
+                                                                     monkeypatch):
+    # Another process holds the lock and publishes its key whole (by rename)
+    # a moment later: this one waits, then uses that key.
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    p = tmp_path / "node.key"
+    (tmp_path / "node.key.lock").touch()
+    theirs = NodeKey(b"\x05" * 32)
+
+    def other_process():
+        src = tmp_path / "theirs.tmp"
+        src.write_bytes(b"\x05" * 32)
+        src.chmod(0o600)
+        os.rename(src, p)
+
+    timer = threading.Timer(0.2, other_process)
+    timer.start()
+    try:
+        assert NodeKey.load_or_create(p).node_id == theirs.node_id
+    finally:
+        timer.join()
+    assert p.read_bytes() == b"\x05" * 32
+
+
+def test_no_link_rename_does_not_replace_a_key_that_appeared(tmp_path, monkeypatch):
+    # The key appears between the exists() check and taking the lock.
+    p = tmp_path / "node.key"
+
+    def link_then_other_wins(a, b):
+        p.write_bytes(b"\x06" * 32)
+        p.chmod(0o600)
+        _no_link(a, b)
+
+    monkeypatch.setattr(protocol.os, "link", link_then_other_wins)
+    assert NodeKey.load_or_create(p).node_id == NodeKey(b"\x06" * 32).node_id
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
+
+
+def test_no_link_stale_lock_is_reported(tmp_path, monkeypatch):
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
+    (tmp_path / "node.key.lock").touch()
+    with pytest.raises(RuntimeError, match="node.key.lock"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+
+
+def test_other_link_errors_are_raised(tmp_path, monkeypatch):
+    def full(a, b):
+        raise OSError(errno.ENOSPC, "no space")
+
+    monkeypatch.setattr(protocol.os, "link", full)
+    with pytest.raises(OSError, match="no space"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("size", [0, 31, 33])
