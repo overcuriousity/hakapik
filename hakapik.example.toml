@@ -32,3 +32,48 @@ batch_size = 256
 # batch from a shared pool of at most this many; keep it below the server's
 # max_connections (compose.yaml sets 300).
 max_db_connections = 64
+
+# --- Resolve and fetch (all optional; omitting a key keeps its default) ---
+
+# Concurrent fetch workers.
+fetch_workers = 2
+
+# Minimum seconds between fetches to the same IP address, and the maximum
+# number of fetches per day. Omitted = unlimited.
+# fetch_per_ip_interval_s = 5.0
+# fetch_daily_cap = 5000
+
+# HTTP(S) proxy for all browser traffic, e.g. "http://127.0.0.1:3128".
+# Omitted = fetch from the head's own address.
+# fetch_proxy = "http://127.0.0.1:3128"
+
+# Address recorded as the egress address of each attempt. Omitted = not recorded.
+# egress_address = "203.0.113.7"
+
+# DNS servers for the resolver. Empty = system resolver.
+resolver_nameservers = []
+
+# Seconds after a job's creation at which each attempt runs. Must be
+# non-empty, start at 0 and strictly increase.
+retry_ladder_s = [0, 120, 600, 3600, 21600, 86400]
+
+# A renewal of a seen FQDN becomes a candidate again if its last attempt
+# finished more than this many days ago (and it is not in the Tranco top set).
+recheck_days = 30
+
+# Maximum open fetch jobs. Omitted = unlimited.
+# queue_cap = 100000
+
+# Open jobs older than this many hours are aged out.
+ageout_hours = 24.0
+
+# Per-navigation timeout in seconds.
+nav_timeout_s = 30.0
+
+# Seconds a worker holds a claimed job before it may be claimed again.
+# Must be at least 4 * nav_timeout_s + 60 (landing, up to 3 click hops and
+# the resolve), so a job is not claimed again while it still runs.
+lease_s = 600
+
+# Path to a GeoLite2-ASN .mmdb you supply, for ASN enrichment. Omitted = no enrichment.
+# asn_mmdb = "/var/lib/hakapik/GeoLite2-ASN.mmdb"

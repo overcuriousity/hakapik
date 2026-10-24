@@ -39,7 +39,7 @@ import signal
 import struct
 import time
 from dataclasses import asdict, dataclass, fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -63,7 +63,8 @@ from hakapik.db import (
 )
 from hakapik.dedup import cert_key
 from hakapik.firstseen import FirstSeenIndex
-from hakapik.names import normalize
+from hakapik.jobs import last_fetched
+from hakapik.names import NameRecord, normalize
 from hakapik.suppress import Suppressor
 
 RAW_MEDIA_TYPE = "application/x-hakapik-ctbatch"
@@ -91,7 +92,10 @@ class StatCounter:
     supp_tranco: int = 0
     supp_public_apex: int = 0
     supp_wildcard: int = 0
+    # candidates counts first-seen candidates only; re-check candidates are
+    # counted apart in candidates_recheck, so day-one numbers stay comparable.
     candidates: int = 0
+    candidates_recheck: int = 0
 
     def increments(self) -> dict[str, int]:
         return asdict(self)
@@ -157,13 +161,15 @@ async def process_batch(
     bs: BlobStore,
     conn,
     stats: StatCounter,
+    recheck_days: int = 30,
 ) -> int:
     """Ingest entries start..end; return how many entries the log returned.
 
     See ``_process_batch`` for the details.
     """
     n, _ = await _process_batch(
-        src, start, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats
+        src, start, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=stats,
+        recheck_days=recheck_days,
     )
     return n
 
@@ -178,6 +184,7 @@ async def _process_batch(
     bs: BlobStore,
     conn,
     stats: StatCounter,
+    recheck_days: int,
 ) -> tuple[int, int]:
     """Ingest entries start..end; return (entries returned, next cursor index).
 
@@ -194,6 +201,8 @@ async def _process_batch(
         rows: list[CandidateRow] = []
         new_certs: set[bytes] = set()
         new_fqdns: dict[str, tuple[int, int]] = {}  # NameRecord.key -> (ts_ms, index)
+        # Already-indexed, unsuppressed names seen again: re-check contenders.
+        recheck: dict[str, tuple[NameRecord, int, int, bytes]] = {}
         for index, leaf, extra in entries:
             batch.bytes += len(leaf) + len(extra)
             parsed = _parse(src.info.kind, leaf)
@@ -209,7 +218,15 @@ async def _process_batch(
                 rec = normalize(san)
                 if not rec.valid:
                     continue  # never indexed or emitted
-                if rec.key in new_fqdns or ix.get(rec.key) is not None:
+                if rec.key in new_fqdns:
+                    continue
+                if ix.get(rec.key) is not None:
+                    if (
+                        not rec.wildcard
+                        and rec.fqdn not in recheck
+                        and sup.reason(rec) is None
+                    ):
+                        recheck[rec.fqdn] = (rec, parsed.timestamp_ms, index, key)
                     continue
                 new_fqdns[rec.key] = (parsed.timestamp_ms, index)
                 batch.fqdns_new += 1
@@ -227,6 +244,19 @@ async def _process_batch(
                         )
                     )
         batch.candidates = len(rows)
+        if recheck:
+            last_at = await last_fetched(conn, list(recheck))
+            cutoff = datetime.now(timezone.utc) - timedelta(days=recheck_days)
+            for fqdn, (rec, ts_ms, index, key) in recheck.items():
+                done = last_at.get(fqdn)  # never attempted: not re-checked
+                if done is None or done >= cutoff or sup.top_listed(rec.registrable):
+                    continue
+                rows.append(
+                    CandidateRow(
+                        fqdn, rec.registrable, log_id, index, key, ts_ms, "recheck"
+                    )
+                )
+                batch.candidates_recheck += 1
         last = entries[-1][0]
         blob = bs.put(pack_entries(entries), RAW_MEDIA_TYPE)
         await add_raw_batch(conn, log_id, start, last, blob, len(entries), batch.bytes)
@@ -360,7 +390,8 @@ async def _tail_once(
         return 0, next_index, size
     end = _batch_end(src, next_index, size, cfg.batch_size)
     n, nxt = await _process_batch(
-        src, next_index, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter()
+        src, next_index, end, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter(),
+        recheck_days=cfg.recheck_days,
     )
     return n, nxt, size
 
