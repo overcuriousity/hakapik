@@ -26,6 +26,19 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _tolerate(digest: str, problem: str, op: str, fn, *args) -> None:
+    """Run ``fn(*args)``, named ``op``, on an existing blob.
+
+    A PermissionError (e.g. a file owned by another user) is only logged.
+    """
+    try:
+        fn(*args)
+    except PermissionError as e:
+        _log.warning(
+            "blob %s exists but %s (%s: %r); keeping it", digest, problem, op, e
+        )
+
+
 class BlobStore:
     def __init__(self, root: Path) -> None:
         self.root = Path(root)
@@ -47,16 +60,15 @@ class BlobStore:
             # Content-addressed, so the bytes are right; the mode is not
             # guaranteed if someone touched the file.
             if (dest.stat().st_mode & 0o777) != 0o444:
-                os.chmod(dest, 0o444)
+                _tolerate(
+                    digest, "its mode cannot be fixed", "chmod", os.chmod, dest, 0o444
+                )
             # A file's age is the time since its last put: the orphan sweep
             # (db.sweep_orphan_blobs) leaves young files alone.
-            os.utime(dest)
+            _tolerate(digest, "its mtime cannot be refreshed", "utime", os.utime, dest)
             return digest
         except FileNotFoundError:
             pass  # absent, or pruned meanwhile: write it
-        except PermissionError:
-            _log.warning("blob %s exists but its mode cannot be fixed; keeping it", digest)
-            return digest
         dest.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")
         try:

@@ -21,12 +21,12 @@ applied only after the commit succeeds. Consequences:
   wins; the other batch rolls back (``CursorMoved``) and is retried from the
   new cursor, so a range is not stored or emitted twice.
 
-The raw blob is written before the commit, under ``lock_blob`` held to
-the commit. A batch that fails, is cancelled or loses the cursor
+The raw blob is written before the commit, under ``lock_blob`` held to the
+commit. A batch that fails, is cancelled or loses the cursor
 (``CursorMoved``) leaves its blob unreferenced unless another commit stores
-the same bytes; stale worker results leave unreferenced blobs too. ``prune`` reclaims
-such orphans once they are older than ``orphan_margin_hours``
-(``db.sweep_orphan_blobs``).
+the same bytes; stale worker results leave unreferenced blobs too.
+``prune`` reclaims such orphans once they are older than
+``orphan_margin_hours`` (``db.sweep_orphan_blobs``).
 
 Concurrency: one in-flight batch per log. Log tasks share one
 ``FirstSeenIndex`` on one event loop and borrow Postgres connections from a

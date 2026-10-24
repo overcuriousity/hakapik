@@ -90,7 +90,8 @@ def test_blobstore_put_tolerates_unfixable_mode_of_existing_blob(tmp_path, monke
     monkeypatch.setattr(os, "chmod", deny)
     with caplog.at_level("WARNING", logger="hakapik.blobstore"):
         assert bs.put(b"abc", "x") == h
-    assert any(h in r.getMessage() for r in caplog.records)
+    [msg] = [r.getMessage() for r in caplog.records]
+    assert h in msg and "mode cannot be fixed" in msg and "chmod" in msg
 
 
 def test_blobstore_put_of_an_existing_blob_refreshes_its_mtime(tmp_path):
@@ -101,3 +102,22 @@ def test_blobstore_put_of_an_existing_blob_refreshes_its_mtime(tmp_path):
     os.utime(bs.path(h), (1000, 1000))
     assert bs.put(b"abc", "x") == h
     assert bs.path(h).stat().st_mtime > 1000
+
+
+def test_blobstore_put_tolerates_unrefreshable_mtime_of_existing_blob(
+    tmp_path, monkeypatch, caplog
+):
+    import os
+
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"abc", "x")
+
+    def deny(path, *a, **kw):
+        raise PermissionError("not owner")
+
+    monkeypatch.setattr(os, "utime", deny)
+    with caplog.at_level("WARNING", logger="hakapik.blobstore"):
+        assert bs.put(b"abc", "x") == h
+    [msg] = [r.getMessage() for r in caplog.records]
+    assert h in msg and "mtime cannot be refreshed" in msg and "utime" in msg
+    assert "mode" not in msg

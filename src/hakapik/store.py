@@ -105,8 +105,10 @@ async def store_result(
     # row locks cannot form a cycle. (Two digests sharing a 64-bit lock key
     # could still order differently; Postgres then reports a deadlock and the
     # job is retried after its lease, nothing hangs.) The manifest blob of
-    # write_manifest needs no lock: its bytes name a new version, so its file
-    # is new and young.
+    # write_manifest needs no lock: its bytes hold the candidate id and the
+    # new attempt's id, which comes from a sequence and is never reused, even
+    # after a rollback; so no earlier put wrote these bytes, and the file is
+    # new and young.
     env_sha = hashlib.sha256(envelope).hexdigest()
     for sha in sorted({env_sha, *(b.sha256 for b in r.blobs)}):
         await lock_blob(conn, sha)

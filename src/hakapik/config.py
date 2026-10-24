@@ -105,8 +105,10 @@ def load_config(path: Path) -> Config:
     # shorter lease lets a running job be claimed again mid-run.
     if cfg.lease_s < 4 * cfg.nav_timeout_s + 60:
         raise ValueError("lease_s must be at least 4 * nav_timeout_s + 60")
-    # A worker's blobs are unreferenced until its result is stored, at most
-    # a lease later; the orphan sweep must not take them before that.
+    # A worker's blobs are unreferenced until store_result locks and verifies
+    # them. A blob the sweep takes before that only gets the result rejected
+    # and the job retried (nothing dangling is committed); the margin makes
+    # that rare, and a margin within the lease would make it routine.
     if cfg.orphan_margin_hours * 3600 <= cfg.lease_s:
         raise ValueError("orphan_margin_hours must be longer than lease_s")
     return cfg

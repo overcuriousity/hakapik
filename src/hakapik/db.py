@@ -462,8 +462,10 @@ async def sweep_orphan_blobs(
     committed the row referencing it. A blob counts as referenced by a
     raw_batch row or a blob row. The age is the time since the last put
     (``BlobStore.put`` refreshes the mtime), so a writer still working on a
-    blob keeps it young; a worker's blobs wait at most a lease for their
-    result, and the margin is longer (config). Each candidate is re-checked
+    blob keeps it young. A worker's blob is unreferenced until
+    ``store_result`` locks and verifies it; if the sweep takes it first, the
+    result is rejected and the job retried, so the margin (longer than the
+    lease, see config) only has to make that rare. Each candidate is re-checked
     and unlinked under ``lock_blob``, which ingest and ``store_result`` hold
     from before they rely on an existing blob until they commit. Leftover
     ``.tmp-*`` files of interrupted puts older than the margin go too.
