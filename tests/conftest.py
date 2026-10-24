@@ -8,7 +8,7 @@ import pytest_asyncio
 
 from hakapik.db import connect, migrate
 
-pytest_plugins = ["sites", "dnsserver"]  # local test site, browser and DNS fixtures
+pytest_plugins = ["sites", "dnsserver", "asnmmdb"]  # site, browser, DNS, ASN fixtures
 
 
 def _test_db_url() -> str:

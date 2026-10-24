@@ -1,10 +1,16 @@
+import asyncio
+import dataclasses
 import hashlib
 import json
+import os
 
+import psycopg
 import pytest
 
+import hakapik.store as store
+from hakapik.asn import AsnDb
 from hakapik.blobstore import BlobStore
-from hakapik.db import CandidateRow, add_candidates, add_raw_batch
+from hakapik.db import CandidateRow, add_candidates, add_raw_batch, connect
 from hakapik.jobs import enqueue_manual
 from hakapik.protocol import (
     AttemptResult,
@@ -12,6 +18,7 @@ from hakapik.protocol import (
     DnsAnswer,
     NodeKey,
     PageResult,
+    open_envelope,
     seal,
 )
 from hakapik.store import ResultRejected, register_node, store_result, write_manifest
@@ -227,13 +234,21 @@ async def test_manifest_chain(conn, tmp_path, key):
 
 
 async def test_manifest_is_deterministic(conn, tmp_path, key):
+    # The same database state gives the same bytes, whatever the session time
+    # zone: each write is rolled back, so both see the same version and prev.
     bs, jid, cid = await _setup(conn, tmp_path, key)
     await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER)
-    _, _, doc1 = await _manifest(conn, bs, cid, 1)
-    await write_manifest(conn, bs, cid)
-    _, _, doc2 = await _manifest(conn, bs, cid, 2)
-    del doc1["version"], doc1["prev"], doc2["version"], doc2["prev"]
-    assert doc1 == doc2
+    shas = []
+    for tz in ("UTC", "Asia/Tokyo"):
+        async with conn.transaction():  # psycopg.Rollback leaves it quietly
+            await conn.execute(f"SET LOCAL TimeZone = '{tz}'")
+            shas.append(await write_manifest(conn, bs, cid))
+            raise psycopg.Rollback()
+    assert shas[0] == shas[1]
+    data = bs.path(shas[0]).read_bytes()
+    doc = json.loads(data)
+    assert doc["version"] == 2
+    assert data == json.dumps(doc, sort_keys=True, separators=(",", ":")).encode()
 
 
 async def test_manifest_ct_provenance(conn, tmp_path):
@@ -259,24 +274,14 @@ async def test_register_node_conflicting_key_raises(conn, key):
         await register_node(conn, key.node_id, NodeKey(b"\x02" * 32).public_key)
 
 
-def _asn_db(tmp_path, bs):
-    import netaddr
-    from mmdb_writer import MMDBWriter
-
-    from hakapik.asn import AsnDb
-
-    w = MMDBWriter(ip_version=6, database_type="GeoLite2-ASN", ipv4_compatible=True)
-    w.insert_network(netaddr.IPSet(["192.0.2.0/24"]), {
-        "autonomous_system_number": 64500,
-        "autonomous_system_organization": "Example AS"})
-    path = tmp_path / "asn.mmdb"
-    w.to_db_file(str(path))
-    return AsnDb.load(path, bs)
+@pytest.fixture
+def asn_db(asn_mmdb, tmp_path):
+    return lambda bs: AsnDb.load(asn_mmdb("192.0.2.0/24"), bs)
 
 
-async def test_store_records_asn(conn, tmp_path, key):
+async def test_store_records_asn(conn, tmp_path, key, asn_db):
     bs, jid, cid = await _setup(conn, tmp_path, key)
-    db = _asn_db(tmp_path, bs)
+    db = asn_db(bs)
     aid = await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER,
                              asn_db=db)
     cur = await conn.execute(
@@ -292,11 +297,9 @@ async def test_store_records_asn(conn, tmp_path, key):
                            "media_type": "application/vnd.maxmind.mmdb"}
 
 
-async def test_store_asn_falls_back_to_dns_address(conn, tmp_path, key):
-    import dataclasses
-
+async def test_store_asn_falls_back_to_dns_address(conn, tmp_path, key, asn_db):
     bs, jid, _ = await _setup(conn, tmp_path, key)
-    db = _asn_db(tmp_path, bs)
+    db = asn_db(bs)
     r = _result(bs, key, jid, 0)
     r = dataclasses.replace(r, pages=tuple(
         dataclasses.replace(p, server_ip=None) for p in r.pages))
@@ -316,11 +319,9 @@ async def test_store_without_asn_db_leaves_nulls(conn, tmp_path, key):
     assert (a["asn"], a["asn_org"], a["asn_db_sha256"], a["asn_db"]) == (None,) * 4
 
 
-async def test_store_miss_records_snapshot_hash(conn, tmp_path, key):
-    import dataclasses
-
+async def test_store_miss_records_snapshot_hash(conn, tmp_path, key, asn_db):
     bs, jid, _ = await _setup(conn, tmp_path, key)
-    db = _asn_db(tmp_path, bs)
+    db = asn_db(bs)
     r = _result(bs, key, jid, 0)
     r = dataclasses.replace(r, pages=tuple(
         dataclasses.replace(p, server_ip="8.8.8.8") for p in r.pages))
@@ -331,11 +332,9 @@ async def test_store_miss_records_snapshot_hash(conn, tmp_path, key):
     assert await _count(conn, "blob", "sha256 = %s", (db.sha256,)) == 1
 
 
-async def test_store_no_address_leaves_nulls_even_with_db(conn, tmp_path, key):
-    import dataclasses
-
+async def test_store_no_address_leaves_nulls_even_with_db(conn, tmp_path, key, asn_db):
     bs, jid, _ = await _setup(conn, tmp_path, key)
-    db = _asn_db(tmp_path, bs)
+    db = asn_db(bs)
     r = _result(bs, key, jid, 0)
     r = dataclasses.replace(
         r, dns=(), pages=tuple(dataclasses.replace(p, server_ip=None) for p in r.pages))
@@ -347,12 +346,6 @@ async def test_store_no_address_leaves_nulls_even_with_db(conn, tmp_path, key):
 
 
 async def test_concurrent_store_of_same_step_waits_then_is_noop(conn, tmp_path, key):
-    import asyncio
-    import dataclasses
-    import os
-
-    from hakapik.db import connect
-
     bs, jid, _ = await _setup(conn, tmp_path, key)
     await conn.commit()
     env_a = seal(_result(bs, key, jid, 0), key)
@@ -376,8 +369,6 @@ async def test_concurrent_store_of_same_step_waits_then_is_noop(conn, tmp_path, 
 async def test_store_locks_every_blob_in_order_before_verifying(conn, tmp_path, key, monkeypatch):
     # The orphan sweep must not unlink a listed blob between its verification
     # and the commit; blob locks come before the job row lock, sorted.
-    import hakapik.store as store
-
     bs, jid, cid = await _setup(conn, tmp_path, key)
     r = _result(bs, key, jid, 0)
     env = seal(r, key)
@@ -401,3 +392,49 @@ async def test_store_locks_every_blob_in_order_before_verifying(conn, tmp_path, 
     first_verify = next(i for i, e in enumerate(events) if e[0] == "verify")
     assert all(e[0] == "lock" for e in events[:first_verify])
     assert len(locks) == first_verify
+
+
+@pytest.mark.parametrize("field,value", [
+    ("started_at", "yesterday"), ("finished_at", "2026-10-24T10:00:05"),
+    ("dns", "not a time"), ("dns", "2026-10-24T10:00:00"),
+])
+async def test_rejects_bad_or_naive_timestamps(conn, tmp_path, key, field, value):
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    r = _result(bs, key, jid, 0)
+    if field == "dns":
+        r = dataclasses.replace(r, dns=(dataclasses.replace(r.dns[0], queried_at=value),))
+    else:
+        r = dataclasses.replace(r, **{field: value})
+    with pytest.raises(ResultRejected, match="timestamp"):
+        await store_result(conn, bs, seal(r, key), LADDER)
+    await _nothing_written(conn)
+
+
+async def test_blob_size_is_checked_before_reading(conn, tmp_path, key, monkeypatch):
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    sha = bs.put(b"abc" * 1000, "text/plain")
+    wrong = BlobRef("mobile", "dom", sha, 4, "text/html")
+
+    def no_read(*a, **k):
+        raise AssertionError("blob opened despite a size mismatch")
+
+    monkeypatch.setattr(store, "open", no_read, raising=False)
+    with pytest.raises(ResultRejected, match="size"):
+        await store_result(conn, bs, seal(_result(bs, key, jid, 0, (wrong,)), key), LADDER)
+    await _nothing_written(conn)
+
+
+async def test_manifest_alone_verifies_every_envelope(conn, tmp_path, key):
+    # Each attempt names its node's public key, so the manifest and the blobs
+    # suffice to check every envelope signature, without the database.
+    bs, jid, cid = await _setup(conn, tmp_path, key)
+    await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER)
+    await store_result(conn, bs, seal(_result(bs, key, jid, 1), key), LADDER)
+    _, _, doc = await _manifest(conn, bs, cid, 2)
+    assert len(doc["attempts"]) == 2
+    for a in doc["attempts"]:
+        assert a["node_public_key"] == key.public_key.hex()
+        pub = bytes.fromhex(a["node_public_key"])
+        env = bs.path(a["envelope_sha256"]).read_bytes()
+        r = open_envelope(env, {a["node_id"]: pub}.get)
+        assert (r.job_id, r.step) == (jid, a["step"])

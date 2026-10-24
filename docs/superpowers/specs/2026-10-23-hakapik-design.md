@@ -340,7 +340,10 @@ Server-rendered FastAPI with HTMX. No JavaScript framework.
   and resolved address per record.
 - Signed worker results carry node identity, egress address and time.
 - Evidence bundle export: manifest, blobs, timestamp tokens, and a
-  human-readable summary of the verdict chain.
+  human-readable summary of the verdict chain. The bundle carries the
+  Ed25519 public key of every node that signed one of its results (the
+  manifest lists it per attempt), so each signature verifies without the
+  database.
 - Known limit, stated for the PoC: immutability of the blob store rests on
   filesystem permissions and the external timestamp, not on object lock.
 - Retention defaults, all configurable: flagged-site evidence 2 years; benign

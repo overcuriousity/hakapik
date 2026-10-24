@@ -64,6 +64,9 @@ def _verify_blob(bs: BlobStore, sha256: str, size: int) -> None:
         raise ResultRejected(str(e)) from e
     h, n = hashlib.sha256(), 0
     try:
+        # Size first: a wrong size is rejected without reading the file.
+        if path.stat().st_size != size:
+            raise ResultRejected(f"blob {sha256} does not match its size")
         with open(path, "rb") as f:
             while chunk := f.read(1 << 20):
                 h.update(chunk)
@@ -87,6 +90,8 @@ async def store_result(
     leaves the database unchanged.
     """
     # open_envelope needs a synchronous key lookup, so the key is fetched first.
+    # That parses the envelope JSON twice (here and in open_envelope); it is a
+    # few hundred bytes plus a base64 payload, cheaper than a second API.
     pub = None
     node_id = _envelope_node_id(envelope)
     if node_id is not None:
@@ -223,16 +228,20 @@ async def write_manifest(
             ct_raw_batch = row and row["blob_sha256"]
 
         await cur.execute(
-            """SELECT a.id, a.step, a.node_id, a.outcome, a.started_at, a.envelope_sha256,
-                      a.asn, a.asn_org, a.asn_db_sha256, b.size AS asn_db_size,
-                      b.media_type AS asn_db_media_type
+            """SELECT a.id, a.step, a.node_id, n.public_key, a.outcome, a.started_at,
+                      a.envelope_sha256, a.asn, a.asn_org, a.asn_db_sha256,
+                      b.size AS asn_db_size, b.media_type AS asn_db_media_type
                FROM attempt a JOIN fetch_job j ON j.id = a.job_id
+               JOIN node n ON n.node_id = a.node_id
                LEFT JOIN blob b ON b.sha256 = a.asn_db_sha256
                WHERE j.candidate_id = %s ORDER BY a.step, a.id""",
             (candidate_id,),
         )
         attempts = [
+            # The signing node's Ed25519 public key (hex): with it the
+            # manifest alone lets an auditor verify each envelope (spec 8).
             {"attempt_id": a["id"], "step": a["step"], "node_id": a["node_id"],
+             "node_public_key": _plain(a["public_key"]),
              "outcome": a["outcome"], "started_at": _plain(a["started_at"]),
              "envelope_sha256": a["envelope_sha256"],
              "asn": a["asn"], "asn_org": a["asn_org"],
