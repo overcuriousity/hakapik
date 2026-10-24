@@ -72,6 +72,7 @@ USER_AGENT = "hakapik/0.1 (CT monitor)"
 IDLE_SLEEP_S = 10.0
 PROGRESS_INTERVAL_S = 60.0  # per-log rate/lag log line
 TRACEBACK_INTERVAL_S = 600.0  # at most one full traceback per log per window
+STOP_GRACE_S = 5.0  # after stop, a running batch may finish this long, then is cancelled
 
 _HEAD = struct.Struct(">QI")
 _LEN = struct.Struct(">I")
@@ -427,16 +428,43 @@ async def tail_log(
     log = _logger(src)
     progress = _Progress(log)
     failures = _Failures(log)
+    async def one_batch():
+        async with _borrow(db) as conn:
+            return await _tail_once(src, cfg, ix, sup, bs, conn)
+
     while not stop.is_set():
+        batch = asyncio.create_task(one_batch())
+        if not await _finish_or_stop(batch, stop):
+            return  # stopped mid-batch; nothing was committed, nothing skipped
         try:
-            async with _borrow(db) as conn:
-                n, next_index, size = await _tail_once(src, cfg, ix, sup, bs, conn)
+            n, next_index, size = batch.result()
             progress.note(n, next_index, size)
         except Exception as e:
             failures.warn("batch", e, IDLE_SLEEP_S)
             n = 0
         if n == 0:
             await _sleep_or_stop(stop, IDLE_SLEEP_S)
+
+
+async def _finish_or_stop(task: asyncio.Task, stop: asyncio.Event) -> bool:
+    """Wait for ``task``; True once it is done, False if stop ended it.
+
+    A log stuck in rate limiting keeps a batch in retry_get for up to
+    Retry-After (600 s), so a set ``stop`` gives the batch STOP_GRACE_S to
+    commit and then cancels it. Cancelling is safe: the cursor advances only
+    with the batch's commit, so the next run repeats the batch.
+    """
+    stopper = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            await asyncio.wait({task}, timeout=STOP_GRACE_S)
+    finally:
+        stopper.cancel()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    return not task.cancelled()
 
 
 def _load_suppressor(cfg: Config) -> Suppressor:

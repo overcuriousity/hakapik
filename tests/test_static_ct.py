@@ -124,3 +124,16 @@ async def test_undecodable_last_leaf_does_not_block_tile(respx_mock, tlog):
     out = await tlog.entries(0, 2)
     assert [i for i, *_ in out] == [0, 1, 2]
     assert out[2][1] == bytes(bad)
+
+
+async def test_tile_not_yet_served_ends_batch_early(respx_mock, tlog):
+    # Some logs answer 404 for a tile their checkpoint already covers until
+    # the tile has propagated (seen on TrustAsia, up to ~45 s). The batch ends
+    # before that tile; the tailer polls again later and nothing is skipped.
+    t0, l0 = make_tile(256)
+    respx_mock.get(MON + "checkpoint").respond(text=checkpoint(1000))
+    respx_mock.get(MON + "tile/data/000").respond(content=t0)
+    respx_mock.get(MON + "tile/data/001").respond(status_code=404)
+    out = await tlog.entries(250, 300)
+    assert [i for i, *_ in out] == list(range(250, 256))
+    assert await tlog.entries(256, 300) == []

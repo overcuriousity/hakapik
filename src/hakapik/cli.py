@@ -207,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # operator-facing: message, not traceback
         print(f"hakapik: error: {e}", file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, asyncio.CancelledError):  # second Ctrl-C
+        print("hakapik: interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

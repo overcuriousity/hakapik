@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import date
 
@@ -138,3 +139,24 @@ async def test_second_migrate_takes_no_exclusive_lock(conn):
         await migrate(conn)
     finally:
         await other.close()
+
+
+async def test_concurrent_overlapping_candidates_do_not_deadlock(conn):
+    # The same certificate reaches several logs, so concurrent log tasks insert
+    # the same names; fetch_job's unique open-fqdn index makes them wait on each
+    # other, which deadlocks unless every batch inserts in one global order.
+    url = os.environ["HAKAPIK_TEST_DB"]
+
+    async def batch(names):
+        c = await connect(url)
+        try:
+            rows = [CandidateRow(n, "example.com", "L", i, b"k", 0) for i, n in enumerate(names)]
+            await add_candidates(c, rows)
+            await c.commit()
+        finally:
+            await c.close()
+
+    for r in range(3):
+        names = [f"h{r}-{i}.example.com" for i in range(2000)]
+        await asyncio.gather(batch(names), batch(names[::-1]))
+    assert await _count(conn, "fetch_job") == 6000

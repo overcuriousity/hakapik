@@ -228,6 +228,10 @@ async def set_cursor(conn: psycopg.AsyncConnection, log_id: str, next_index: int
 async def add_candidates(
     conn: psycopg.AsyncConnection, rows: list[CandidateRow]
 ) -> None:
+    # Concurrent log tasks insert the same names (one certificate reaches
+    # several logs), and fetch_job's unique open-fqdn index makes them wait on
+    # each other. Inserting in one global order (by fqdn) rules out deadlocks.
+    rows = sorted(rows, key=lambda r: r.fqdn)
     async with conn.cursor() as cur:
         await cur.executemany(
             """WITH c AS (

@@ -166,3 +166,17 @@ async def test_prune_skips_invalid_digest(tmp_path, conn):
     await conn.commit()
     assert await prune_raw(conn, bs, date.today() - timedelta(days=7)) == 2
     assert not bs.path(good).exists()
+
+
+@pytest.mark.parametrize("exc", [asyncio.CancelledError, KeyboardInterrupt])
+def test_second_interrupt_exits_130_without_traceback(tmp_path, capsys, monkeypatch, exc):
+    # A second Ctrl-C cancels the run; the operator gets one line, not a traceback.
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(f'data_dir = "{tmp_path}"\ndatabase_url = "postgresql://unused"\n')
+
+    def interrupted(cfg, args):
+        raise exc()
+
+    monkeypatch.setattr(cli, "_cmd_tail", interrupted)
+    assert main(["--config", str(cfg), "tail"]) == 130
+    assert capsys.readouterr().err.strip().endswith("hakapik: interrupted")

@@ -243,6 +243,26 @@ async def test_tail_log_stops_on_event(fake, ix, sup, bs, cfg, conn):
     assert await get_cursor(conn, INFO.log_id) == 4
 
 
+class HangingSource(FakeSource):
+    """A log stuck answering 429: tree_size never returns."""
+
+    async def tree_size(self) -> int:
+        await asyncio.Event().wait()
+
+
+async def test_tail_log_stop_does_not_wait_for_a_hanging_log(ix, sup, bs, cfg, conn, monkeypatch):
+    # A rate-limited log keeps retry_get sleeping (Retry-After up to 600 s);
+    # the first stop signal must still end the tailer promptly.
+    monkeypatch.setattr(ingest, "STOP_GRACE_S", 0.2)
+    await cursor_at(conn)
+    stop = asyncio.Event()
+    task = asyncio.create_task(tail_log(HangingSource([LEAF_X509]), cfg, ix, sup, bs, conn, stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+    assert await get_cursor(conn, INFO.log_id) == 0
+
+
 def test_missing_tranco_falls_back_to_empty_set(tmp_path, caplog):
     from hakapik.ingest import _load_suppressor
     from hakapik.names import normalize

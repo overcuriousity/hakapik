@@ -57,17 +57,29 @@ class StaticCtLog:
         resp = await retry_get(self._client, f"{self._base}checkpoint")
         return parse_checkpoint(resp.text)[0]
 
-    async def _tile(self, n: int, tree_size: int) -> list[bytes]:
+    async def _tile(self, n: int, tree_size: int) -> list[bytes] | None:
+        """Leaves of tile `n`, or None if the log does not serve it yet."""
         width = min(TILE_WIDTH, tree_size - TILE_WIDTH * n)
         partial = width if width < TILE_WIDTH else None
-        resp = await retry_get(self._client, self._base + tile_path(n, partial))
+        try:
+            resp = await retry_get(self._client, self._base + tile_path(n, partial))
+        except httpx.HTTPStatusError as e:
+            # Some logs publish the checkpoint before the tiles it covers have
+            # propagated (TrustAsia: 404 for up to ~45 s).
+            if e.response.status_code == 404:
+                return None
+            raise
         leaves = _split_tile(resp.content)
         if len(leaves) != width:
             raise RuntimeError(f"tile {n} holds {len(leaves)} leaves, expected {width}")
         return leaves
 
     async def entries(self, start: int, end: int) -> list[tuple[int, bytes, bytes]]:
-        """Fetch entries start..end inclusive, clamped to the tree size."""
+        """Fetch entries start..end inclusive, clamped to the tree size.
+
+        Stops before the first tile the log does not serve yet, so the result
+        may be shorter than asked for (possibly empty), always a prefix.
+        """
         size = await self.tree_size()
         end = min(end, size - 1)
         out: list[tuple[int, bytes, bytes]] = []
@@ -75,6 +87,8 @@ class StaticCtLog:
             return out
         for n in range(start // TILE_WIDTH, end // TILE_WIDTH + 1):
             leaves = await self._tile(n, size)
+            if leaves is None:
+                break  # not served yet: return what precedes it, poll again later
             for j, leaf in enumerate(leaves):
                 i = TILE_WIDTH * n + j
                 if start <= i <= end:
