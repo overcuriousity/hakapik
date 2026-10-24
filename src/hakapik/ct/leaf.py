@@ -25,8 +25,13 @@ class LeafError:
     reason: str
 
 
-class _Truncated(Exception):
-    pass
+class _Malformed(Exception):
+    """A structural problem; ``ts`` is the entry timestamp if already read."""
+
+    def __init__(self, reason: str, ts: int | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.ts = ts
 
 
 class _Reader:
@@ -37,7 +42,7 @@ class _Reader:
     def take(self, n: int) -> bytes:
         end = self.pos + n
         if n < 0 or end > len(self.buf):
-            raise _Truncated(f"truncated: need {n} bytes at offset {self.pos}")
+            raise _Malformed(f"truncated: need {n} bytes at offset {self.pos}")
         data = bytes(self.buf[self.pos : end])
         self.pos = end
         return data
@@ -57,14 +62,20 @@ def _san_dns(tbs: x509.TbsCertificate) -> tuple[str, ...]:
 
 def _build(timestamp_ms: int, kind, tbs: x509.TbsCertificate, raw_len: int) -> ParsedLeaf:
     validity = tbs["validity"]
+    not_before = validity["not_before"].native
+    not_after = validity["not_after"].native
+    for when in (not_before, not_after):
+        # asn1crypto yields an extended_datetime (not a datetime) for year 0.
+        if not isinstance(when, datetime):
+            raise ValueError(f"validity {when!r} is out of the datetime range")
     return ParsedLeaf(
         timestamp_ms=timestamp_ms,
         entry_type=kind,
         issuer_dn_der=tbs["issuer"].dump(),
         serial=tbs["serial_number"].contents,
         san_dns=_san_dns(tbs),
-        not_before=validity["not_before"].native,
-        not_after=validity["not_after"].native,
+        not_before=not_before,
+        not_after=not_after,
         raw_len=raw_len,
     )
 
@@ -79,9 +90,10 @@ def _read_entry(r: _Reader) -> tuple[int, Literal["x509", "precert"], bytes]:
         if etype == 1:
             r.take(32)
             return ts, "precert", r.take(r.uint(3))
-    except _Truncated as exc:
-        raise _Truncated(str(exc), ts) from exc
-    raise ValueError(ts, f"unknown entry_type {etype}")
+        raise _Malformed(f"unknown entry_type {etype}")
+    except _Malformed as exc:
+        exc.ts = ts
+        raise
 
 
 def _decode(ts: int, kind, der: bytes, raw_len: int) -> ParsedLeaf | LeafError:
@@ -95,20 +107,21 @@ def _decode(ts: int, kind, der: bytes, raw_len: int) -> ParsedLeaf | LeafError:
         return LeafError(ts, f"certificate parse failed: {exc}")
 
 
-def _ts_of(exc: Exception) -> int | None:
-    return exc.args[1] if len(exc.args) > 1 else None
-
-
 def parse_rfc6962_leaf(leaf_input: bytes) -> ParsedLeaf | LeafError:
     r = _Reader(leaf_input)
+    ts: int | None = None
     try:
-        r.take(2)  # version, leaf_type
+        version, leaf_type = r.uint(1), r.uint(1)
+        if version != 0:
+            raise _Malformed(f"unknown version {version}")
+        if leaf_type != 0:
+            raise _Malformed(f"unknown leaf_type {leaf_type}")
         ts, kind, der = _read_entry(r)
         r.take(r.uint(2))  # extensions
-    except _Truncated as exc:
-        return LeafError(_ts_of(exc), str(exc.args[0]))
-    except ValueError as exc:
-        return LeafError(exc.args[0], exc.args[1])
+        if r.pos != len(leaf_input):
+            raise _Malformed(f"{len(leaf_input) - r.pos} trailing bytes")
+    except _Malformed as exc:
+        return LeafError(exc.ts if exc.ts is not None else ts, exc.reason)
     return _decode(ts, kind, der, len(leaf_input))
 
 
@@ -121,6 +134,8 @@ def parse_tile_leaf(
     structurally valid leaf whose certificate fails to decode yields a
     LeafError together with its true next offset.
     """
+    if not 0 <= offset <= len(buf):
+        return LeafError(None, f"offset {offset} outside the buffer"), -1
     r = _Reader(buf, offset)
     ts: int | None = None
     try:
@@ -129,8 +144,6 @@ def parse_tile_leaf(
         if kind == "precert":
             r.take(r.uint(3))  # pre_certificate
         r.take(r.uint(2))  # fingerprints
-    except _Truncated as exc:
-        return LeafError(_ts_of(exc) or ts, str(exc.args[0])), -1
-    except ValueError as exc:
-        return LeafError(exc.args[0], exc.args[1]), -1
+    except _Malformed as exc:
+        return LeafError(exc.ts if exc.ts is not None else ts, exc.reason), -1
     return _decode(ts, kind, der, r.pos - offset), r.pos
