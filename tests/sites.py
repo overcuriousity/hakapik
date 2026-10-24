@@ -1,10 +1,20 @@
-"""A small local test site and a shared Browser, as pytest fixtures."""
+"""A small local test site (plain and TLS) and a shared Browser, as pytest fixtures."""
 
+import base64
+import datetime
+import hashlib
+import ipaddress
+import ssl
 import threading
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import pytest_asyncio
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from hakapik.browser import Browser
 
@@ -45,21 +55,25 @@ PAGES = {
                        b' b = \'<a href="/login?via=sign">Sign in</a>\';'
                        b'document.write(document.cookie.includes("seen") ? b + a : a + b);'
                        b'document.cookie = "seen=1";</script></body></html>'),
+    # a favicon the page asks for itself, as a link and as an image
+    "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
+                        b'<body>icons<img src="/favicon.ico"></body></html>'),
     "/apk": (200, [("Content-Type", "application/vnd.android.package-archive"),
                    ("Content-Disposition", 'attachment; filename="app.apk"')], b"PK\x03\x04" * 64),
 }
 
 
 class Site:
-    def __init__(self, port: int):
+    def __init__(self, port: int, scheme: str = "http"):
         self.port = port
+        self.scheme = scheme
         self.paths_requested: list[str] = []
         self.user_agents: list[str] = []
         self.headers: list[dict[str, str]] = []  # lower-cased names, per request
         self.release = threading.Event()  # lets /never return
 
     def url(self, path: str) -> str:
-        return f"http://127.0.0.1:{self.port}{path}"
+        return f"{self.scheme}://127.0.0.1:{self.port}{path}"
 
 
 def _handler(site: Site):
@@ -91,10 +105,11 @@ def _handler(site: Site):
     return Handler
 
 
-@pytest.fixture
-def site():
+def _serve(tls: ssl.SSLContext | None = None):
     server = ThreadingHTTPServer(("127.0.0.1", 0), None)
-    s = Site(server.server_address[1])
+    if tls is not None:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
+    s = Site(server.server_address[1], "https" if tls else "http")
     server.RequestHandlerClass = _handler(s)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -108,10 +123,64 @@ def site():
         thread.join()
 
 
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def browser():
-    """One Chromium per test module; tests using it need loop_scope="module"."""
-    b = Browser(proxy=None, nav_timeout_s=10, settle_s=1)
+@pytest.fixture
+def site():
+    yield from _serve()
+
+
+@dataclass(frozen=True)
+class SiteCert:
+    der: bytes
+    cert_file: str
+    key_file: str
+    spki_sha256: str  # base64, the form --ignore-certificate-errors-spki-list takes
+
+
+@pytest.fixture(scope="session")
+def site_cert(tmp_path_factory) -> SiteCert:
+    """A self-signed certificate for 127.0.0.1, made for this test session."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=7))
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .sign(key, hashes.SHA256()))
+    d = tmp_path_factory.mktemp("tls")
+    (d / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (d / "key.pem").write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    spki = cert.public_key().public_bytes(serialization.Encoding.DER,
+                                          serialization.PublicFormat.SubjectPublicKeyInfo)
+    return SiteCert(der=cert.public_bytes(serialization.Encoding.DER),
+                    cert_file=str(d / "cert.pem"), key_file=str(d / "key.pem"),
+                    spki_sha256=base64.b64encode(hashlib.sha256(spki).digest()).decode())
+
+
+@pytest.fixture
+def tls_site(site_cert):
+    """The same site over HTTPS with ``site_cert``."""
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(site_cert.cert_file, site_cert.key_file)
+    yield from _serve(tls)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def browser(site_cert):
+    """One Chromium per test session; tests using it need loop_scope="session".
+
+    It trusts ``site_cert`` by its key (a test-only launch argument); every
+    other certificate is checked as in production.
+    """
+    class TrustingBrowser(Browser):
+        LAUNCH_ARGS = (*Browser.LAUNCH_ARGS,
+                       f"--ignore-certificate-errors-spki-list={site_cert.spki_sha256}")
+
+    b = TrustingBrowser(proxy=None, nav_timeout_s=10, settle_s=1)
     try:
         await b.__aenter__()
     except Exception as e:  # no Chromium installed, no display libs, ...

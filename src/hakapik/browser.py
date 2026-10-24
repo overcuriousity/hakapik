@@ -143,6 +143,8 @@ class _ClickFailed(Exception):
 
 
 class Browser:
+    LAUNCH_ARGS: tuple[str, ...] = ("--disable-blink-features=AutomationControlled",)
+
     def __init__(self, *, proxy: str | None, nav_timeout_s: float, settle_s: float = 3.0):
         self.proxy = proxy
         self.nav_timeout_s = nav_timeout_s
@@ -158,7 +160,7 @@ class Browser:
         try:
             self._browser = await self._pw.chromium.launch(
                 channel="chromium",
-                args=["--disable-blink-features=AutomationControlled"],
+                args=list(self.LAUNCH_ARGS),
                 proxy={"server": self.proxy} if self.proxy else None)
         except BaseException:
             await self._pw.stop()
