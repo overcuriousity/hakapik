@@ -257,3 +257,52 @@ async def test_register_node_conflicting_key_raises(conn, key):
     assert await _count(conn, "node") == 1
     with pytest.raises(ValueError):
         await register_node(conn, key.node_id, NodeKey(b"\x02" * 32).public_key)
+
+
+def _asn_db(tmp_path, bs):
+    import netaddr
+    from mmdb_writer import MMDBWriter
+
+    from hakapik.asn import AsnDb
+
+    w = MMDBWriter(ip_version=6, database_type="GeoLite2-ASN", ipv4_compatible=True)
+    w.insert_network(netaddr.IPSet(["192.0.2.0/24"]), {
+        "autonomous_system_number": 64500,
+        "autonomous_system_organization": "Example AS"})
+    path = tmp_path / "asn.mmdb"
+    w.to_db_file(str(path))
+    return AsnDb.load(path, bs)
+
+
+async def test_store_records_asn(conn, tmp_path, key):
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    db = _asn_db(tmp_path, bs)
+    aid = await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER,
+                             asn_db=db)
+    cur = await conn.execute(
+        "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
+    assert await cur.fetchone() == (64500, "Example AS", db.sha256)
+    cur = await conn.execute(
+        "SELECT media_type FROM blob WHERE sha256 = %s", (db.sha256,))
+    assert (await cur.fetchone())[0] == "application/vnd.maxmind.mmdb"
+
+
+async def test_store_asn_falls_back_to_dns_address(conn, tmp_path, key):
+    import dataclasses
+
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    db = _asn_db(tmp_path, bs)
+    r = _result(bs, key, jid, 0)
+    r = dataclasses.replace(r, pages=tuple(
+        dataclasses.replace(p, server_ip=None) for p in r.pages))
+    aid = await store_result(conn, bs, seal(r, key), LADDER, asn_db=db)
+    cur = await conn.execute("SELECT asn FROM attempt WHERE id = %s", (aid,))
+    assert (await cur.fetchone())[0] == 64500
+
+
+async def test_store_without_asn_db_leaves_nulls(conn, tmp_path, key):
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    aid = await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER)
+    cur = await conn.execute(
+        "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
+    assert await cur.fetchone() == (None, None, None)

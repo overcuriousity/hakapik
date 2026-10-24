@@ -14,9 +14,11 @@ from datetime import datetime, timezone
 import psycopg
 from psycopg.rows import dict_row
 
+from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
 from hakapik.jobs import advance_job
 from hakapik.protocol import BadEnvelope, canonical_json, open_envelope
+from hakapik.resolve import addresses
 
 
 class ResultRejected(Exception):
@@ -73,9 +75,12 @@ def _verify_blob(bs: BlobStore, sha256: str, size: int) -> None:
 
 async def store_result(
     conn: psycopg.AsyncConnection, bs: BlobStore, envelope: bytes,
-    ladder: tuple[int, ...],
+    ladder: tuple[int, ...], *, asn_db: AsnDb | None = None,
 ) -> int | None:
     """Verify and store a sealed result; the attempt id, or None if stale or duplicate.
+
+    With ``asn_db`` the attempt also records the ASN of the mobile page's server
+    address (or, failing that, the first resolved address) and the snapshot hash.
 
     Every check runs before the first write, so a rejected or stale result
     leaves the database unchanged.
@@ -93,13 +98,13 @@ async def store_result(
         raise ResultRejected(str(e)) from e
 
     cur = await conn.execute(
-        "SELECT candidate_id FROM fetch_job WHERE id = %s AND step = %s AND state = 'open'",
+        "SELECT candidate_id, fqdn FROM fetch_job WHERE id = %s AND step = %s AND state = 'open'",
         (r.job_id, r.step),
     )
     row = await cur.fetchone()
     if row is None:
         return None
-    candidate_id = row[0]
+    candidate_id, fqdn = row
 
     started, finished = _ts(r.started_at), _ts(r.finished_at)
     queried = [_ts(d.queried_at) for d in r.dns]
@@ -117,14 +122,26 @@ async def store_result(
         )
 
     mobile = next((p for p in r.pages if p.profile == "mobile"), None)
+    hit = None
+    if asn_db is not None:
+        ip = (mobile.server_ip if mobile else None) or next(iter(addresses(r.dns, fqdn)), None)
+        hit = asn_db.lookup(ip) if ip else None
+        if hit is not None:
+            await conn.execute(
+                "INSERT INTO blob (sha256, size, media_type) VALUES (%s, %s, %s) "
+                "ON CONFLICT DO NOTHING",
+                (asn_db.sha256, asn_db.size, MMDB_MEDIA_TYPE),
+            )
     cur = await conn.execute(
         """INSERT INTO attempt (job_id, step, node_id, egress_address, started_at,
-             finished_at, outcome, http_status, final_url, error, envelope_sha256)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             finished_at, outcome, http_status, final_url, error, envelope_sha256,
+             asn, asn_org, asn_db_sha256)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
            ON CONFLICT (job_id, step) DO NOTHING RETURNING id""",
         (r.job_id, r.step, r.node_id, r.egress_address, started, finished, r.outcome,
          mobile.http_status if mobile else None,
-         mobile.final_url if mobile else None, r.error, env_sha),
+         mobile.final_url if mobile else None, r.error, env_sha,
+         hit and hit.asn, hit and hit.org, hit and asn_db.sha256),
     )
     row = await cur.fetchone()
     if row is None:
