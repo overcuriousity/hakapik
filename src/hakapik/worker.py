@@ -8,7 +8,9 @@ runs exactly this; in the PoC the head does.
 import asyncio
 import base64
 import time
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from typing import Protocol
 
 from hakapik.blobstore import BlobStore
 from hakapik.browser import Capture
@@ -34,25 +36,53 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+class ResolverLike(Protocol):
+    async def resolve(self, fqdn: str, registrable: str) -> tuple[DnsAnswer, ...]: ...
+
+
+class BrowserLike(Protocol):
+    async def capture(self, url: str, profile: str, *,
+                      click_through: bool = False) -> Capture: ...
+
+
 class IpSpacer:
     """Keeps at least interval_s between starts against one IP.
 
     Each wait reserves the next free slot synchronously (no await between
     reading and writing the slot), so concurrent waits on one IP are spaced.
+    Slots already passed are forgotten, so the map holds only IPs with a
+    future slot. A waiter cancelled while sleeping gives its slot back if no
+    later waiter has reserved after it; otherwise the gap stays (spacing is
+    never shortened).
     """
 
-    def __init__(self, interval_s: float | None) -> None:
+    def __init__(self, interval_s: float | None, *,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], Awaitable[None]] = asyncio.sleep) -> None:
         self.interval_s = interval_s
+        self._clock = clock
+        self._sleep = sleep
         self._next: dict[str, float] = {}
 
     async def wait(self, ip: str) -> None:
         if self.interval_s is None:
             return
-        now = time.monotonic()
-        start = max(now, self._next.get(ip, now))
-        self._next[ip] = start + self.interval_s
+        now = self._clock()
+        for passed in [k for k, t in self._next.items() if t <= now]:
+            del self._next[passed]
+        prev = self._next.get(ip)
+        start = max(now, prev or now)
+        end = self._next[ip] = start + self.interval_s
         if start > now:
-            await asyncio.sleep(start - now)
+            try:
+                await self._sleep(start - now)
+            except asyncio.CancelledError:
+                if self._next.get(ip) == end:
+                    if prev is None:
+                        del self._next[ip]
+                    else:
+                        self._next[ip] = prev
+                raise
 
 
 def _store(bs: BlobStore, blobs: list[BlobRef], profile: str, kind: str,
@@ -64,22 +94,31 @@ def _store(bs: BlobStore, blobs: list[BlobRef], profile: str, kind: str,
 
 def _record(bs: BlobStore, cap: Capture, pages: list[PageResult],
             blobs: list[BlobRef]) -> None:
+    """Write a capture's blobs, then record its pages and blobs together.
+
+    If any write fails, nothing of this capture is recorded: a recorded page
+    always comes with every artefact it produced. Blobs written before the
+    failure stay unreferenced in the store until the orphan sweep removes them.
+    """
     profile = cap.page.profile
-    pages.append(cap.page)
-    _store(bs, blobs, profile, "warc", cap.warc, WARC)
-    _store(bs, blobs, profile, "screenshot", cap.screenshot, PNG)
-    _store(bs, blobs, profile, "dom", cap.dom, DOM)
+    new_pages, new_blobs = [cap.page], []
+    _store(bs, new_blobs, profile, "warc", cap.warc, WARC)
+    _store(bs, new_blobs, profile, "screenshot", cap.screenshot, PNG)
+    _store(bs, new_blobs, profile, "dom", cap.dom, DOM)
     if cap.cert_chain:
         chain = canonical_json([base64.b64encode(c).decode("ascii")
                                 for c in cap.cert_chain])
-        _store(bs, blobs, profile, "certchain", chain, JSON)
+        _store(bs, new_blobs, profile, "certchain", chain, JSON)
     for click in cap.clicks:
-        pages.append(click.page)
-        _store(bs, blobs, click.page.profile, "screenshot", click.screenshot, PNG)
-        _store(bs, blobs, click.page.profile, "dom", click.dom, DOM)
+        new_pages.append(click.page)
+        _store(bs, new_blobs, click.page.profile, "screenshot", click.screenshot, PNG)
+        _store(bs, new_blobs, click.page.profile, "dom", click.dom, DOM)
+    pages.extend(new_pages)
+    blobs.extend(new_blobs)
 
 
-async def run_job(job: Job, *, resolver, browser, bs: BlobStore, key: NodeKey,
+async def run_job(job: Job, *, resolver: ResolverLike, browser: BrowserLike,
+                  bs: BlobStore, key: NodeKey,
                   egress_address: str | None, spacer: IpSpacer) -> bytes:
     started = _now()
     dns: tuple[DnsAnswer, ...] = ()
@@ -100,7 +139,8 @@ async def run_job(job: Job, *, resolver, browser, bs: BlobStore, key: NodeKey,
                 desktop = await browser.capture(job.url, "desktop", click_through=True)
                 _record(bs, desktop, pages, blobs)
     except Exception as e:
-        # A finished mobile pass keeps its outcome; the error says what failed after it.
+        # A recorded mobile pass (all its blobs written) keeps its outcome; the
+        # error says what failed after it.
         mobile_page = next((p for p in pages if p.profile == "mobile"), None)
         outcome = mobile_page.outcome if mobile_page else "error"
         error = repr(e)
