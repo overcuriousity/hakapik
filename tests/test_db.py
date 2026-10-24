@@ -8,6 +8,7 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
+    advance_cursor,
     connect,
     bump_stat,
     get_cursor,
@@ -191,6 +192,32 @@ async def test_init_cursor_never_overwrites(conn):
     assert await init_cursor(conn, "L", 5) is True
     assert await init_cursor(conn, "L", 99) is False
     assert await get_cursor(conn, "L") == 5
+
+
+async def test_advance_cursor_is_a_compare_and_set(conn):
+    assert await advance_cursor(conn, "L", 0, 4) is True  # no row: created
+    assert await advance_cursor(conn, "L", 0, 8) is False  # not at 0 any more
+    assert await get_cursor(conn, "L") == 4
+    assert await advance_cursor(conn, "L", 4, 8) is True
+    assert await get_cursor(conn, "L") == 8
+
+
+async def test_concurrent_cursor_advance_lets_one_writer_win(conn):
+    await set_cursor(conn, "L", 0)
+    await conn.commit()
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        assert await advance_cursor(conn, "L", 0, 4) is True
+        # The second writer waits on the row lock, then sees the new value.
+        second = asyncio.create_task(advance_cursor(other, "L", 0, 4))
+        await asyncio.sleep(0.1)
+        assert not second.done()
+        await conn.commit()
+        assert await second is False
+        await other.rollback()
+    finally:
+        await other.close()
+    assert await get_cursor(conn, "L") == 4
 
 
 async def test_second_migrate_takes_no_share_lock(conn):

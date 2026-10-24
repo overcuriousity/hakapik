@@ -227,19 +227,28 @@ async def test_tail_log_once_batches_and_catches_up(fake, ix, sup, bs, cfg, conn
     assert await get_cursor(conn, INFO.log_id) == 4
 
 
-async def test_tail_log_stops_on_event(fake, ix, sup, bs, cfg, conn):
+async def test_tail_log_stops_on_event(ix, sup, bs, cfg, conn, monkeypatch):
+    # The idle sleep is long, so a prompt end proves stop interrupts it.
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 60.0)
+
+    class Counting(FakeSource):
+        sizes = 0
+
+        async def tree_size(self):
+            Counting.sizes += 1
+            return await super().tree_size()
+
+    src = Counting([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT])
     await cursor_at(conn)
     stop = asyncio.Event()
-    task = asyncio.create_task(tail_log(fake, cfg, ix, sup, bs, conn, stop))
-    # Poll the source, not the shared connection, until the tailer is caught up
-    # (it has then asked for both batches and is sleeping on the stop event).
-    for _ in range(200):
-        if len(fake.calls) >= 2:
-            break
+    task = asyncio.create_task(tail_log(src, cfg, ix, sup, bs, conn, stop))
+    # Two batches, then a third tree_size() that finds it caught up: the
+    # tailer is now idle (or about to be), whatever the machine's speed.
+    while Counting.sizes < 3:
         await asyncio.sleep(0.01)
-    await asyncio.sleep(0.05)
     stop.set()
     await asyncio.wait_for(task, timeout=2)
+    assert src.calls == [(0, 1), (2, 3)]
     assert await get_cursor(conn, INFO.log_id) == 4
 
 
@@ -447,19 +456,99 @@ class GappySource(FakeSource):
 
     async def entries(self, start, end):
         self.calls.append((start, end))
-        out = [e for e in self._entries[start : end + 1] if (e[0] - start) % 2 == 0]
-        return out
+        return [e for e in self._entries[start : end + 1] if (e[0] - start) % 2 == 0]
 
 
-async def test_tail_advances_by_last_returned_index(ix, sup, bs, conn, tmp_path):
-    src = GappySource([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT, LEAF_X509])
+class OverlongSource(FakeSource):
+    """Returns one entry past the requested end."""
+
+    async def entries(self, start, end):
+        self.calls.append((start, end))
+        return self._entries[start : end + 2]
+
+
+class OffsetSource(FakeSource):
+    """Returns the requested range shifted by one (first index is start + 1)."""
+
+    async def entries(self, start, end):
+        self.calls.append((start, end))
+        return self._entries[start + 1 : end + 2]
+
+
+@pytest.mark.parametrize("cls", [GappySource, OverlongSource, OffsetSource])
+async def test_non_contiguous_response_is_rejected(cls, ix, sup, bs, conn, tmp_path):
+    src = cls([LEAF_X509, LEAF_PRECERT, LEAF_X509, LEAF_PRECERT, LEAF_X509])
+    await cursor_at(conn)
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=3)
+    with pytest.raises(ValueError, match="not contiguous"):
+        await tail_log_once(src, cfg, ix, sup, bs, conn)
+    assert await get_cursor(conn, INFO.log_id) == 0
+    assert await count(conn, "raw_batch") == 0
+    assert await count(conn, "candidate") == 0
+
+
+class ShortSource(FakeSource):
+    """Returns at most one entry per call, like a log capping get-entries."""
+
+    async def entries(self, start, end):
+        self.calls.append((start, end))
+        return self._entries[start : start + 1]
+
+
+async def test_short_read_advances_past_returned_entries_only(ix, sup, bs, conn, tmp_path):
+    src = ShortSource([LEAF_X509, LEAF_PRECERT, LEAF_X509])
     await cursor_at(conn)
     cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=3)
     while await tail_log_once(src, cfg, ix, sup, bs, conn):
         pass
-    # 0..2 returns indices 0 and 2 -> next is 3 (not 0 + 2); 3..4 returns 3 only.
-    assert src.calls == [(0, 2), (3, 4), (4, 4)]
-    assert await get_cursor(conn, INFO.log_id) == 5
+    assert src.calls == [(0, 2), (1, 2), (2, 2)]
+    assert await get_cursor(conn, INFO.log_id) == 3
+    cur = await conn.execute("SELECT start_index, end_index FROM raw_batch ORDER BY id")
+    assert await cur.fetchall() == [(0, 0), (1, 1), (2, 2)]
+
+
+async def test_commit_failure_keeps_cursor_rows_and_index(fake, ix, sup, bs, cfg, conn, monkeypatch):
+    await cursor_at(conn)
+    real_commit = conn.commit
+
+    async def boom():
+        raise OSError("connection lost during commit")
+
+    monkeypatch.setattr(conn, "commit", boom)
+    with pytest.raises(OSError, match="during commit"):
+        await tail_log_once(fake, cfg, ix, sup, bs, conn)
+    monkeypatch.setattr(conn, "commit", real_commit)
+    assert await get_cursor(conn, INFO.log_id) == 0
+    assert await count(conn, "raw_batch") == 0
+    assert await count(conn, "candidate") == 0
+    for fqdn in EXPECTED_NEW_FQDNS:
+        assert ix.get(fqdn) is None
+    # The retry re-emits what the failed commit lost.
+    assert await tail_log_once(fake, cfg, ix, sup, bs, conn) == 2
+    assert await _candidates(conn) == EXPECTED_NEW_FQDNS
+
+
+async def test_batch_fails_if_another_writer_moved_the_cursor(fake, ix, sup, bs, conn):
+    # Two tailers read cursor 0; the other one committed first (cursor now 2).
+    await cursor_at(conn, INFO.log_id, 2)
+    with pytest.raises(ingest.CursorMoved):
+        await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    assert await get_cursor(conn, INFO.log_id) == 2
+    assert await count(conn, "raw_batch") == 0
+    assert await count(conn, "candidate") == 0
+    for fqdn in EXPECTED_NEW_FQDNS:
+        assert ix.get(fqdn) is None
+
+
+async def test_unknown_suppression_reason_fails_the_batch(fake, ix, bs, conn):
+    class NewReason(Suppressor):
+        def reason(self, rec):
+            return "brand_new"
+
+    sup = NewReason(frozenset(), frozenset())
+    with pytest.raises(AttributeError, match="supp_brand_new"):
+        await process_batch(fake, 0, 1, ix=ix, sup=sup, bs=bs, conn=conn, stats=StatCounter())
+    assert await count(conn, "raw_batch") == 0
 
 
 # --- wildcard vs apex (synthetic leaves) ------------------------------------
@@ -719,3 +808,55 @@ async def test_readonly_startup_failure_warns_retries_then_follows(
     assert len(warns) == 1 and "readonly check failed" in warns[0].getMessage()
     assert "following until caught up (readonly, 3 entries left)" in caplog.text
     assert await get_cursor(conn, READONLY_INFO.log_id) == 4
+
+
+# --- ConnPool edge cases (fake connections, no server) ----------------------
+
+class FakeConn:
+    def __init__(self, hang_rollback=False, close_error=False):
+        self.closed = False
+        self.broken = False
+        self._hang = hang_rollback
+        self._close_error = close_error
+
+    async def rollback(self):
+        if self._hang:
+            await asyncio.Event().wait()
+
+    async def close(self):
+        self.closed = True
+        if self._close_error:
+            raise OSError("close failed")
+
+
+async def test_pool_closes_a_connection_cancelled_during_release_rollback(monkeypatch):
+    conn = FakeConn(hang_rollback=True)
+
+    async def fake_connect(url):
+        return conn
+
+    monkeypatch.setattr(ingest, "connect", fake_connect)
+    pool = ingest.ConnPool("unused", 1)
+    entered = asyncio.Event()
+
+    async def use():
+        async with pool.borrow():
+            entered.set()
+        # leaving the block runs the release rollback, which hangs
+
+    task = asyncio.create_task(use())
+    await entered.wait()
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Its transaction state is unknown: closed, not handed out again.
+    assert conn.closed and pool._idle == []
+
+
+async def test_pool_close_closes_every_idle_connection_despite_errors():
+    pool = ingest.ConnPool("unused", 2)
+    bad, good = FakeConn(close_error=True), FakeConn()
+    pool._idle = [good, bad]  # close() pops bad first
+    await pool.close()
+    assert bad.closed and good.closed and pool._idle == []

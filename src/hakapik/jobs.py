@@ -109,6 +109,14 @@ async def last_fetched(
     return dict(await cur.fetchall())
 
 
+async def open_job_fqdns(conn: psycopg.AsyncConnection, fqdns: list[str]) -> set[str]:
+    """The FQDNs among ``fqdns`` that have an open fetch job."""
+    cur = await conn.execute(
+        "SELECT fqdn FROM fetch_job WHERE state = 'open' AND fqdn = ANY(%s)", (fqdns,)
+    )
+    return {r[0] for r in await cur.fetchall()}
+
+
 async def enqueue_manual(
     conn: psycopg.AsyncConnection, names: list[str]
 ) -> list[tuple[str, str]]:

@@ -16,9 +16,19 @@ applied only after the commit succeeds. Consequences:
   certificate naming such an FQDN can then emit a duplicate candidate; a
   candidate is never lost. Later stages dedup candidates by fqdn.
 - Re-running an already committed and indexed batch emits nothing new.
+- The cursor advance is a compare-and-set (``advance_cursor``): of two
+  processes tailing the same log from the same cursor, only the first commit
+  wins; the other batch rolls back (``CursorMoved``) and is retried from the
+  new cursor, so a range is not stored or emitted twice.
 
-The raw blob is written before the commit; after a failure it may be an
-orphan (harmless: content-addressed, reclaimed by pruning).
+The raw blob is written before the commit. After a failed commit the retry
+normally re-reads the same entries, builds the same (content-addressed) blob
+and references it. Only when the retry gets a different range (the log
+returns fewer or more entries) is the first blob left unreferenced. Such a
+blob is not reclaimed: ``prune`` only unlinks blobs of the raw_batch rows it
+deletes, and a sweep of unreferenced files would have to know every other
+user of the shared blob store (fetch results, ASN snapshots) and every
+in-flight writer. The cost is at most one batch blob per failed commit.
 
 Concurrency: one in-flight batch per log. Log tasks share one
 ``FirstSeenIndex`` on one event loop and borrow Postgres connections from a
@@ -39,6 +49,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 import zstandard
@@ -53,16 +64,16 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
+    advance_cursor,
     bump_stat,
     connect,
     get_cursor,
     init_cursor,
     migrate,
-    set_cursor,
 )
 from hakapik.dedup import cert_key
 from hakapik.firstseen import FirstSeenIndex
-from hakapik.jobs import last_fetched
+from hakapik.jobs import last_fetched, open_job_fqdns
 from hakapik.names import NameRecord, normalize
 from hakapik.signals import stop_on_signals
 from hakapik.suppress import Suppressor
@@ -104,6 +115,17 @@ class StatCounter:
     def add(self, other: StatCounter) -> None:
         for f in fields(self):
             setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+
+
+class CursorMoved(RuntimeError):
+    """Another writer advanced the log's cursor while this batch ran."""
+
+
+class _Recheck(NamedTuple):
+    rec: NameRecord
+    ts_ms: int
+    index: int
+    cert_key: bytes
 
 
 def pack_entries(entries: list[tuple[int, bytes, bytes]]) -> bytes:
@@ -200,12 +222,19 @@ async def _process_batch(
         entries = await src.entries(start, end)
         if not entries:
             return 0, start
+        # The cursor advances to last + 1, so a gap or a shifted range would
+        # skip entries unseen; the clients build contiguous prefixes, this
+        # holds any LogSource to it.
+        if any(e[0] != start + i for i, e in enumerate(entries)) or entries[-1][0] > end:
+            raise ValueError(
+                f"{log_id}: entries for {start}..{end} are not contiguous from {start}"
+            )
         batch = StatCounter(entries=len(entries))
         rows: list[CandidateRow] = []
         new_certs: set[bytes] = set()
         new_fqdns: dict[str, tuple[int, int]] = {}  # NameRecord.key -> (ts_ms, index)
         # Already-indexed, unsuppressed names seen again: re-check contenders.
-        recheck: dict[str, tuple[NameRecord, int, int, bytes]] = {}
+        recheck: dict[str, _Recheck] = {}
         for index, leaf, extra in entries:
             batch.bytes += len(leaf) + len(extra)
             parsed = _parse(src.info.kind, leaf)
@@ -224,21 +253,22 @@ async def _process_batch(
                 if rec.key in new_fqdns:
                     continue
                 if ix.get(rec.key) is not None:
-                    if (
-                        not rec.wildcard
-                        and rec.fqdn not in recheck
-                        and sup.reason(rec) is None
-                    ):
-                        recheck[rec.fqdn] = (rec, parsed.timestamp_ms, index, key)
+                    # sup.reason is a few set lookups, cheap enough per SAN; it
+                    # keeps suppressed names (wildcards included) out of the
+                    # last_fetched query below.
+                    if rec.fqdn not in recheck and sup.reason(rec) is None:
+                        recheck[rec.fqdn] = _Recheck(rec, parsed.timestamp_ms, index, key)
                     continue
                 new_fqdns[rec.key] = (parsed.timestamp_ms, index)
                 batch.fqdns_new += 1
                 reason = sup.reason(rec)
                 if reason is not None:
                     batch.suppressed += 1
+                    # Every reason for a valid name has a supp_* column; a new
+                    # reason without one fails here (AttributeError) instead of
+                    # vanishing from the split.
                     by_reason = f"supp_{reason}"
-                    if hasattr(batch, by_reason):
-                        setattr(batch, by_reason, getattr(batch, by_reason) + 1)
+                    setattr(batch, by_reason, getattr(batch, by_reason) + 1)
                 else:
                     rows.append(
                         CandidateRow(
@@ -248,15 +278,25 @@ async def _process_batch(
                     )
         batch.candidates = len(rows)
         if recheck:
-            last_at = await last_fetched(conn, list(recheck))
+            names = list(recheck)
+            last_at = await last_fetched(conn, names)
+            # A name with an open job is being fetched already, e.g. after the
+            # same certificate reached another log's batch first: no second
+            # candidate. (Two batches committing at once can still both add
+            # one; the open-job index then keeps a single job.)
+            busy = await open_job_fqdns(conn, names)
             cutoff = datetime.now(timezone.utc) - timedelta(days=recheck_days)
-            for fqdn, (rec, ts_ms, index, key) in recheck.items():
+            for fqdn, r in recheck.items():
                 done = last_at.get(fqdn)  # never attempted: not re-checked
-                if done is None or done >= cutoff or sup.top_listed(rec.registrable):
+                if (
+                    done is None or done >= cutoff or fqdn in busy
+                    or sup.top_listed(r.rec.registrable)
+                ):
                     continue
                 rows.append(
                     CandidateRow(
-                        fqdn, rec.registrable, log_id, index, key, ts_ms, "recheck"
+                        fqdn, r.rec.registrable, log_id, r.index, r.cert_key, r.ts_ms,
+                        "recheck",
                     )
                 )
                 batch.candidates_recheck += 1
@@ -266,7 +306,8 @@ async def _process_batch(
         await add_candidates(conn, rows)
         day = datetime.now(timezone.utc).date()
         await bump_stat(conn, log_id, day, **batch.increments())
-        await set_cursor(conn, log_id, last + 1)
+        if not await advance_cursor(conn, log_id, start, last + 1):
+            raise CursorMoved(f"{log_id}: cursor is no longer at {start}")
         await conn.commit()
     except BaseException:
         await conn.rollback()
@@ -359,12 +400,18 @@ class ConnPool:
                 return
             except Exception:
                 pass
+            except BaseException:  # cancelled mid-rollback: state unknown
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                raise
         with contextlib.suppress(Exception):
             await conn.close()
 
     async def close(self) -> None:
+        """Close the idle connections; one failing to close does not stop the rest."""
         while self._idle:
-            await self._idle.pop().close()
+            with contextlib.suppress(Exception):
+                await self._idle.pop().close()
 
 
 def _borrow(db):

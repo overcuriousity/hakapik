@@ -245,6 +245,26 @@ async def set_cursor(conn: psycopg.AsyncConnection, log_id: str, next_index: int
     )
 
 
+async def advance_cursor(
+    conn: psycopg.AsyncConnection, log_id: str, expected: int, next_index: int
+) -> bool:
+    """Move the cursor from ``expected`` to ``next_index``; False if it is elsewhere.
+
+    A compare-and-set: of two writers that read the same cursor, the one
+    committing second updates nothing (it waits on the row lock, then sees
+    the new value) and must roll its batch back. A missing row is created.
+    """
+    cur = await conn.execute(
+        """INSERT INTO log_cursor (log_id, next_index) VALUES (%s, %s)
+           ON CONFLICT (log_id) DO UPDATE SET
+             next_index = EXCLUDED.next_index,
+             updated_at = now()
+           WHERE log_cursor.next_index = %s""",
+        (log_id, next_index, expected),
+    )
+    return cur.rowcount == 1
+
+
 async def init_cursor(
     conn: psycopg.AsyncConnection, log_id: str, next_index: int
 ) -> bool:
@@ -294,6 +314,11 @@ async def add_raw_batch(
     entries: int,
     nbytes: int,
 ) -> None:
+    # No uniqueness on (log_id, start_index), on purpose: ingest commits this
+    # row together with advance_cursor's compare-and-set, so a range is stored
+    # twice only when an operator rewinds a cursor to re-read it; the second
+    # row then records that re-read. Both rows may share one blob; prune_raw
+    # keeps a blob while any row references it.
     await conn.execute(
         """INSERT INTO raw_batch
              (log_id, start_index, end_index, blob_sha256, entries, bytes)
