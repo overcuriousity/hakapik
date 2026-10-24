@@ -100,7 +100,10 @@ async def run_job(job: Job, *, resolver, browser, bs: BlobStore, key: NodeKey,
                 desktop = await browser.capture(job.url, "desktop", click_through=True)
                 _record(bs, desktop, pages, blobs)
     except Exception as e:
-        outcome, error = "error", repr(e)
+        # A finished mobile pass keeps its outcome; the error says what failed after it.
+        mobile_page = next((p for p in pages if p.profile == "mobile"), None)
+        outcome = mobile_page.outcome if mobile_page else "error"
+        error = repr(e)
     return seal(AttemptResult(
         job_id=job.job_id, step=job.step, node_id=key.node_id,
         egress_address=egress_address, started_at=started, finished_at=_now(),

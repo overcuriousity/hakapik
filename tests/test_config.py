@@ -75,3 +75,18 @@ def test_list_values_become_tuples(tmp_path):
 def test_asn_mmdb_is_a_path(tmp_path):
     assert _load(tmp_path, "").asn_mmdb is None
     assert _load(tmp_path, 'asn_mmdb = "/x/a.mmdb"').asn_mmdb == Path("/x/a.mmdb")
+
+
+def test_lease_must_cover_worst_case_capture(tmp_path):
+    # 4 * nav_timeout_s + 60: landing, up to 3 click hops, resolve
+    assert _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 180").lease_s == 180
+    with pytest.raises(ValueError, match="lease_s"):
+        _load(tmp_path, "nav_timeout_s = 30.0\nlease_s = 179")
+    with pytest.raises(ValueError, match="lease_s"):
+        _load(tmp_path, "nav_timeout_s = 200.0")
+
+
+def test_fetch_workers_at_least_one(tmp_path):
+    assert _load(tmp_path, "fetch_workers = 1").fetch_workers == 1
+    with pytest.raises(ValueError, match="fetch_workers"):
+        _load(tmp_path, "fetch_workers = 0")

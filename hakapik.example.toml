@@ -71,6 +71,8 @@ ageout_hours = 24.0
 nav_timeout_s = 30.0
 
 # Seconds a worker holds a claimed job before it may be claimed again.
+# Must be at least 4 * nav_timeout_s + 60 (landing, up to 3 click hops and
+# the resolve), so a job is not claimed again while it still runs.
 lease_s = 600
 
 # Path to a GeoLite2-ASN .mmdb you supply, for ASN enrichment. Omitted = no enrichment.

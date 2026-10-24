@@ -1,5 +1,7 @@
 import asyncio
 
+import dns.resolver
+import pytest
 import pytest_asyncio
 
 from dnsserver import DnsServer
@@ -102,3 +104,19 @@ async def test_unexpected_error_is_logged_and_recorded(dns_server, monkeypatch, 
         ans = await r.resolve(NAME, NAME)
     assert ans and all(a.rcode == "ERROR" for a in ans)
     assert any(NAME in rec.getMessage() and rec.exc_info for rec in caplog.records)
+
+
+def test_no_nameservers_raises(monkeypatch):
+    class Empty:
+        nameservers = []
+
+    monkeypatch.setattr(dns.resolver, "Resolver", lambda configure=True: Empty())
+    with pytest.raises(ValueError, match="no DNS nameservers configured"):
+        Resolver(())
+
+    def unconfigured(configure=True):
+        raise dns.resolver.NoResolverConfiguration("no nameservers")
+
+    monkeypatch.setattr(dns.resolver, "Resolver", unconfigured)
+    with pytest.raises(ValueError, match="no DNS nameservers configured"):
+        Resolver(())

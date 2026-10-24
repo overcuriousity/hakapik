@@ -31,14 +31,15 @@ def page(profile, outcome="live"):
 
 
 class FakeBrowser:
-    def __init__(self, mobile="live", exc=None):
+    def __init__(self, mobile="live", exc=None, exc_profile="desktop"):
         self.calls = []
         self.mobile = mobile
         self.exc = exc
+        self.exc_profile = exc_profile
 
     async def capture(self, url, profile, *, click_through=False):
         self.calls.append((url, profile, click_through))
-        if self.exc and profile == "desktop":
+        if self.exc and profile == self.exc_profile:
             raise self.exc
         if profile == "mobile":
             return Capture(page(profile, self.mobile), b"png-m", b"<m>", b"warc-m",
@@ -90,13 +91,22 @@ async def test_non_live_mobile_skips_desktop(tmp_path):
     assert len(b.calls) == 1
 
 
-async def test_browser_exception_becomes_error_result(tmp_path):
+async def test_desktop_exception_keeps_mobile_outcome(tmp_path):
     b = FakeBrowser(exc=RuntimeError("boom"))
     r, bs = await run(tmp_path, FakeResolver(dns()), b)
-    assert r.outcome == "error" and r.error == repr(RuntimeError("boom"))
+    assert r.outcome == "live" and r.error == repr(RuntimeError("boom"))
     assert [p.profile for p in r.pages] == ["mobile"] and r.dns
-    assert {(x.profile, x.kind) for x in r.blobs} >= {("mobile", "warc")}
+    assert {(x.profile, x.kind) for x in r.blobs} == {
+        ("mobile", "warc"), ("mobile", "screenshot"), ("mobile", "dom"),
+        ("mobile", "certchain")}
     assert all(bs.path(x.sha256).exists() for x in r.blobs)
+
+
+async def test_mobile_exception_becomes_error_result(tmp_path):
+    b = FakeBrowser(exc=RuntimeError("boom"), exc_profile="mobile")
+    r, _ = await run(tmp_path, FakeResolver(dns()), b)
+    assert r.outcome == "error" and r.error == repr(RuntimeError("boom"))
+    assert r.pages == () and r.blobs == () and r.dns
 
 
 async def test_ip_spacer_waits():

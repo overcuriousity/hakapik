@@ -275,7 +275,7 @@ def _asn_db(tmp_path, bs):
 
 
 async def test_store_records_asn(conn, tmp_path, key):
-    bs, jid, _ = await _setup(conn, tmp_path, key)
+    bs, jid, cid = await _setup(conn, tmp_path, key)
     db = _asn_db(tmp_path, bs)
     aid = await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER,
                              asn_db=db)
@@ -285,6 +285,11 @@ async def test_store_records_asn(conn, tmp_path, key):
     cur = await conn.execute(
         "SELECT media_type FROM blob WHERE sha256 = %s", (db.sha256,))
     assert (await cur.fetchone())[0] == "application/vnd.maxmind.mmdb"
+    _, _, doc = await _manifest(conn, bs, cid, 1)
+    [a] = doc["attempts"]
+    assert (a["asn"], a["asn_org"], a["asn_db_sha256"]) == (64500, "Example AS", db.sha256)
+    assert a["asn_db"] == {"sha256": db.sha256, "size": db.size,
+                           "media_type": "application/vnd.maxmind.mmdb"}
 
 
 async def test_store_asn_falls_back_to_dns_address(conn, tmp_path, key):
@@ -301,11 +306,14 @@ async def test_store_asn_falls_back_to_dns_address(conn, tmp_path, key):
 
 
 async def test_store_without_asn_db_leaves_nulls(conn, tmp_path, key):
-    bs, jid, _ = await _setup(conn, tmp_path, key)
+    bs, jid, cid = await _setup(conn, tmp_path, key)
     aid = await store_result(conn, bs, seal(_result(bs, key, jid, 0), key), LADDER)
     cur = await conn.execute(
         "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
     assert await cur.fetchone() == (None, None, None)
+    _, _, doc = await _manifest(conn, bs, cid, 1)
+    [a] = doc["attempts"]
+    assert (a["asn"], a["asn_org"], a["asn_db_sha256"], a["asn_db"]) == (None,) * 4
 
 
 async def test_store_miss_records_snapshot_hash(conn, tmp_path, key):
@@ -336,3 +344,30 @@ async def test_store_no_address_leaves_nulls_even_with_db(conn, tmp_path, key):
         "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
     assert await cur.fetchone() == (None, None, None)
     assert await _count(conn, "blob", "sha256 = %s", (db.sha256,)) == 0
+
+
+async def test_concurrent_store_of_same_step_waits_then_is_noop(conn, tmp_path, key):
+    import asyncio
+    import dataclasses
+    import os
+
+    from hakapik.db import connect
+
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    await conn.commit()
+    env_a = seal(_result(bs, key, jid, 0), key)
+    env_b = seal(dataclasses.replace(_result(bs, key, jid, 0), error="other"), key)
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        assert await store_result(conn, bs, env_a, LADDER) is not None
+        task = asyncio.create_task(store_result(other, bs, env_b, LADDER))
+        await asyncio.sleep(0.3)
+        assert not task.done()  # blocked on the job row
+        await conn.commit()
+        assert await task is None
+        await other.commit()
+    finally:
+        await other.close()
+    assert await _count(conn, "attempt") == 1
+    assert await _count(conn, "blob", "sha256 = %s",
+                        (hashlib.sha256(env_b).hexdigest(),)) == 0

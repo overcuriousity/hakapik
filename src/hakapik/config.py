@@ -54,4 +54,11 @@ def load_config(path: Path) -> Config:
         not ladder or ladder[0] != 0 or any(a >= b for a, b in zip(ladder, ladder[1:]))
     ):
         raise ValueError("retry_ladder_s must be non-empty, start at 0 and strictly increase")
-    return Config(**raw)
+    cfg = Config(**raw)
+    if cfg.fetch_workers < 1:
+        raise ValueError("fetch_workers must be at least 1")
+    # Worst-case capture: landing plus up to 3 click hops, plus resolve. A
+    # shorter lease lets a running job be claimed again mid-run.
+    if cfg.lease_s < 4 * cfg.nav_timeout_s + 60:
+        raise ValueError("lease_s must be at least 4 * nav_timeout_s + 60")
+    return cfg

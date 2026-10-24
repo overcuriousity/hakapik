@@ -7,6 +7,7 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
+    connect,
     bump_stat,
     get_cursor,
     migrate,
@@ -126,3 +127,14 @@ async def test_migrate_upgrades_old_candidate_table(conn):
 async def test_migrate_is_idempotent(conn):
     await migrate(conn)
     await migrate(conn)
+
+
+async def test_second_migrate_takes_no_exclusive_lock(conn):
+    # a reader holding ACCESS SHARE blocks any ALTER TABLE; a second migrate must not need one
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        await other.execute("LOCK TABLE candidate, ingest_stat IN ACCESS SHARE MODE")
+        await conn.execute("SET lock_timeout = '1s'")
+        await migrate(conn)
+    finally:
+        await other.close()

@@ -1,4 +1,4 @@
-"""Operator entry point: tail, stats, sample, prune."""
+"""Operator entry point: tail, stats, sample, prune, enqueue, fetch, show."""
 
 from __future__ import annotations
 

@@ -59,13 +59,7 @@ _SCHEMA = [
     "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
     "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
     "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)",
-    # Stage two. The ALTERs are idempotent: migrate() runs on every command start.
-    "ALTER TABLE candidate ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT 'first_seen'",
-    "ALTER TABLE candidate ALTER COLUMN log_id DROP NOT NULL",
-    "ALTER TABLE candidate ALTER COLUMN log_index DROP NOT NULL",
-    "ALTER TABLE candidate ALTER COLUMN cert_key DROP NOT NULL",
-    "ALTER TABLE candidate ALTER COLUMN first_seen_ms DROP NOT NULL",
-    "ALTER TABLE ingest_stat ADD COLUMN IF NOT EXISTS candidates_recheck bigint NOT NULL DEFAULT 0",
+    # Stage two; the column changes to stage-one tables are in _UPGRADES.
     "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)",
     """CREATE TABLE IF NOT EXISTS fetch_job (
         id bigserial PRIMARY KEY,
@@ -141,6 +135,26 @@ _SCHEMA = [
     )""",
 ]
 
+# Changes to tables that may predate stage two, as (table, column, change, DDL).
+# ALTER TABLE takes ACCESS EXCLUSIVE even when IF NOT EXISTS makes it a no-op,
+# and migrate() runs on every command start, so each one runs only while
+# information_schema shows it is still needed: "add" while the column is
+# missing, "drop_not_null" while it is NOT NULL.
+_UPGRADES = [
+    ("candidate", "reason", "add",
+     "ALTER TABLE candidate ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT 'first_seen'"),
+    ("candidate", "log_id", "drop_not_null",
+     "ALTER TABLE candidate ALTER COLUMN log_id DROP NOT NULL"),
+    ("candidate", "log_index", "drop_not_null",
+     "ALTER TABLE candidate ALTER COLUMN log_index DROP NOT NULL"),
+    ("candidate", "cert_key", "drop_not_null",
+     "ALTER TABLE candidate ALTER COLUMN cert_key DROP NOT NULL"),
+    ("candidate", "first_seen_ms", "drop_not_null",
+     "ALTER TABLE candidate ALTER COLUMN first_seen_ms DROP NOT NULL"),
+    ("ingest_stat", "candidates_recheck", "add",
+     "ALTER TABLE ingest_stat ADD COLUMN IF NOT EXISTS candidates_recheck bigint NOT NULL DEFAULT 0"),
+]
+
 STAT_COLUMNS = (
     "entries",
     "bytes",
@@ -174,6 +188,20 @@ async def connect(url: str) -> psycopg.AsyncConnection:
 async def migrate(conn: psycopg.AsyncConnection) -> None:
     for stmt in _SCHEMA:
         await conn.execute(stmt)
+    for table, column, change, stmt in _UPGRADES:
+        cur = await conn.execute(
+            """SELECT is_nullable FROM information_schema.columns
+               WHERE table_schema = current_schema()
+                 AND table_name = %s AND column_name = %s""",
+            (table, column),
+        )
+        row = await cur.fetchone()
+        if change == "add":
+            needed = row is None
+        else:
+            needed = row is not None and row[0] == "NO"
+        if needed:
+            await conn.execute(stmt)
     await conn.commit()
 
 

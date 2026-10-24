@@ -97,8 +97,12 @@ async def store_result(
     except BadEnvelope as e:
         raise ResultRejected(str(e)) from e
 
+    # FOR UPDATE: a concurrent store of the same (job_id, step) waits here,
+    # then sees the advanced step and returns None before writing anything.
+    # Lock order is job, then candidate (write_manifest).
     cur = await conn.execute(
-        "SELECT candidate_id, fqdn FROM fetch_job WHERE id = %s AND step = %s AND state = 'open'",
+        "SELECT candidate_id, fqdn FROM fetch_job WHERE id = %s AND step = %s AND state = 'open' "
+        "FOR UPDATE",
         (r.job_id, r.step),
     )
     row = await cur.fetchone()
@@ -203,15 +207,24 @@ async def write_manifest(
             ct_raw_batch = row and row["blob_sha256"]
 
         await cur.execute(
-            """SELECT a.id, a.step, a.node_id, a.outcome, a.started_at, a.envelope_sha256
+            """SELECT a.id, a.step, a.node_id, a.outcome, a.started_at, a.envelope_sha256,
+                      a.asn, a.asn_org, a.asn_db_sha256, b.size AS asn_db_size,
+                      b.media_type AS asn_db_media_type
                FROM attempt a JOIN fetch_job j ON j.id = a.job_id
+               LEFT JOIN blob b ON b.sha256 = a.asn_db_sha256
                WHERE j.candidate_id = %s ORDER BY a.step, a.id""",
             (candidate_id,),
         )
         attempts = [
             {"attempt_id": a["id"], "step": a["step"], "node_id": a["node_id"],
              "outcome": a["outcome"], "started_at": _plain(a["started_at"]),
-             "envelope_sha256": a["envelope_sha256"], "blobs": []}
+             "envelope_sha256": a["envelope_sha256"],
+             "asn": a["asn"], "asn_org": a["asn_org"],
+             "asn_db_sha256": a["asn_db_sha256"],
+             "asn_db": a["asn_db_sha256"] and {
+                 "sha256": a["asn_db_sha256"], "size": a["asn_db_size"],
+                 "media_type": a["asn_db_media_type"]},
+             "blobs": []}
             for a in await cur.fetchall()
         ]
         by_id = {a["attempt_id"]: a for a in attempts}

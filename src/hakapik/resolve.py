@@ -36,8 +36,13 @@ class Resolver:
     def __init__(self, nameservers: tuple[str, ...] = (), *, port: int = 53,
                  timeout_s: float = 5.0):
         if not nameservers:
-            nameservers = tuple(
-                str(ns) for ns in dns.resolver.Resolver(configure=True).nameservers)
+            try:
+                system = dns.resolver.Resolver(configure=True).nameservers
+            except dns.resolver.NoResolverConfiguration:
+                system = []
+            nameservers = tuple(str(ns) for ns in system)
+        if not nameservers:
+            raise ValueError("no DNS nameservers configured")
         self._servers = nameservers
         self._resolvers = []
         for ns in nameservers:

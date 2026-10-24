@@ -57,6 +57,14 @@ No running `tail` is needed.
 `fetch_proxy` if that is set. Rate limits (`fetch_per_ip_interval_s`,
 `fetch_daily_cap`) are off unless configured.
 
+To run the fetcher safely, set `egress_address` (recorded in every signed
+result) together with `fetch_proxy`. The fetcher visits attacker-controlled
+pages, so when this machine shares a network with anything sensitive (the
+Postgres container, for example), run `hakapik fetch` in a separate network
+namespace or behind `fetch_proxy`. On a headless server Playwright also needs
+its system libraries: `uv run playwright install-deps chromium` on
+Debian/Ubuntu, or the distribution's packages elsewhere.
+
 For ASN enrichment, set `asn_mmdb` to a GeoLite2-ASN file (this needs a
 MaxMind account); refresh it by replacing the file. Without it, ASNs are null.
 
