@@ -138,11 +138,13 @@ def unpack_entries(data: bytes) -> list[tuple[int, bytes, bytes]]:
 def _batch_end(src: LogSource, pos: int, size: int, batch_size: int) -> int:
     """Inclusive end index of the batch starting at ``pos``.
 
-    Tiled logs serve whole 256-entry tiles, so their batches end at the next
-    tile boundary (each tile is fetched once); other logs use ``batch_size``.
+    Tiled logs serve whole 256-entry tiles, so their batches end on a tile
+    boundary (each tile is fetched once) and span ``batch_size // 256`` tiles,
+    at least one; other logs use ``batch_size``.
     """
     if src.info.kind == "tiled":
-        return min((pos // TILE_WIDTH + 1) * TILE_WIDTH, size) - 1
+        tiles = max(1, batch_size // TILE_WIDTH)
+        return min((pos // TILE_WIDTH + tiles) * TILE_WIDTH, size) - 1
     return min(pos + batch_size, size) - 1
 
 
@@ -292,9 +294,13 @@ class _Progress:
         if dt < PROGRESS_INTERVAL_S:
             return
         rate = self._n / dt if dt > 0 else 0.0
+        # next_index > size happens when a log's tree head (STH/checkpoint)
+        # lags behind the entries it already serves; the lag is then 0.
+        ahead = next_index - size
         self._log.info(
-            "tail %.1f entries/s lag=%d next_index=%d tree_size=%d",
-            rate, size - next_index, next_index, size,
+            "tail %.1f entries/s lag=%d next_index=%d tree_size=%d%s",
+            rate, max(0, -ahead), next_index, size,
+            f" (tree head {ahead} behind served entries)" if ahead > 0 else "",
         )
         self._t0 = time.monotonic()
         self._n = 0

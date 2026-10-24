@@ -543,6 +543,17 @@ async def test_tail_tiled_batches_are_tile_aligned(ix, sup, bs, tmp_path, conn):
     assert await count(conn, "raw_batch") == 3
 
 
+async def test_tail_tiled_batch_size_spans_whole_tiles(ix, sup, bs, tmp_path, conn):
+    src = TiledFakeSource(1200)
+    await cursor_at(conn, TILED_INFO.log_id, 100)
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=512)
+    while await tail_log_once(src, cfg, ix, sup, bs, conn):
+        pass
+    assert src.calls == [(100, 511), (512, 1023), (1024, 1199)]
+    cfg = Config(data_dir=tmp_path, database_url="unused", batch_size=10)
+    assert ingest._batch_end(src, 0, 1200, cfg.batch_size) == 255  # at least one tile
+
+
 async def test_stats_split_by_reason(synth, ix, bs, conn):
     sup = Suppressor(frozenset({"t.com"}), frozenset({"pub.com"}))
     src = FakeSource([
@@ -597,3 +608,21 @@ async def test_tail_log_rate_limits_tracebacks(ix, sup, bs, cfg, conn, monkeypat
     assert len(recs) >= 5 and all(r.levelname == "WARNING" for r in recs)
     assert "ConnectError('down')" in recs[0].getMessage()
     assert [bool(r.exc_info) for r in recs].count(True) == 1 and recs[0].exc_info
+
+
+async def test_tail_log_lag_never_negative(ix, sup, bs, cfg, conn, monkeypatch, caplog):
+    # A log whose tree head lags the entries it serves: cursor ahead of size.
+    await cursor_at(conn, INFO.log_id, 6)
+    fake = FakeSource([b"x"] * 4)
+    monkeypatch.setattr(ingest, "PROGRESS_INTERVAL_S", 0.0)
+    stop = asyncio.Event()
+    with caplog.at_level("INFO"):
+        task = asyncio.create_task(tail_log(fake, cfg, ix, sup, bs, conn, stop))
+        for _ in range(200):
+            if "lag=" in caplog.text:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+    assert "lag=0 next_index=6 tree_size=4 (tree head 2 behind served entries)" in caplog.text
+    assert "lag=-" not in caplog.text
