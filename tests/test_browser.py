@@ -1,7 +1,9 @@
 import asyncio
+import gc
 import gzip
 import io
 import json
+import logging
 import time
 
 import pytest
@@ -304,6 +306,30 @@ async def test_a_blocked_click_is_an_error_even_if_the_url_moves(site):
 
 
 @session_loop
+async def test_click_bound_stays_within_the_hop_deadline(site, browser, monkeypatch):
+    # with a small nav_timeout_s the reserve is below the 0.5 s click margin
+    monkeypatch.setattr(browser, "nav_timeout_s", 0.9)
+    loop = asyncio.get_running_loop()
+    deadlines, ends = [], []
+    real_click, real_wait_for = browser._click, asyncio.wait_for
+
+    async def click(context, rec, url, profile, n, label, deadline):
+        deadlines.append(deadline)
+        return await real_click(context, rec, url, profile, n, label, deadline)
+
+    def wait_for(aw, timeout):
+        if getattr(aw, "__qualname__", "").endswith(".click"):
+            ends.append(loop.time() + timeout)
+        return real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(browser, "_click", click)
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
+    c = await browser.capture(site.url("/hang-login"), "desktop", click_through=True)
+    assert c.clicks[0].page.outcome == "timeout"
+    assert len(ends) == 1 and ends[0] <= deadlines[0] + 0.01  # left() ran a moment earlier
+
+
+@session_loop
 async def test_click_pages_are_closed_after_their_hop(site, browser, monkeypatch):
     real = browser._click
     open_pages = []
@@ -556,6 +582,40 @@ async def test_a_context_created_after_the_setup_timeout_is_closed(site, browser
         if made and not browser._browser.contexts:
             break
     assert len(made) == 1 and browser._browser.contexts == []
+
+
+@session_loop
+async def test_a_context_created_after_a_cancelled_capture_is_closed(
+        site, browser, monkeypatch, caplog):
+    # e.g. job_timeout_s cancels the capture while the browser is slow
+    real_new_context = browser._browser.new_context
+    made = []
+
+    async def slow_new_context(**kwargs):
+        await asyncio.sleep(1)
+        made.append(await real_new_context(**kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(browser._browser, "new_context", slow_new_context)
+    task = asyncio.ensure_future(browser.capture(site.url("/"), "mobile"))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if made and not browser._browser.contexts:
+            break
+    assert len(made) == 1 and browser._browser.contexts == []
+    gc.collect()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_exit_cancels_pending_late_closes():
+    async with Browser(proxy=None, nav_timeout_s=5, settle_s=0) as b:
+        pending = asyncio.ensure_future(asyncio.sleep(3600))  # a close that hangs
+        b._late_closes.add(pending)
+    assert pending.cancelled()
 
 
 class _LocalResolver:

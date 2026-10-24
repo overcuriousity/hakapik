@@ -221,6 +221,9 @@ class Browser:
             await context.close()
 
     async def __aexit__(self, *exc):
+        for t in self._late_closes:  # the browser's close ends those contexts anyway
+            t.cancel()
+        await asyncio.gather(*self._late_closes, return_exceptions=True)
         try:
             await self._browser.close()
         finally:
@@ -342,7 +345,9 @@ class Browser:
         tracker cannot use up the hop. If the click opened a popup, the first
         one is captured instead of the page. Nothing on the clicked page is
         clicked. A failed click is outcome "error"; a click whose navigation
-        never commits is outcome "timeout".
+        never commits is outcome "timeout". Only playwright's own click
+        timeout can tell that; if asyncio's bound fires first (a wedged
+        driver), the hop is "error".
         """
         loop = asyncio.get_running_loop()
         started = _now()
@@ -383,12 +388,16 @@ class Browser:
             try:
                 # Playwright's click waits, within its timeout, for a
                 # navigation it starts to commit; asyncio's bound is a margin
-                # behind it, so playwright's timeout (with its log) comes first.
-                await asyncio.wait_for(element.click(timeout=budget * 1000), budget + 0.5)
+                # behind it (within the reserve, so never past ``deadline``),
+                # so playwright's timeout, with its log, comes first.
+                await asyncio.wait_for(element.click(timeout=budget * 1000),
+                                       budget + min(0.5, reserve))
             except PlaywrightTimeout as e:
                 # Hung only if the click went out (playwright logged it) and a
                 # navigation started since is still unanswered; a moving URL
-                # or a blocked click is a failed click.
+                # or a blocked click is a failed click. The log line is
+                # playwright 1.64.x's (pinned in pyproject.toml); guarded by
+                # test_hop_budget_bounds_a_hanging_click_target.
                 if "click action done" not in e.message or not (
                         nav.unanswered - unanswered_before):
                     raise
@@ -445,7 +454,8 @@ class Browser:
             error=error, started_at=_rfc3339(started), finished_at=_rfc3339(_now())))
 
     def _close_late_context(self, create: asyncio.Future):
-        if create.cancelled() or create.exception() is not None:
+        """Close a context that arrived after its capture gave up."""
+        if create.cancelled() or create.exception() is not None:  # retrieved: no warning
             return
         task = asyncio.ensure_future(create.result().close())
         self._late_closes.add(task)  # a reference until it is done
@@ -484,12 +494,13 @@ class Browser:
                 raise TimeoutError("browser setup took over nav_timeout_s") from None
 
         # Raises if the browser is wedged: there is no page yet to blame. A
-        # context that arrives after that is closed then, not left open.
+        # context that arrives after that, or after the capture was cancelled,
+        # is closed then, not left open.
         create = asyncio.ensure_future(
             self._browser.new_context(**settings, accept_downloads=False))
         try:
             context = await setup(asyncio.shield(create))
-        except TimeoutError:
+        except BaseException:
             create.add_done_callback(self._close_late_context)
             raise
         rec = Recorder()
