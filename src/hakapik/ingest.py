@@ -21,21 +21,19 @@ applied only after the commit succeeds. Consequences:
   wins; the other batch rolls back (``CursorMoved``) and is retried from the
   new cursor, so a range is not stored or emitted twice.
 
-The raw blob is written before the commit. After a failed commit the retry
-normally re-reads the same entries, builds the same (content-addressed) blob
-and references it. Only when the retry gets a different range (the log
-returns fewer or more entries) is the first blob left unreferenced. Such a
-blob is not reclaimed: ``prune`` only unlinks blobs of the raw_batch rows it
-deletes, and a sweep of unreferenced files would have to know every other
-user of the shared blob store (fetch results, ASN snapshots) and every
-in-flight writer. The cost is at most one batch blob per failed commit.
+The raw blob is written before the commit, under ``lock_blob`` held to
+the commit. A batch that fails, is cancelled or loses the cursor
+(``CursorMoved``) leaves its blob unreferenced unless another commit stores
+the same bytes; stale worker results leave unreferenced blobs too. ``prune`` reclaims
+such orphans once they are older than ``orphan_margin_hours``
+(``db.sweep_orphan_blobs``).
 
 Concurrency: one in-flight batch per log. Log tasks share one
 ``FirstSeenIndex`` on one event loop and borrow Postgres connections from a
-``ConnPool`` capped at ``Config.max_db_connections``. Two logs can both read an FQDN as new before either applies its
-post-commit writes (a batch awaits the DB in between); that too yields at
-most a duplicate candidate, and ``first_seen`` keeps the first writer's
-sighting.
+``ConnPool`` capped at ``Config.max_db_connections``. Two logs can both
+read an FQDN as new before either applies its post-commit writes (a batch
+awaits the DB in between); that too yields at most a duplicate candidate,
+and ``first_seen`` keeps the first writer's sighting.
 """
 
 from __future__ import annotations

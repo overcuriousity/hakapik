@@ -11,15 +11,17 @@ after the lease expires. Signal handling belongs to the caller: setting
 
 import asyncio
 import contextlib
+import hashlib
 import logging
+from pathlib import Path
 
 import maxminddb
 
-from hakapik.asn import AsnDb
+from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
 from hakapik.browser import Browser
 from hakapik.config import Config
-from hakapik.db import connect, migrate
+from hakapik.db import connect, lock_blob, migrate
 from hakapik.ingest import ConnPool
 from hakapik.jobs import attempts_today, claim_jobs, sweep
 from hakapik.protocol import Job, NodeKey, open_envelope
@@ -33,15 +35,30 @@ IDLE_SLEEP_S = 2.0  # nothing claimed
 CAP_SLEEP_S = 60.0  # daily cap reached
 
 
-def _load_asn(cfg: Config, bs: BlobStore) -> AsnDb | None:
+async def _load_asn(cfg: Config, bs: BlobStore, conn) -> AsnDb | None:
+    """Load the snapshot and commit its blob row, so it is always referenced.
+
+    The blob lock is held from before the put until that commit: the orphan
+    sweep cannot unlink an existing snapshot file this load relies on.
+    """
     if cfg.asn_mmdb is None:
         return None
     try:
-        return AsnDb.load(cfg.asn_mmdb, bs)
+        data = Path(cfg.asn_mmdb).read_bytes()
+        await lock_blob(conn, hashlib.sha256(data).hexdigest())
+        asn = AsnDb.from_bytes(data, bs, cfg.asn_mmdb)
     except (OSError, ValueError, maxminddb.InvalidDatabaseError) as e:
+        await conn.rollback()
         log.warning("ASN database %s unusable (%r); ASN enrichment disabled",
                     cfg.asn_mmdb, e)
         return None
+    await conn.execute(
+        "INSERT INTO blob (sha256, size, media_type) VALUES (%s, %s, %s) "
+        "ON CONFLICT DO NOTHING",
+        (asn.sha256, asn.size, MMDB_MEDIA_TYPE),
+    )
+    await conn.commit()
+    return asn
 
 
 async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
@@ -63,9 +80,9 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=
         await migrate(conn)
         await register_node(conn, key.node_id, key.public_key)
         await conn.commit()
+        asn_db = await _load_asn(cfg, bs, conn)
     finally:
         await conn.close()
-    asn_db = _load_asn(cfg, bs)
     if resolver is None:
         resolver = Resolver(cfg.resolver_nameservers)
     pool = ConnPool(cfg.database_url, min(cfg.max_db_connections, cfg.fetch_workers + 2))

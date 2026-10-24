@@ -34,7 +34,11 @@ class AsnDb:
 
     @classmethod
     def load(cls, path: Path, bs: BlobStore) -> "AsnDb":
-        data = Path(path).read_bytes()
+        return cls.from_bytes(Path(path).read_bytes(), bs, path)
+
+    @classmethod
+    def from_bytes(cls, data: bytes, bs: BlobStore, path: Path) -> "AsnDb":
+        """Store the snapshot ``data`` (read from ``path``) and open it."""
         sha = bs.put(data, MMDB_MEDIA_TYPE)
         reader = maxminddb.open_database(bs.path(sha), mode=maxminddb.MODE_MEMORY)
         epoch = reader.metadata().build_epoch

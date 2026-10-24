@@ -91,3 +91,13 @@ def test_blobstore_put_tolerates_unfixable_mode_of_existing_blob(tmp_path, monke
     with caplog.at_level("WARNING", logger="hakapik.blobstore"):
         assert bs.put(b"abc", "x") == h
     assert any(h in r.getMessage() for r in caplog.records)
+
+
+def test_blobstore_put_of_an_existing_blob_refreshes_its_mtime(tmp_path):
+    import os
+
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"abc", "x")
+    os.utime(bs.path(h), (1000, 1000))
+    assert bs.put(b"abc", "x") == h
+    assert bs.path(h).stat().st_mtime > 1000

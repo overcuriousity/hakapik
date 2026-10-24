@@ -17,6 +17,7 @@ from hakapik.db import (
     connect,
     lock_blob,
     prune_raw,
+    sweep_orphan_blobs,
 )
 
 needs_db = pytest.mark.skipif(
@@ -112,7 +113,9 @@ async def test_prune_keeps_batch_with_candidate_in_range(tmp_path, conn, cfg_pat
     await add_candidates(conn, [_cand(9, "L")])
     await conn.commit()
     assert await run_main(["--config", cfg_path, "prune"]) == 0
-    assert capsys.readouterr().out.strip() == "1"
+    assert capsys.readouterr().out.splitlines() == [
+        "raw_batches\t1", "orphan_blobs\t0", "temp_files\t0"
+    ]
     assert bs.path(kept).exists()
     assert not bs.path(gone).exists()
     cur = await conn.execute("SELECT count(*) FROM raw_batch")
@@ -284,3 +287,92 @@ async def test_prune_waits_for_a_batch_about_to_reference_the_blob(tmp_path, con
     finally:
         await ingest_conn.close()
     assert bs.path(sha).exists()
+
+
+# --- orphan blob sweep -------------------------------------------------------
+
+DAY = 86400
+
+
+def _age(bs, sha_or_path, seconds):
+    p = bs.path(sha_or_path) if isinstance(sha_or_path, str) else sha_or_path
+    t = datetime.now(timezone.utc).timestamp() - seconds
+    os.utime(p, (t, t))
+
+
+@needs_db
+async def test_sweep_removes_old_unreferenced_blob_and_keeps_the_rest(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    orphan = bs.put(b"orphan", "x")
+    young = bs.put(b"young", "x")
+    raw = await _batch(conn, bs, "L", 0, 9, b"raw", 0)
+    result = bs.put(b"result", "x")
+    await conn.execute(
+        "INSERT INTO blob (sha256, size, media_type) VALUES (%s, 6, 'x')", (result,)
+    )
+    await conn.commit()
+    for sha in (orphan, raw, result):
+        _age(bs, sha, 2 * DAY)
+    assert await sweep_orphan_blobs(conn, bs, DAY) == (1, 0)
+    assert not bs.path(orphan).exists()
+    assert bs.path(young).exists()  # unreferenced but within the margin
+    assert bs.path(raw).exists() and bs.path(result).exists()  # referenced
+
+
+@needs_db
+async def test_sweep_removes_stale_temp_files_only(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    sha = bs.put(b"x", "x")
+    d = bs.path(sha).parent
+    stale, fresh = d / ".tmp-stale", d / ".tmp-fresh"
+    stale.write_bytes(b"partial")
+    fresh.write_bytes(b"partial")
+    _age(bs, stale, 2 * DAY)
+    assert await sweep_orphan_blobs(conn, bs, DAY) == (0, 1)
+    assert not stale.exists() and fresh.exists() and bs.path(sha).exists()
+
+
+@needs_db
+async def test_sweep_keeps_an_old_blob_that_was_put_again(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    sha = bs.put(b"screenshot", "x")
+    _age(bs, sha, 2 * DAY)
+    bs.put(b"screenshot", "x")  # a worker produced the same bytes again
+    assert await sweep_orphan_blobs(conn, bs, DAY) == (0, 0)
+    assert bs.path(sha).exists()
+
+
+@needs_db
+async def test_sweep_skips_a_blob_put_again_while_it_waited_for_the_lock(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    sha = bs.put(b"same", "x")
+    _age(bs, sha, 2 * DAY)
+    writer = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        await lock_blob(writer, sha)
+        sweep = asyncio.create_task(sweep_orphan_blobs(conn, bs, DAY))
+        await asyncio.sleep(0.2)
+        assert not sweep.done()  # waits on the writer's lock
+        bs.put(b"same", "x")
+        await writer.commit()
+        assert await sweep == (0, 0)
+    finally:
+        await writer.close()
+    assert bs.path(sha).exists()
+
+
+@needs_db
+async def test_sweep_without_blob_dir_is_a_noop(tmp_path, conn):
+    assert await sweep_orphan_blobs(conn, BlobStore(tmp_path / "none"), DAY) == (0, 0)
+
+
+@needs_db
+async def test_prune_command_reports_orphans(tmp_path, conn, cfg_path, capsys):
+    bs = BlobStore(tmp_path / "data" / "blobs")
+    orphan = bs.put(b"orphan", "x")
+    _age(bs, orphan, 2 * DAY)
+    assert await run_main(["--config", cfg_path, "prune"]) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "raw_batches\t0", "orphan_blobs\t1", "temp_files\t0"
+    ]
+    assert not bs.path(orphan).exists()

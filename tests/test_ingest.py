@@ -244,8 +244,11 @@ async def test_tail_log_stops_on_event(ix, sup, bs, cfg, conn, monkeypatch):
     task = asyncio.create_task(tail_log(src, cfg, ix, sup, bs, conn, stop))
     # Two batches, then a third tree_size() that finds it caught up: the
     # tailer is now idle (or about to be), whatever the machine's speed.
-    while Counting.sizes < 3:
-        await asyncio.sleep(0.01)
+    async def caught_up():
+        while Counting.sizes < 3:
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(caught_up(), 5)  # a regression fails, not hangs
     stop.set()
     await asyncio.wait_for(task, timeout=2)
     assert src.calls == [(0, 1), (2, 3)]

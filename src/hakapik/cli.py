@@ -20,6 +20,7 @@ from hakapik.db import (
     prune_raw,
     read_stats,
     sample_candidates,
+    sweep_orphan_blobs,
 )
 from hakapik.jobs import enqueue_manual, show_fqdn
 from hakapik.names import normalize
@@ -85,8 +86,14 @@ def _cmd_sample(cfg: Config, args) -> int:
 def _cmd_prune(cfg: Config, args) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
     bs = BlobStore(cfg.data_dir / "blobs")
-    n = asyncio.run(_with_conn(cfg, lambda c: prune_raw(c, bs, cutoff), commit=False))
-    print(n)
+
+    async def prune(conn):
+        batches = await prune_raw(conn, bs, cutoff)
+        orphans, tmps = await sweep_orphan_blobs(conn, bs, cfg.orphan_margin_hours * 3600)
+        return batches, orphans, tmps
+
+    batches, orphans, tmps = asyncio.run(_with_conn(cfg, prune, commit=False))
+    print(f"raw_batches\t{batches}\norphan_blobs\t{orphans}\ntemp_files\t{tmps}")
     return 0
 
 

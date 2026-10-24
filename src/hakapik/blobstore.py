@@ -1,6 +1,7 @@
 """Content-addressed blob store on the local filesystem.
 
-Blobs live at ``root/ab/cd/<sha256 hex>`` and are immutable (mode 0o444).
+Blobs live at ``root/ab/cd/<sha256 hex>`` and are immutable (mode 0o444);
+the mtime is refreshed on every put of an existing blob.
 The store is deliberately dumb: ``media_type`` is accepted for call-site
 clarity but is not recorded here; callers record it in Postgres.
 """
@@ -47,6 +48,9 @@ class BlobStore:
             # guaranteed if someone touched the file.
             if (dest.stat().st_mode & 0o777) != 0o444:
                 os.chmod(dest, 0o444)
+            # A file's age is the time since its last put: the orphan sweep
+            # (db.sweep_orphan_blobs) leaves young files alone.
+            os.utime(dest)
             return digest
         except FileNotFoundError:
             pass  # absent, or pruned meanwhile: write it

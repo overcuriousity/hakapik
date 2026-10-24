@@ -371,3 +371,33 @@ async def test_concurrent_store_of_same_step_waits_then_is_noop(conn, tmp_path, 
     assert await _count(conn, "attempt") == 1
     assert await _count(conn, "blob", "sha256 = %s",
                         (hashlib.sha256(env_b).hexdigest(),)) == 0
+
+
+async def test_store_locks_every_blob_in_order_before_verifying(conn, tmp_path, key, monkeypatch):
+    # The orphan sweep must not unlink a listed blob between its verification
+    # and the commit; blob locks come before the job row lock, sorted.
+    import hakapik.store as store
+
+    bs, jid, cid = await _setup(conn, tmp_path, key)
+    r = _result(bs, key, jid, 0)
+    env = seal(r, key)
+    events = []
+    real_lock, real_verify = store.lock_blob, store._verify_blob
+
+    async def lock(c, sha):
+        events.append(("lock", sha))
+        await real_lock(c, sha)
+
+    def verify(bs_, sha, size):
+        events.append(("verify", sha))
+        real_verify(bs_, sha, size)
+
+    monkeypatch.setattr(store, "lock_blob", lock)
+    monkeypatch.setattr(store, "_verify_blob", verify)
+    assert await store_result(conn, bs, env, LADDER) is not None
+    locks = [sha for kind, sha in events if kind == "lock"]
+    expected = sorted({hashlib.sha256(env).hexdigest(), *(b.sha256 for b in r.blobs)})
+    assert locks == expected
+    first_verify = next(i for i, e in enumerate(events) if e[0] == "verify")
+    assert all(e[0] == "lock" for e in events[:first_verify])
+    assert len(locks) == first_verify

@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import logging
 
 import pytest
@@ -208,3 +209,14 @@ def _fast(monkeypatch):
     # once=True never sleeps, but keep any stray wait short.
     monkeypatch.setattr(fetchloop, "IDLE_SLEEP_S", 0.01, raising=False)
     monkeypatch.setattr(fetchloop, "CAP_SLEEP_S", 0.01, raising=False)
+
+
+async def test_loaded_asn_snapshot_has_its_blob_row(conn, tmp_path):
+    from test_asn import _mmdb
+
+    path = _mmdb(tmp_path)
+    cfg = _cfg(tmp_path, asn_mmdb=path)
+    await _once(cfg)  # nothing queued: no attempt, so no ASN hit
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert await _count(conn, "attempt") == 0
+    assert await _count(conn, "blob", f"sha256 = '{sha}'") == 1

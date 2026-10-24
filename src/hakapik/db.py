@@ -5,8 +5,10 @@ No function here commits; the caller owns the transaction.
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
+from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
@@ -449,3 +451,80 @@ async def prune_raw(
         finally:
             await conn.rollback()  # ends the read and releases the lock
     return count
+
+
+async def sweep_orphan_blobs(
+    conn: psycopg.AsyncConnection, bs: BlobStore, margin_s: float
+) -> tuple[int, int]:
+    """Unlink unreferenced blob files older than ``margin_s``; (blobs, temp files).
+
+    Orphans come from batches and results that wrote a blob but never
+    committed the row referencing it. A blob counts as referenced by a
+    raw_batch row or a blob row. The age is the time since the last put
+    (``BlobStore.put`` refreshes the mtime), so a writer still working on a
+    blob keeps it young; a worker's blobs wait at most a lease for their
+    result, and the margin is longer (config). Each candidate is re-checked
+    and unlinked under ``lock_blob``, which ingest and ``store_result`` hold
+    from before they rely on an existing blob until they commit. Leftover
+    ``.tmp-*`` files of interrupted puts older than the margin go too.
+
+    Commits nothing; each blob's check runs in its own short transaction.
+    """
+    blobs = tmps = 0
+    try:
+        top = sorted(os.scandir(bs.root), key=lambda e: e.name)
+    except FileNotFoundError:
+        return 0, 0
+    files = [
+        Path(f.path)
+        for d1 in top if d1.is_dir(follow_symlinks=False)
+        for d2 in os.scandir(d1.path) if d2.is_dir(follow_symlinks=False)
+        for f in os.scandir(d2.path) if f.is_file(follow_symlinks=False)
+    ]
+
+    def old(path: Path) -> bool:
+        try:
+            return time.time() - path.stat().st_mtime > margin_s
+        except FileNotFoundError:
+            return False
+
+    for path in files:
+        if not old(path):
+            continue
+        if path.name.startswith(".tmp-"):
+            try:
+                path.unlink()
+                tmps += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink temp file %s: %r", path, e)
+            continue
+        sha = path.name
+        try:
+            if bs.path(sha) != path:
+                continue  # a digest in the wrong directory: not ours to judge
+        except ValueError:
+            continue  # not a blob name
+        try:
+            await lock_blob(conn, sha)
+            if not old(path):
+                continue  # put again meanwhile
+            cur = await conn.execute(
+                """SELECT EXISTS (SELECT 1 FROM raw_batch WHERE blob_sha256 = %s)
+                       OR EXISTS (SELECT 1 FROM blob WHERE sha256 = %s)""",
+                (sha, sha),
+            )
+            if (await cur.fetchone())[0]:
+                continue
+            try:
+                os.chmod(path, 0o644)
+                path.unlink()
+                blobs += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink orphan blob %s: %r; left in place", sha, e)
+        finally:
+            await conn.rollback()  # ends the read and releases the lock
+    return blobs, tmps

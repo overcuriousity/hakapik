@@ -34,7 +34,7 @@ curl -sSL https://tranco-list.eu/top-1m.csv.zip | funzip > "$DATA_DIR/tranco.csv
 uv run hakapik --config hakapik.toml tail     # follow all logs live
 uv run hakapik --config hakapik.toml stats    # per-log, per-day volumes
 uv run hakapik --config hakapik.toml sample --n 200 --out candidates.csv
-uv run hakapik --config hakapik.toml prune    # apply raw-entry retention
+uv run hakapik --config hakapik.toml prune    # raw-entry retention, then unreferenced blobs
 
 uv run playwright install chromium --no-shell # once, for fetch
 uv run hakapik --config hakapik.toml enqueue example.com   # or --file names.txt

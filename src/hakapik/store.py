@@ -16,6 +16,7 @@ from psycopg.rows import dict_row
 
 from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
+from hakapik.db import lock_blob
 from hakapik.jobs import advance_job
 from hakapik.protocol import BadEnvelope, canonical_json, open_envelope
 from hakapik.resolve import addresses
@@ -97,9 +98,22 @@ async def store_result(
     except BadEnvelope as e:
         raise ResultRejected(str(e)) from e
 
+    # Blob locks first (db.lock_blob, sorted by digest): the orphan sweep
+    # cannot unlink a listed blob between its verification below and the
+    # commit of the rows referencing it. Every writer takes its blob locks
+    # before any row lock (ingest takes one, before its inserts), so blob and
+    # row locks cannot form a cycle. (Two digests sharing a 64-bit lock key
+    # could still order differently; Postgres then reports a deadlock and the
+    # job is retried after its lease, nothing hangs.) The manifest blob of
+    # write_manifest needs no lock: its bytes name a new version, so its file
+    # is new and young.
+    env_sha = hashlib.sha256(envelope).hexdigest()
+    for sha in sorted({env_sha, *(b.sha256 for b in r.blobs)}):
+        await lock_blob(conn, sha)
+
     # FOR UPDATE: a concurrent store of the same (job_id, step) waits here,
     # then sees the advanced step and returns None before writing anything.
-    # Lock order is job, then candidate (write_manifest).
+    # Lock order is blobs, job, then candidate (write_manifest).
     cur = await conn.execute(
         "SELECT candidate_id, fqdn FROM fetch_job WHERE id = %s AND step = %s AND state = 'open' "
         "FOR UPDATE",
@@ -115,7 +129,7 @@ async def store_result(
     for b in r.blobs:
         _verify_blob(bs, b.sha256, b.size)
 
-    env_sha = bs.put(envelope, "application/json")
+    bs.put(envelope, "application/json")
     blob_rows = [(env_sha, len(envelope), "application/json")]
     blob_rows += [(b.sha256, b.size, b.media_type) for b in r.blobs]
     async with conn.cursor() as c:

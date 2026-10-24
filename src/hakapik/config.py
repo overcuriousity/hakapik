@@ -16,6 +16,7 @@ class Config:
     data_dir: Path
     database_url: str
     raw_retention_days: int = 7
+    orphan_margin_hours: float = 24.0
     tranco_top_n: int = 100_000
     public_apexes: tuple[str, ...] = ()
     log_lists: tuple[str, ...] = DEFAULT_LOG_LISTS
@@ -44,6 +45,7 @@ _INT_MIN = {
 }
 _FLOAT_MIN = {
     "fetch_per_ip_interval_s": 0.0, "ageout_hours": 0.0, "nav_timeout_s": 0.0,
+    "orphan_margin_hours": 1.0,
 }
 _STR_KEYS = ("database_url", "fetch_proxy", "egress_address")
 _STR_TUPLE_KEYS = ("public_apexes", "log_lists", "resolver_nameservers")
@@ -103,4 +105,8 @@ def load_config(path: Path) -> Config:
     # shorter lease lets a running job be claimed again mid-run.
     if cfg.lease_s < 4 * cfg.nav_timeout_s + 60:
         raise ValueError("lease_s must be at least 4 * nav_timeout_s + 60")
+    # A worker's blobs are unreferenced until its result is stored, at most
+    # a lease later; the orphan sweep must not take them before that.
+    if cfg.orphan_margin_hours * 3600 <= cfg.lease_s:
+        raise ValueError("orphan_margin_hours must be longer than lease_s")
     return cfg
