@@ -37,3 +37,17 @@ def test_replacing_file_after_load_does_not_change_snapshot(tmp_path):
     db = AsnDb.load(path, BlobStore(tmp_path / "blobs"))
     _mmdb(tmp_path, asn=64501)
     assert db.lookup("1.2.3.4").asn == 64500
+
+
+def test_reader_errors_surface(tmp_path):
+    import pytest
+
+    db = AsnDb.load(_mmdb(tmp_path), BlobStore(tmp_path / "blobs"))
+
+    class Broken:
+        def get(self, ip):
+            raise RuntimeError("corrupt database")
+
+    db._reader = Broken()
+    with pytest.raises(RuntimeError):
+        db.lookup("1.2.3.4")

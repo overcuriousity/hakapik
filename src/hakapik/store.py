@@ -122,11 +122,12 @@ async def store_result(
         )
 
     mobile = next((p for p in r.pages if p.profile == "mobile"), None)
-    hit = None
+    hit = snapshot = None
     if asn_db is not None:
         ip = (mobile.server_ip if mobile else None) or next(iter(addresses(r.dns, fqdn)), None)
-        hit = asn_db.lookup(ip) if ip else None
-        if hit is not None:
+        if ip:
+            hit = asn_db.lookup(ip)
+            snapshot = asn_db.sha256
             await conn.execute(
                 "INSERT INTO blob (sha256, size, media_type) VALUES (%s, %s, %s) "
                 "ON CONFLICT DO NOTHING",
@@ -141,7 +142,7 @@ async def store_result(
         (r.job_id, r.step, r.node_id, r.egress_address, started, finished, r.outcome,
          mobile.http_status if mobile else None,
          mobile.final_url if mobile else None, r.error, env_sha,
-         hit and hit.asn, hit and hit.org, hit and asn_db.sha256),
+         hit and hit.asn, hit and hit.org, snapshot),
     )
     row = await cur.fetchone()
     if row is None:

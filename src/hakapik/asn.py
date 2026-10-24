@@ -5,6 +5,7 @@ opened from those same bytes, so the recorded sha256 is the snapshot that
 produced every ASN even if the operator replaces the file meanwhile.
 """
 
+import ipaddress
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,11 +42,13 @@ class AsnDb:
         return cls(reader, sha, len(data), epoch)
 
     def lookup(self, ip: str) -> AsnHit | None:
+        """None for malformed or unknown addresses; a broken database raises."""
         try:
-            rec = self._reader.get(ip)
-            if not rec or not isinstance(rec.get("autonomous_system_number"), int):
-                return None
-            org = rec.get("autonomous_system_organization")
-            return AsnHit(rec["autonomous_system_number"], org if isinstance(org, str) else None)
-        except Exception:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
             return None
+        rec = self._reader.get(addr)
+        if not rec or not isinstance(rec.get("autonomous_system_number"), int):
+            return None
+        org = rec.get("autonomous_system_organization")
+        return AsnHit(rec["autonomous_system_number"], org if isinstance(org, str) else None)

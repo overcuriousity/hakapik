@@ -306,3 +306,33 @@ async def test_store_without_asn_db_leaves_nulls(conn, tmp_path, key):
     cur = await conn.execute(
         "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
     assert await cur.fetchone() == (None, None, None)
+
+
+async def test_store_miss_records_snapshot_hash(conn, tmp_path, key):
+    import dataclasses
+
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    db = _asn_db(tmp_path, bs)
+    r = _result(bs, key, jid, 0)
+    r = dataclasses.replace(r, pages=tuple(
+        dataclasses.replace(p, server_ip="8.8.8.8") for p in r.pages))
+    aid = await store_result(conn, bs, seal(r, key), LADDER, asn_db=db)
+    cur = await conn.execute(
+        "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
+    assert await cur.fetchone() == (None, None, db.sha256)
+    assert await _count(conn, "blob", "sha256 = %s", (db.sha256,)) == 1
+
+
+async def test_store_no_address_leaves_nulls_even_with_db(conn, tmp_path, key):
+    import dataclasses
+
+    bs, jid, _ = await _setup(conn, tmp_path, key)
+    db = _asn_db(tmp_path, bs)
+    r = _result(bs, key, jid, 0)
+    r = dataclasses.replace(
+        r, dns=(), pages=tuple(dataclasses.replace(p, server_ip=None) for p in r.pages))
+    aid = await store_result(conn, bs, seal(r, key), LADDER, asn_db=db)
+    cur = await conn.execute(
+        "SELECT asn, asn_org, asn_db_sha256 FROM attempt WHERE id = %s", (aid,))
+    assert await cur.fetchone() == (None, None, None)
+    assert await _count(conn, "blob", "sha256 = %s", (db.sha256,)) == 0
