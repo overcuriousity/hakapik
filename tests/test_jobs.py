@@ -1,6 +1,9 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
-from hakapik.db import CandidateRow, add_candidates
+from conftest import _test_db_url
+
+from hakapik.db import CandidateRow, add_candidates, connect
 from hakapik.jobs import (
     advance_job,
     attempts_today,
@@ -149,21 +152,50 @@ async def test_advance_is_noop_on_closed_jobs(conn):
     assert (await _job(conn, done))[:2] == (0, "done")
 
 
-async def test_manual_lost_race_leaves_no_orphan(conn, monkeypatch):
-    # Simulate by making the pre-check blind: open job exists but SELECT says no.
-    await _add(conn, "race.example.com")
-    orig = conn.execute
-
-    async def blind(sql, *a, **k):
-        if sql.startswith("SELECT 1 FROM fetch_job"):
-            return await orig("SELECT 1 WHERE false")
-        return await orig(sql, *a, **k)
-
-    monkeypatch.setattr(conn, "execute", blind, raising=False)
-    assert await enqueue_manual(conn, ["race.example.com"]) == [("race.example.com", "already_open")]
-    monkeypatch.undo()
+async def test_manual_lost_race_leaves_no_orphan(conn):
+    # A real concurrent transaction: ``conn`` holds an uncommitted open job, so
+    # the other enqueue's pre-check sees nothing and its insert waits on the
+    # unique open-job index, then loses when ``conn`` commits.
+    await conn.commit()
+    assert await enqueue_manual(conn, ["race.example.com"]) == [("race.example.com", "queued")]
+    other = await connect(_test_db_url())
+    try:
+        task = asyncio.create_task(enqueue_manual(other, ["race.example.com"]))
+        for _ in range(200):
+            cur = await conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND datname = current_database()")
+            if (await cur.fetchone())[0]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the second enqueue never waited on the first")
+        assert not task.done()
+        await conn.commit()
+        assert await asyncio.wait_for(task, 10) == [("race.example.com", "already_open")]
+        await other.commit()
+    finally:
+        await other.close()
     assert await _count(conn, "candidate") == 1
     assert await _count(conn, "fetch_job") == 1
+
+
+async def test_claim_orders_by_priority_then_newest(conn):
+    # Inserted in the reverse of the claim order, so neither the physical row
+    # order nor RETURNING's order happens to match: the re-sort in claim_jobs
+    # is what orders the list.
+    ids = {}
+    for fqdn, prio, age in [("lo-old.example.com", 0, 30), ("lo-new.example.com", 0, 10),
+                            ("hi-old.example.com", 5, 40), ("hi-new.example.com", 5, 20)]:
+        ids[fqdn] = await _add(conn, fqdn, age)
+        await conn.execute("UPDATE fetch_job SET priority = %s WHERE id = %s",
+                           (prio, ids[fqdn]))
+    jobs = await claim_jobs(conn, 4, 60)
+    assert [j.fqdn for j in jobs] == ["hi-new.example.com", "hi-old.example.com",
+                                      "lo-new.example.com", "lo-old.example.com"]
+    # The limit takes the highest priority first, not the newest.
+    await conn.execute("UPDATE fetch_job SET claimed_until = NULL")
+    assert [j.fqdn for j in await claim_jobs(conn, 1, 60)] == ["hi-new.example.com"]
 
 
 async def test_sweep_takes_fractional_ageout_hours(conn):
