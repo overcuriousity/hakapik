@@ -45,8 +45,20 @@ class AsnDb:
         log.info("ASN database %s loaded: sha256 %s, build epoch %d", path, sha, epoch)
         return cls(reader, sha, len(data), epoch)
 
+    def close(self) -> None:
+        """Close the reader; idempotent. A later lookup raises RuntimeError.
+
+        maxminddb's MODE_MEMORY reader keeps answering after its close(), so
+        the reader is dropped here to make use after close an error.
+        """
+        if self._reader is not None:
+            self._reader.close()
+            self._reader = None
+
     def lookup(self, ip: str) -> AsnHit | None:
         """None for malformed or unknown addresses; a broken database raises."""
+        if self._reader is None:
+            raise RuntimeError("ASN database closed")
         try:
             addr = ipaddress.ip_address(ip)
         except ValueError:

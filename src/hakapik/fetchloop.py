@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import maxminddb
@@ -27,7 +28,7 @@ from hakapik.jobs import attempts_today, claim_jobs, sweep
 from hakapik.protocol import Job, NodeKey, open_envelope
 from hakapik.resolve import Resolver
 from hakapik.store import ResultRejected, register_node, store_result
-from hakapik.worker import IpSpacer, run_job
+from hakapik.worker import BrowserLike, IpSpacer, ResolverLike, run_job
 
 log = logging.getLogger(__name__)
 
@@ -66,12 +67,13 @@ async def _sleep_or_stop(stop: asyncio.Event, seconds: float) -> None:
         await asyncio.wait_for(stop.wait(), seconds)
 
 
-async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=None,
-                    once: bool = False) -> None:
+async def run_fetch(cfg: Config, *, stop: asyncio.Event,
+                    resolver: ResolverLike | None = None,
+                    browser: BrowserLike | None = None, once: bool = False) -> None:
     """Fetch due jobs until ``stop`` is set (or one iteration with ``once``).
 
     An injected ``browser`` is used as is; the default ``Browser`` is opened
-    and closed here.
+    and closed here, as is the ASN database.
     """
     bs = BlobStore(cfg.data_dir / "blobs")
     key = NodeKey.load_or_create(cfg.data_dir / "node.key")
@@ -83,10 +85,10 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=
         asn_db = await _load_asn(cfg, bs, conn)
     finally:
         await conn.close()
-    if resolver is None:
-        resolver = Resolver(cfg.resolver_nameservers)
     pool = ConnPool(cfg.database_url, min(cfg.max_db_connections, cfg.fetch_workers + 2))
     try:
+        if resolver is None:
+            resolver = Resolver(cfg.resolver_nameservers)
         async with contextlib.AsyncExitStack() as stack:
             if browser is None:
                 browser = await stack.enter_async_context(
@@ -100,6 +102,9 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=
                     env = await run_job(job, resolver=resolver, browser=browser, bs=bs,
                                         key=key, egress_address=cfg.egress_address,
                                         spacer=spacer)
+                    # Read before storing: after the commit only the log line
+                    # runs, so a job logged as failed below was never stored.
+                    outcome = open_envelope(env, {key.node_id: key.public_key}.get).outcome
                     async with pool.borrow() as c:
                         try:
                             attempt_id = await store_result(
@@ -110,7 +115,6 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=
                             log.error("job %d %s: result rejected: %s",
                                       job.job_id, job.fqdn, e)
                             return
-                    outcome = open_envelope(env, {key.node_id: key.public_key}.get).outcome
                     log.info("finished job %d %s outcome %s attempt %s", job.job_id,
                              job.fqdn, outcome,
                              "duplicate" if attempt_id is None else attempt_id)
@@ -120,21 +124,28 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event, resolver=None, browser=
             await _loop(cfg, stop, once, pool, one)
     finally:
         await pool.close()
+        if asn_db is not None:
+            asn_db.close()
 
 
 async def _loop(cfg: Config, stop: asyncio.Event, once: bool, pool: ConnPool,
-                one) -> None:
+                one: Callable[[Job], Awaitable[None]]) -> None:
     running: set[asyncio.Task] = set()
     try:
         while not stop.is_set():
             jobs: list[Job] = []
             capped = False
+            # The sweep has its own try: a failing sweep must not stop claims.
             try:
                 async with pool.borrow() as conn:
                     aged = await sweep(conn, cfg.ageout_hours, cfg.queue_cap)
                     await conn.commit()
-                    if aged:
-                        log.info("aged out %d jobs", aged)
+                if aged:
+                    log.info("aged out %d jobs", aged)
+            except Exception:
+                log.exception("fetch queue sweep failed")
+            try:
+                async with pool.borrow() as conn:
                     free = cfg.fetch_workers - len(running)
                     if cfg.fetch_daily_cap is not None:
                         # Tasks in flight have not stored their attempt yet.

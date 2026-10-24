@@ -7,6 +7,7 @@ from conftest import _test_db_url
 from test_worker import T, FakeBrowser
 
 from hakapik import fetchloop
+from hakapik.asn import AsnDb
 from hakapik.config import Config
 from hakapik.fetchloop import run_fetch
 from hakapik.jobs import enqueue_manual
@@ -211,12 +212,79 @@ def _fast(monkeypatch):
     monkeypatch.setattr(fetchloop, "CAP_SLEEP_S", 0.01, raising=False)
 
 
-async def test_loaded_asn_snapshot_has_its_blob_row(conn, tmp_path):
-    from test_asn import _mmdb
-
-    path = _mmdb(tmp_path)
+async def test_loaded_asn_snapshot_has_its_blob_row(conn, tmp_path, asn_mmdb):
+    path = asn_mmdb()
     cfg = _cfg(tmp_path, asn_mmdb=path)
     await _once(cfg)  # nothing queued: no attempt, so no ASN hit
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
     assert await _count(conn, "attempt") == 0
     assert await _count(conn, "blob", f"sha256 = '{sha}'") == 1
+
+
+async def test_sweep_failure_does_not_block_claims(conn, tmp_path, monkeypatch, caplog):
+    async def broken_sweep(*a, **k):
+        raise RuntimeError("sweep broke")
+
+    monkeypatch.setattr(fetchloop, "sweep", broken_sweep)
+    cfg = _cfg(tmp_path)
+    await _queue(conn, "a.example.com")
+    await _once(cfg)
+    assert await _count(conn, "attempt") == 1
+    assert any("sweep" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+async def test_unreadable_result_is_not_stored_and_logged_failed(conn, tmp_path, monkeypatch,
+                                                                 caplog):
+    # The outcome is read before storing, so "failed" is never logged for a
+    # job whose attempt was stored.
+    def unreadable(*a, **k):
+        raise ValueError("cannot open")
+
+    monkeypatch.setattr(fetchloop, "open_envelope", unreadable)
+    cfg = _cfg(tmp_path)
+    await _queue(conn, "a.example.com")
+    await _once(cfg)
+    assert any("failed" in r.getMessage() and r.exc_info for r in caplog.records)
+    assert await _count(conn, "attempt") == 0
+    assert "finished job" not in caplog.text
+
+
+async def test_default_resolver_and_browser_are_built_from_config_and_closed(
+        conn, tmp_path, monkeypatch):
+    made = {}
+
+    class StubResolver(FakeResolver):
+        def __init__(self, nameservers):
+            made["nameservers"] = nameservers
+
+    class StubBrowser(FakeBrowser):
+        def __init__(self, *, proxy, nav_timeout_s):
+            super().__init__()
+            made["browser"] = (proxy, nav_timeout_s)
+            made["events"] = []
+
+        async def __aenter__(self):
+            made["events"].append("enter")
+            return self
+
+        async def __aexit__(self, *exc):
+            made["events"].append("exit")
+
+    monkeypatch.setattr(fetchloop, "Resolver", StubResolver)
+    monkeypatch.setattr(fetchloop, "Browser", StubBrowser)
+    cfg = _cfg(tmp_path, resolver_nameservers=("192.0.2.53",),
+               fetch_proxy="socks5://127.0.0.1:9", nav_timeout_s=7)
+    await _queue(conn, "a.example.com")
+    await run_fetch(cfg, stop=asyncio.Event(), once=True)
+    assert made["nameservers"] == ("192.0.2.53",)
+    assert made["browser"] == ("socks5://127.0.0.1:9", 7)
+    assert made["events"] == ["enter", "exit"]
+    assert await _count(conn, "attempt", "outcome = 'live'") == 1
+
+
+async def test_asn_db_is_closed_when_fetch_ends(conn, tmp_path, asn_mmdb, monkeypatch):
+    closed = []
+    real_close = AsnDb.close
+    monkeypatch.setattr(AsnDb, "close", lambda self: (closed.append(self), real_close(self))[1])
+    await _once(_cfg(tmp_path, asn_mmdb=asn_mmdb()))
+    assert len(closed) == 1
