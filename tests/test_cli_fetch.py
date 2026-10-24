@@ -112,3 +112,71 @@ def test_fetch_second_signal_exits_130_without_traceback(tmp_path, monkeypatch, 
     err = capsys.readouterr().err
     assert err.strip() == "hakapik: interrupted"
     assert "Traceback" not in err
+
+
+async def _history(conn):
+    """Two candidates for a.example.com: one with two attempts and two manifests."""
+    from hakapik.db import CandidateRow, add_candidates
+
+    await add_candidates(conn, [CandidateRow("a.example.com", "example.com", "L", 1, b"k", 1)])
+    cur = await conn.execute("UPDATE fetch_job SET state = 'done', step = 1 RETURNING id, candidate_id")
+    jid, cid = await cur.fetchone()
+    await conn.execute("INSERT INTO node (node_id, public_key) VALUES ('n', 'k')")
+    for sha in ("env0", "env1", "m1", "m2"):
+        await conn.execute(
+            "INSERT INTO blob (sha256, size, media_type) VALUES (%s, 1, 'x')", (sha,)
+        )
+    await conn.execute(
+        """INSERT INTO attempt (job_id, step, node_id, started_at, finished_at, outcome,
+                                http_status, final_url, envelope_sha256, asn, asn_org)
+           VALUES (%s, 0, 'n', now(), now(), 'live', 200, 'https://a.example.com/',
+                   'env0', 64500, 'Example AS'),
+                  (%s, 1, 'n', now(), now(), 'nxdomain', NULL, NULL, 'env1', NULL, NULL)""",
+        (jid, jid),
+    )
+    await conn.execute(
+        """INSERT INTO manifest (candidate_id, version, sha256, prev_sha256)
+           VALUES (%s, 1, 'm1', NULL), (%s, 2, 'm2', 'm1')""",
+        (cid, cid),
+    )
+    await enqueue_manual(conn, ["a.example.com"])
+    await conn.commit()
+
+
+async def test_show_lists_attempts_and_latest_manifest(cfg_file, conn, capsys):
+    await _history(conn)
+    rc = await run_main(["--config", str(cfg_file), "show", "A.Example.com"])
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "a.example.com"
+    assert lines[1].startswith("candidate ") and "reason first_seen" in lines[1]
+    assert "state done  step 1" in lines[2]
+    assert "attempt 0" in lines[3] and "live  http 200  https://a.example.com/" in lines[3]
+    assert lines[3].endswith("asn 64500  Example AS")
+    assert "attempt 1" in lines[4] and "nxdomain  http -  -  asn -  -" in lines[4]
+    assert lines[5] == "  manifest v2  m2"
+    assert "reason manual" in lines[6] and "state open  step 0" in lines[7]
+    assert lines[8] == "  manifest -"
+    assert len(lines) == 9
+
+
+async def test_show_fqdn_query_count_does_not_grow_with_history(conn):
+    from hakapik.jobs import show_fqdn
+
+    await _history(conn)
+    calls = 0
+    real = conn.execute
+
+    async def counting(*a, **kw):
+        nonlocal calls
+        calls += 1
+        return await real(*a, **kw)
+
+    conn.execute = counting
+    try:
+        out = await show_fqdn(conn, "a.example.com")
+    finally:
+        del conn.execute
+    assert [len(c["jobs"]) for c in out] == [1, 1]
+    assert [len(j["attempts"]) for c in out for j in c["jobs"]] == [2, 0]
+    assert calls <= 4  # candidates, jobs, attempts, manifests

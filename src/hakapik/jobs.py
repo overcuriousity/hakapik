@@ -164,40 +164,49 @@ async def enqueue_manual(
 
 
 async def show_fqdn(conn: psycopg.AsyncConnection, fqdn: str) -> list[dict]:
-    """Read-only history of an FQDN: candidates with jobs, attempts, latest manifest."""
+    """Read-only history of an FQDN: candidates with jobs, attempts, latest manifest.
+
+    Four queries whatever the history's length (one per table).
+    """
     cur = await conn.execute(
         "SELECT id, reason, created_at FROM candidate WHERE fqdn = %s ORDER BY id",
         (fqdn,),
     )
-    out = []
-    for cid, reason, created_at in await cur.fetchall():
-        cur = await conn.execute(
-            """SELECT id, state, step, due_at FROM fetch_job
-               WHERE candidate_id = %s ORDER BY id""",
-            (cid,),
+    cands = await cur.fetchall()
+    cids = [c[0] for c in cands]
+    cur = await conn.execute(
+        """SELECT id, candidate_id, state, step, due_at FROM fetch_job
+           WHERE candidate_id = ANY(%s) ORDER BY id""",
+        (cids,),
+    )
+    jobs = await cur.fetchall()
+    cur = await conn.execute(
+        """SELECT job_id, step, started_at, outcome, http_status, final_url,
+                  asn, asn_org
+           FROM attempt WHERE job_id = ANY(%s) ORDER BY job_id, step""",
+        ([j[0] for j in jobs],),
+    )
+    attempts: dict[int, list[dict]] = {}
+    for jid, *rest in await cur.fetchall():
+        attempts.setdefault(jid, []).append(
+            dict(zip(("step", "started_at", "outcome", "http_status",
+                      "final_url", "asn", "asn_org"), rest))
         )
-        jobs = []
-        for jid, state, step, due_at in await cur.fetchall():
-            cur = await conn.execute(
-                """SELECT step, started_at, outcome, http_status, final_url,
-                          asn, asn_org
-                   FROM attempt WHERE job_id = %s ORDER BY step""",
-                (jid,),
-            )
-            attempts = [
-                dict(zip(("step", "started_at", "outcome", "http_status",
-                          "final_url", "asn", "asn_org"), r))
-                for r in await cur.fetchall()
-            ]
-            jobs.append({"state": state, "step": step, "due_at": due_at,
-                         "attempts": attempts})
-        cur = await conn.execute(
-            """SELECT version, sha256 FROM manifest
-               WHERE candidate_id = %s ORDER BY version DESC LIMIT 1""",
-            (cid,),
+    cur = await conn.execute(
+        """SELECT DISTINCT ON (candidate_id) candidate_id, version, sha256
+           FROM manifest WHERE candidate_id = ANY(%s)
+           ORDER BY candidate_id, version DESC""",
+        (cids,),
+    )
+    manifests = {r[0]: {"version": r[1], "sha256": r[2]} for r in await cur.fetchall()}
+    by_cand: dict[int, list[dict]] = {}
+    for jid, cid, state, step, due_at in jobs:
+        by_cand.setdefault(cid, []).append(
+            {"state": state, "step": step, "due_at": due_at,
+             "attempts": attempts.get(jid, [])}
         )
-        m = await cur.fetchone()
-        out.append({"id": cid, "reason": reason, "created_at": created_at,
-                    "jobs": jobs,
-                    "manifest": {"version": m[0], "sha256": m[1]} if m else None})
-    return out
+    return [
+        {"id": cid, "reason": reason, "created_at": created_at,
+         "jobs": by_cand.get(cid, []), "manifest": manifests.get(cid)}
+        for cid, reason, created_at in cands
+    ]
