@@ -476,3 +476,44 @@ async def test_heartbeat_skips_a_locked_row_instead_of_waiting(conn, tmp_path,
     b.gate.set()
     await asyncio.wait_for(task, 10)
     assert await _count(conn, "attempt") == 1
+
+
+async def test_timeout_raised_inside_run_job_is_a_plain_failure(conn, tmp_path, monkeypatch,
+                                                                caplog):
+    async def inner_timeout(job, **kw):
+        raise TimeoutError("from inside")
+
+    monkeypatch.setattr(fetchloop, "run_job", inner_timeout)
+    await _queue(conn, "a.example.com")
+    await _once(_cfg(tmp_path, job_timeout_s=60))
+    assert "timed out" not in caplog.text
+    failed = [r for r in caplog.records if "failed" in r.getMessage() and r.exc_info]
+    assert failed and failed[0].levelno == logging.ERROR
+    assert "from inside" in caplog.text
+
+
+async def test_tick_between_commit_and_resume_does_not_warn(conn, tmp_path, monkeypatch,
+                                                            caplog):
+    # A heartbeat tick runs after the store's commit but before the job task
+    # resumes: it finds the job advanced and must stay silent.
+    calls = _count_extends(monkeypatch)
+    real_store = fetchloop.store_result
+
+    async def store_then_slow_commit(c, *a, **k):
+        attempt_id = await real_store(c, *a, **k)
+        real_commit = c.commit
+
+        async def commit():
+            await real_commit()
+            n = len(calls)
+            await _until(lambda: len(calls) > n)  # a tick after the commit
+            del c.commit
+
+        c.commit = commit
+        return attempt_id
+
+    monkeypatch.setattr(fetchloop, "store_result", store_then_slow_commit)
+    await _queue(conn, "a.example.com")
+    await asyncio.wait_for(_once(_cfg(tmp_path, lease_s=1)), 10)
+    assert await _count(conn, "attempt") == 1
+    assert "lease lost" not in caplog.text

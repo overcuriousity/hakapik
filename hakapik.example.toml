@@ -85,8 +85,10 @@ nav_timeout_s = 30.0
 lease_s = 600
 
 # Seconds one job may run (resolve, captures, blob writes) before it is given
-# up: nothing is stored and the job is retried after its lease expires. Must
-# be at least the same floor as lease_s.
+# up: nothing is stored and the job is retried after its lease expires. The
+# capture in progress then still drains and closes, so a run can last up to
+# job_timeout_s + nav_timeout_s + 3 s. Must be at least the same floor as
+# lease_s.
 job_timeout_s = 900.0
 
 # Path to a GeoLite2-ASN .mmdb you supply, for ASN enrichment. Omitted = no enrichment.

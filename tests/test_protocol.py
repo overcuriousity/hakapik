@@ -1,8 +1,8 @@
 import base64
 import errno
+import fcntl
 import json
 import os
-import subprocess
 import threading
 
 import pytest
@@ -199,14 +199,6 @@ def test_no_link_rename_does_not_replace_a_key_that_appeared(tmp_path, monkeypat
     assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
 
 
-def test_no_link_lock_without_a_pid_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
-    (tmp_path / "node.key.lock").touch()
-    with pytest.raises(RuntimeError, match="node.key.lock"):
-        NodeKey.load_or_create(tmp_path / "node.key")
-
-
 @pytest.mark.parametrize("code", [errno.ENOSYS, errno.EMLINK, errno.ENOTSUP])
 def test_every_missing_link_errno_takes_the_fallback(tmp_path, monkeypatch, code):
     def no_link(a, b):
@@ -219,12 +211,12 @@ def test_every_missing_link_errno_takes_the_fallback(tmp_path, monkeypatch, code
         "node.key"]
 
 
-def test_no_link_lock_of_a_dead_process_is_removed(tmp_path, monkeypatch, caplog):
+def test_no_link_lock_without_a_holder_is_taken_over(tmp_path, monkeypatch, caplog):
+    # A lock file nobody holds an flock on: its creator died (the kernel drops
+    # the flock with the process). The waiter removes it and creates the key.
     monkeypatch.setattr(protocol.os, "link", _no_link)
     monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
-    gone = subprocess.Popen(["true"])
-    gone.wait()
-    (tmp_path / "node.key.lock").write_text(str(gone.pid))
+    (tmp_path / "node.key.lock").touch()
     p = tmp_path / "node.key"
     with caplog.at_level("WARNING", logger="hakapik.protocol"):
         NodeKey.load_or_create(p)
@@ -233,68 +225,65 @@ def test_no_link_lock_of_a_dead_process_is_removed(tmp_path, monkeypatch, caplog
     assert any("node.key.lock" in r.getMessage() for r in caplog.records)
 
 
-def test_no_link_lock_of_a_live_process_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
-    (tmp_path / "node.key.lock").write_text(str(os.getpid()))
-    with pytest.raises(RuntimeError, match="node.key.lock"):
-        NodeKey.load_or_create(tmp_path / "node.key")
-    assert (tmp_path / "node.key.lock").exists()
-
-
-def test_no_link_lock_recreated_meanwhile_is_kept(tmp_path, monkeypatch):
-    # The lock looked dead, but another process replaced it before the unlink:
-    # the re-read sees a new identity and the lock stays.
+def test_no_link_lock_with_a_live_holder_is_reported(tmp_path, monkeypatch):
     monkeypatch.setattr(protocol.os, "link", _no_link)
     monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
     lock = tmp_path / "node.key.lock"
-    gone = subprocess.Popen(["true"])
-    gone.wait()
-    lock.write_text(str(gone.pid))
-    real = protocol._dead_lock_owner
-
-    def then_recreated(path):
-        owner = real(path)
-        path.unlink()
-        path.write_text(str(os.getpid()))
-        return owner
-
-    monkeypatch.setattr(protocol, "_dead_lock_owner", then_recreated)
-    with pytest.raises(RuntimeError, match="node.key.lock"):
-        NodeKey.load_or_create(tmp_path / "node.key")
-    assert lock.read_text() == str(os.getpid())
+    holder = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)  # an fd of its own: a live creator
+    try:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="node.key.lock"):
+            NodeKey.load_or_create(tmp_path / "node.key")
+        assert lock.exists() and not (tmp_path / "node.key").exists()
+    finally:
+        os.close(holder)
 
 
-def test_no_link_lock_fd_closed_when_fdopen_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    real_fdopen = os.fdopen
-
-    def fdopen(fd, mode="r", *a, **k):
-        if mode == "w":
-            raise OSError("fdopen failed")
-        return real_fdopen(fd, mode, *a, **k)
-
-    before = set(os.listdir("/proc/self/fd"))
-    monkeypatch.setattr(protocol.os, "fdopen", fdopen)
-    with pytest.raises(OSError, match="fdopen failed"):
-        NodeKey.load_or_create(tmp_path / "node.key")
-    monkeypatch.undo()
-    assert set(os.listdir("/proc/self/fd")) <= before
-    assert list(tmp_path.iterdir()) == []
-
-
-def test_no_link_lock_holds_its_creators_pid(tmp_path, monkeypatch):
+def test_no_link_creator_removes_the_lock_under_its_flock(tmp_path, monkeypatch):
+    lock = tmp_path / "node.key.lock"
     seen = []
-    real_rename = os.rename
+    real_rename, real_unlink = os.rename, os.unlink
+
+    def probe(what):
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.append((what, "free"))
+        except BlockingIOError:
+            seen.append((what, "held"))
+        finally:
+            os.close(fd)
 
     def rename(a, b):
-        seen.append((tmp_path / "node.key.lock").read_text())
+        probe("rename")
         real_rename(a, b)
+
+    def unlink(p):
+        if os.fspath(p) == os.fspath(lock):
+            probe("unlink")
+        real_unlink(p)
 
     monkeypatch.setattr(protocol.os, "link", _no_link)
     monkeypatch.setattr(protocol.os, "rename", rename)
+    monkeypatch.setattr(protocol.os, "unlink", unlink)
     NodeKey.load_or_create(tmp_path / "node.key")
-    assert seen == [str(os.getpid())]
+    assert seen == [("rename", "held"), ("unlink", "held")]
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
+
+
+def test_no_link_lock_fd_closed_when_flock_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(protocol.os, "link", _no_link)
+
+    def broken(fd, op):
+        raise OSError(errno.ENOLCK, "no locks")
+
+    before = set(os.listdir("/proc/self/fd"))
+    monkeypatch.setattr(protocol.fcntl, "flock", broken)
+    with pytest.raises(OSError, match="no locks"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    monkeypatch.undo()
+    assert set(os.listdir("/proc/self/fd")) <= before
+    assert list(tmp_path.iterdir()) == []  # no lock file left behind
 
 
 def test_other_link_errors_are_raised(tmp_path, monkeypatch):

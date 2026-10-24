@@ -7,7 +7,10 @@ import time
 import pytest
 from warcio.archiveiterator import ArchiveIterator
 
+from hakapik.blobstore import BlobStore
 from hakapik.browser import PROFILES, Browser, _Recorder, classify
+from hakapik.protocol import DnsAnswer, Job, NodeKey
+from hakapik.worker import IpSpacer, run_job
 
 # The shared browser fixture lives on the module loop; tests using it must too.
 module_loop = pytest.mark.asyncio(loop_scope="module")
@@ -283,3 +286,31 @@ async def test_freeze_stops_a_refresh_loop(site, browser):
         finally:
             await rec.exchanges(1)
             await context.close()
+
+
+class _LocalResolver:
+    async def resolve(self, fqdn, registrable):
+        return (DnsAnswer(fqdn, "A", "NOERROR", 60, ("127.0.0.1",), "local",
+                          "2026-10-24T10:00:00Z"),)
+
+
+@module_loop
+async def test_job_timeout_cancels_a_hanging_capture_and_the_browser_still_works(
+        site, browser, tmp_path):
+    # The fetch loop's bound: asyncio.timeout around run_job. The landing
+    # never answers; the cancelled capture drains (up to nav_timeout_s) and
+    # closes its context; the same Browser then captures a normal page.
+    job = Job(1, 1, "127.0.0.1", "127.0.0.1", 0, site.url("/hang"))
+    t = time.monotonic()
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(1.0):
+            await run_job(job, resolver=_LocalResolver(), browser=browser,
+                          bs=BlobStore(tmp_path / "blobs"),
+                          key=NodeKey.load_or_create(tmp_path / "key"),
+                          egress_address=None, spacer=IpSpacer(None))
+    # job_timeout + at most one drain (nav_timeout_s = 10, settle 1) + margin
+    assert time.monotonic() - t < 1.0 + 10 + 1 + 5
+    assert "/hang" in site.paths_requested
+    assert browser._browser.contexts == []  # the cancelled capture's context is closed
+    c = await browser.capture(site.url("/"), "mobile")
+    assert c.page.outcome == "live" and c.page.http_status == 200

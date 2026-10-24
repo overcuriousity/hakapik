@@ -138,12 +138,15 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                 stored = asyncio.Event()
                 beat = asyncio.create_task(_heartbeat(pool, claim, cfg.lease_s, stored))
                 try:
+                    bound = asyncio.timeout(cfg.job_timeout_s)
                     try:
-                        async with asyncio.timeout(cfg.job_timeout_s):
+                        async with bound:
                             env = await run_job(
                                 job, resolver=resolver, browser=browser, bs=bs, key=key,
                                 egress_address=cfg.egress_address, spacer=spacer)
                     except TimeoutError:
+                        if not bound.expired():
+                            raise  # raised inside run_job: a plain task failure
                         # Nothing is stored; the lease expires and the job is retried.
                         log.error("job %d %s timed out after %s s; nothing stored",
                                   job.job_id, job.fqdn, cfg.job_timeout_s)
@@ -155,8 +158,15 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                         try:
                             attempt_id = await store_result(
                                 c, bs, env, cfg.retry_ladder_s, asn_db=asn_db)
-                            await c.commit()
+                            # Set before the commit: a heartbeat tick that runs
+                            # after the commit but before this task resumes
+                            # must already see it, or it warns "lease lost".
                             stored.set()
+                            try:
+                                await c.commit()
+                            except BaseException:
+                                stored.clear()
+                                raise
                         except ResultRejected as e:
                             await c.rollback()
                             log.error("job %d %s: result rejected: %s",

@@ -10,6 +10,7 @@ import binascii
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -233,77 +234,77 @@ def _create_key(path: Path, seed: bytes) -> None:
 def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
     """Rename ``tmp`` to ``path`` unless another process creates it; True if renamed.
 
-    The lock file holds its creator's PID. A waiter whose wait expires removes
-    a lock whose creator is gone (a crash) and tries once more.
+    The creator of ``<key>.lock`` (O_EXCL) holds an flock on it from creation
+    until after it has removed it. The kernel drops an flock when its holder
+    dies, so a waiter whose wait expires and gets the flock knows the creator
+    is gone (in any PID namespace): it removes the lock under that flock and
+    tries once more.
     """
     lock = path.with_name(path.name + ".lock")
     try:
-        lfd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        lfd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
-        # Another process holds the lock: its key appears whole, by rename.
-        deadline = time.monotonic() + KEY_LOCK_WAIT_S
-        while not path.exists():
-            if time.monotonic() > deadline:
-                owner = None if retried else _dead_lock_owner(lock)
-                if owner is not None and _lock_identity(lock) == owner:
-                    # Re-read just before the unlink: a lock re-created by
-                    # another process meanwhile (new inode or PID) is kept.
-                    log.warning("removing %s left by a process that is gone", lock)
-                    with contextlib.suppress(FileNotFoundError):
-                        os.unlink(lock)
-                    return _rename_under_lock(tmp, path, retried=True)
-                raise RuntimeError(
-                    f"node key {path} not created while {lock} exists; if no other "
-                    "hakapik process is starting, a crash left the lock: delete it"
-                ) from None
-            time.sleep(0.05)
-        return False
+        return _wait_for_key(tmp, path, lock, retried)
     try:
         try:
-            f = os.fdopen(lfd, "w")
+            fcntl.flock(lfd, fcntl.LOCK_EX)
         except BaseException:
-            os.close(lfd)
+            os.unlink(lock)  # never leave a lock file nobody holds
             raise
-        with f:
-            f.write(str(os.getpid()))
-        if path.exists():
-            return False
-        os.rename(tmp, path)
+        if os.fstat(lfd).st_ino != _inode(lock):
+            # A waiter took this lock for dead before the flock was taken (the
+            # creator stalled for KEY_LOCK_WAIT_S): the waiter creates the key.
+            return _wait_for_key(tmp, path, lock, retried=True)
+        try:
+            if path.exists():
+                return False
+            os.rename(tmp, path)
+            return True
+        finally:
+            os.unlink(lock)  # still under the flock
+    finally:
+        os.close(lfd)
+
+
+def _inode(p: Path) -> int | None:
+    try:
+        return os.stat(p).st_ino
+    except FileNotFoundError:
+        return None
+
+
+def _wait_for_key(tmp: str, path: Path, lock: Path, retried: bool) -> bool:
+    """Wait for another creator's key; take over its lock once if it died."""
+    deadline = time.monotonic() + KEY_LOCK_WAIT_S
+    while not path.exists():
+        if time.monotonic() > deadline:
+            if not retried and _remove_dead_lock(lock):
+                log.warning("removed %s left by a process that is gone", lock)
+                return _rename_under_lock(tmp, path, retried=True)
+            raise RuntimeError(
+                f"node key {path} not created while {lock} exists and is held; "
+                "another hakapik process is still creating it"
+            )
+        time.sleep(0.05)
+    return False
+
+
+def _remove_dead_lock(lock: Path) -> bool:
+    """Remove ``lock`` if no live process holds its flock; True if removed (or gone)."""
+    try:
+        fd = os.open(lock, os.O_RDWR)
+    except FileNotFoundError:
+        return True
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False  # its creator is alive
+        if os.fstat(fd).st_ino == _inode(lock):  # not replaced since we opened it
+            os.unlink(lock)
         return True
     finally:
-        os.unlink(lock)
-
-
-def _lock_identity(lock: Path) -> tuple[int, int] | None:
-    """(inode, PID) of the lock file, or None if it is gone or holds no PID."""
-    try:
-        ino = os.stat(lock).st_ino
-        pid = int(lock.read_text())
-    except (OSError, ValueError):
-        return None
-    return ino, pid
-
-
-def _dead_lock_owner(lock: Path) -> tuple[int, int] | None:
-    """The lock's (inode, PID) if that PID no longer exists, else None.
-
-    An empty or unreadable lock is never taken as dead, by design: its creator
-    writes the PID right after creating it, so an empty lock means a crash in
-    that instant or a file hakapik did not write; an operator decides.
-    A creator in another PID namespace (e.g. another container sharing the
-    data directory) can look dead here; processes sharing a data_dir must
-    share a PID namespace.
-    """
-    ident = _lock_identity(lock)
-    if ident is None or ident[1] <= 0:
-        return None
-    try:
-        os.kill(ident[1], 0)
-    except ProcessLookupError:
-        return ident
-    except OSError:
-        return None  # e.g. EPERM: it exists under another user
-    return None
+        os.close(fd)
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:

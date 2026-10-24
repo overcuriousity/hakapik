@@ -68,7 +68,9 @@ def _handler(site: Site):
             site.paths_requested.append(self.path)
             site.user_agents.append(self.headers.get("User-Agent", ""))
             site.headers.append({k.lower(): v for k, v in self.headers.items()})
-            if self.path == "/never":  # a dead tracker: no answer until teardown
+            # /never: a dead tracker; /hang: a page that never answers. Both
+            # hold the request until teardown.
+            if self.path in ("/never", "/hang"):
                 site.release.wait(30)
                 return
             status, headers, body = PAGES.get(self.path.split("?")[0], (404, [], b"<html>not found</html>"))
