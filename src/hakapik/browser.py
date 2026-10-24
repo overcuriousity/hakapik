@@ -363,7 +363,17 @@ class Browser:
         settings = self._profile(profile)
         started = _now()
         loop = asyncio.get_running_loop()
-        context = await self._browser.new_context(**settings, accept_downloads=False)
+        setup_by = loop.time() + self.nav_timeout_s
+
+        async def setup(coro):
+            """A step before navigation: only a wedged browser takes long."""
+            try:
+                return await asyncio.wait_for(coro, max(setup_by - loop.time(), 0.001))
+            except TimeoutError:
+                raise TimeoutError("browser setup took over nav_timeout_s") from None
+
+        # Raises if the browser is wedged: there is no page yet to blame.
+        context = await setup(self._browser.new_context(**settings, accept_downloads=False))
         rec = Recorder()
         nav = Nav()  # replaced by the page's once it exists
         hint_tasks: list[asyncio.Task] = []  # prepare_page of pages the site opens
@@ -378,11 +388,11 @@ class Browser:
                 rec.blocked.add(route.request)
                 await route.abort()
 
-            await context.route("**/favicon.ico", no_favicon)
+            await setup(context.route("**/favicon.ico", no_favicon))
             rec.watch(context)
-            page = await context.new_page()
+            page = await setup(context.new_page())
             nav = rec.nav(page)
-            cdp = await self.prepare_page(context, page, profile)
+            cdp = await setup(self.prepare_page(context, page, profile))
             # Pages the site opens itself get the same client hints (best effort:
             # a popup's first request may leave before this lands). Our own click
             # pages get them twice, with the same values.
@@ -460,7 +470,9 @@ class Browser:
                 t.cancel()
             await asyncio.gather(*hint_tasks, return_exceptions=True)
             try:
-                await context.close()
+                await asyncio.wait_for(context.close(), self.nav_timeout_s)
+            except TimeoutError:  # a wedged browser; the context stays open
+                log.warning("context of %s did not close within nav_timeout_s", url)
             except PlaywrightError:
                 log.debug("context close failed", exc_info=True)
         finished = _now()

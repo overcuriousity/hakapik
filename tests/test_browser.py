@@ -93,6 +93,19 @@ async def test_no_robots_txt_or_favicon_request_leaves_the_browser(site, tls_sit
         assert "/favicon.ico" not in s.paths_requested and "/robots.txt" not in s.paths_requested
 
 
+@session_loop
+async def test_a_body_over_max_body_is_never_read(site, browser):
+    # Chromium keeps a body for playwright only up to its own buffer, below
+    # MAX_BODY: a larger one is not handed over and the record says so.
+    c = await browser.capture(site.url("/fetch-big"), "mobile")
+    big = [r for r in ArchiveIterator(io.BytesIO(c.warc))
+           if r.rec_type == "response" and r.rec_headers.get_header("WARC-Target-URI")
+           == site.url("/big")]
+    assert len(big) == 1 and big[0].http_headers.get_statuscode() == "200"
+    assert big[0].rec_headers.get_header("WARC-Truncated") == "unspecified"
+    assert big[0].content_stream().read() == b""
+
+
 def _major(browser):
     return browser.version.split(".")[0]
 
@@ -351,6 +364,46 @@ async def test_freeze_stops_a_refresh_loop(site, browser):
         finally:
             await rec.exchanges(1)
             await context.close()
+
+
+async def _hang(*args, **kwargs):
+    await asyncio.sleep(3600)
+
+
+@session_loop
+async def test_a_wedged_browser_before_navigation_is_bounded(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 1)
+    monkeypatch.setattr(browser, "prepare_page", _hang)
+    t = time.monotonic()
+    c = await browser.capture(site.url("/"), "mobile")
+    # setup gets nav_timeout_s, the drain at most nav_timeout_s more
+    assert time.monotonic() - t < 2 * 1 + 2
+    assert c.page.outcome == "timeout" and "browser setup" in c.page.error
+    assert "/" not in site.paths_requested and browser._browser.contexts == []
+
+
+@session_loop
+async def test_a_context_that_never_closes_does_not_hang_the_capture(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 2)
+    contexts = []
+    real_new_context = browser._browser.new_context
+
+    async def new_context(**kwargs):
+        ctx = await real_new_context(**kwargs)
+        contexts.append((ctx, ctx.close))
+        ctx.close = _hang
+        return ctx
+
+    monkeypatch.setattr(browser._browser, "new_context", new_context)
+    try:
+        t = time.monotonic()
+        c = await browser.capture(site.url("/"), "mobile")
+        assert c.page.outcome == "live" and c.page.http_status == 200
+        # navigation, settle, a drain floor and the close's own nav_timeout_s
+        assert time.monotonic() - t < 2 + 1 + 2 + 2 + 2
+    finally:
+        for _, close in contexts:
+            await close()
 
 
 class _LocalResolver:

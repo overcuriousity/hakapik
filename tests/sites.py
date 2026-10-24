@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
 from hakapik.browser import Browser
+from hakapik.warc import MAX_BODY
 
 PAGES = {
     "/": (200, [], b'<html><head><title>Home</title></head><body><h1>Welcome</h1>'
@@ -61,6 +62,7 @@ PAGES = {
     # loads, then sends itself to a host that does not resolve
     "/to-dead": (200, [], b'<html><body>going<script>setTimeout(() => { location.href = '
                           b'"http://nonexistent.invalid/"; }, 100);</script></body></html>'),
+    "/fetch-big": (200, [], b'<html><body>big<script>fetch("/big");</script></body></html>'),
     # a favicon the page asks for itself, as a link and as an image
     "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
                         b'<body>icons<img src="/favicon.ico"></body></html>'),
@@ -93,7 +95,12 @@ def _handler(site: Site):
             if self.path in ("/never", "/hang"):
                 site.release.wait(30)
                 return
-            status, headers, body = PAGES.get(self.path.split("?")[0], (404, [], b"<html>not found</html>"))
+            if self.path == "/big":  # one byte over the WARC's cap, made per request
+                status, headers, body = 200, [("Content-Type", "application/octet-stream")], \
+                    b"x" * (MAX_BODY + 1)
+            else:
+                status, headers, body = PAGES.get(self.path.split("?")[0],
+                                                  (404, [], b"<html>not found</html>"))
             self.send_response(status)
             if not any(n == "Content-Type" for n, _ in headers):
                 self.send_header("Content-Type", "text/html; charset=utf-8")

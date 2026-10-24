@@ -125,6 +125,11 @@ class Recorder:
         if resp is not None:
             status, status_text = resp.status, resp.status_text
             resp_headers = tuple((h["name"], h["value"]) for h in await resp.headers_array())
+            # The body is read whole, but Chromium hands over a body only up
+            # to its DevTools buffer (about 15 MB in Chromium 156: playwright
+            # enables Network with Chromium's defaults), below warc.MAX_BODY;
+            # a larger one fails here and is marked unavailable. So no body
+            # over MAX_BODY is ever held (test_a_body_over_max_body_is_never_read).
             try:
                 body = await resp.body()
             except PlaywrightError:  # redirects have none; evicted bodies are marked
