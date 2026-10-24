@@ -63,7 +63,7 @@ async def sweep(
         """UPDATE fetch_job SET state = 'aged_out'
            WHERE state = 'open' AND step = 0
              AND (claimed_until IS NULL OR claimed_until <= now())
-             AND created_at < now() - make_interval(hours => %s)""",
+             AND created_at < now() - make_interval(secs => %s * 3600)""",
         (ageout_hours,),
     )
     count = cur.rowcount

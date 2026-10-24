@@ -164,3 +164,11 @@ async def test_manual_lost_race_leaves_no_orphan(conn, monkeypatch):
     monkeypatch.undo()
     assert await _count(conn, "candidate") == 1
     assert await _count(conn, "fetch_job") == 1
+
+
+async def test_sweep_takes_fractional_ageout_hours(conn):
+    old = await _add(conn, "old.example.com", 2000)  # older than 0.5 h
+    young = await _add(conn, "young.example.com", 1000)
+    assert await sweep(conn, 0.5, None) == 1
+    assert (await _job(conn, old))[1] == "aged_out"
+    assert (await _job(conn, young))[1] == "open"
