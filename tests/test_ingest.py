@@ -626,3 +626,40 @@ async def test_tail_log_lag_never_negative(ix, sup, bs, cfg, conn, monkeypatch, 
         await asyncio.wait_for(task, timeout=2)
     assert "lag=0 next_index=6 tree_size=4 (tree head 2 behind served entries)" in caplog.text
     assert "lag=-" not in caplog.text
+
+
+# --- readonly logs ----------------------------------------------------------
+
+READONLY_INFO = dataclasses.replace(INFO, log_id="rolog", state="readonly")
+
+
+async def test_readonly_log_without_cursor_is_not_tailed(ix, sup, bs, cfg, conn, caplog):
+    src = FakeSource([b"x"] * 4, READONLY_INFO)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 2)
+    assert src.calls == []
+    assert await get_cursor(conn, READONLY_INFO.log_id) is None
+    assert "skipped" in caplog.text
+
+
+async def test_readonly_log_with_cursor_reads_to_size_then_returns(
+    ix, sup, bs, cfg, conn, caplog
+):
+    src = FakeSource([b"x"] * 4, READONLY_INFO)
+    await cursor_at(conn, READONLY_INFO.log_id, 1)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 5)
+    assert src.calls and src.calls[0][0] == 1 and src.calls[-1][1] == 3
+    assert await get_cursor(conn, READONLY_INFO.log_id) == 4
+    assert "followed until caught up" in caplog.text
+
+
+async def test_usable_log_keeps_running_when_caught_up(ix, sup, bs, cfg, conn):
+    src = FakeSource([b"x"] * 2)
+    await cursor_at(conn, INFO.log_id, 2)
+    stop = asyncio.Event()
+    task = asyncio.create_task(tail_log(src, cfg, ix, sup, bs, conn, stop))
+    await asyncio.sleep(0.2)
+    assert not task.done()
+    stop.set()
+    await asyncio.wait_for(task, 2)

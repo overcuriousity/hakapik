@@ -92,6 +92,8 @@ async def fetch_log_lists(
             response = await client.get(url)
             response.raise_for_status()
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError(f"top level is {type(data).__name__}, not an object")
         except (httpx.HTTPError, ValueError) as exc:
             _log.warning("log list %s failed: %r", url, exc)
             last_error = exc

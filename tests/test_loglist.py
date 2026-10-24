@@ -127,3 +127,13 @@ def test_parse_drops_pending_and_rejected():
         log("c", {"readonly": {"timestamp": "t"}}),
     ]}]}
     assert [l.log_id for l in parse_log_list(data)] == ["c"]
+
+
+async def test_fetch_skips_list_that_is_not_an_object(respx_mock, caplog):
+    respx_mock.get(V3_URL).mock(return_value=httpx.Response(200, json=[1, 2]))
+    respx_mock.get(APPLE_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("b", {"usable": {}}))))
+    async with httpx.AsyncClient() as client:
+        logs = await fetch_log_lists([V3_URL, APPLE_URL], client)
+    assert [l.log_id for l in logs] == ["b"]
+    assert "not an object" in caplog.text

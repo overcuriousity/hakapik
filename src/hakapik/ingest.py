@@ -58,6 +58,7 @@ from hakapik.db import (
     bump_stat,
     connect,
     get_cursor,
+    init_cursor,
     migrate,
     set_cursor,
 )
@@ -386,13 +387,18 @@ async def _tail_once(
     size = await src.tree_size()
     if next_index is None:
         try:
-            await set_cursor(conn, log_id, size)
+            created = await init_cursor(conn, log_id, size)
             await conn.commit()
         except BaseException:
             await conn.rollback()
             raise
-        _logger(src).info("no cursor; starting at tree_size=%d", size)
-        return 0, size, size
+        if created:
+            _logger(src).info("no cursor; starting at tree_size=%d", size)
+            return 0, size, size
+        # Another process created the cursor first; its value stands.
+        existing = await get_cursor(conn, log_id)
+        await conn.rollback()
+        return 0, size if existing is None else existing, size
     if next_index >= size:
         return 0, next_index, size
     end = _batch_end(src, next_index, size, cfg.batch_size)
@@ -430,10 +436,29 @@ async def tail_log(
 
     ``db`` is a ``ConnPool`` (a connection is borrowed per batch) or a
     connection. Logs entries/s and lag every PROGRESS_INTERVAL_S.
+
+    A readonly log no longer grows, so it is not tailed without a cursor
+    (it would start at its tree size and never yield an entry); with a cursor
+    it is followed until the cursor reaches the tree size, then this returns.
     """
     log = _logger(src)
     progress = _Progress(log)
     failures = _Failures(log)
+    readonly = src.info.state == "readonly"
+    while readonly and not stop.is_set():
+        try:
+            async with _borrow(db) as conn:
+                cursor = await get_cursor(conn, src.info.log_id)
+                await conn.rollback()
+        except Exception as e:
+            failures.warn("readonly check", e, IDLE_SLEEP_S)
+            await _sleep_or_stop(stop, IDLE_SLEEP_S)
+            continue
+        if cursor is None:
+            log.info("readonly log without cursor: skipped (it no longer grows)")
+            return
+        log.info("readonly log with cursor %d: followed until caught up", cursor)
+        break
     async def one_batch():
         async with _borrow(db) as conn:
             return await _tail_once(src, cfg, ix, sup, bs, conn)
@@ -445,6 +470,9 @@ async def tail_log(
         try:
             n, next_index, size = batch.result()
             progress.note(n, next_index, size)
+            if readonly and next_index >= size:
+                log.info("readonly log caught up at %d; task ends", next_index)
+                return
         except Exception as e:
             failures.warn("batch", e, IDLE_SLEEP_S)
             n = 0
