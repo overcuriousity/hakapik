@@ -55,6 +55,12 @@ PAGES = {
                        b' b = \'<a href="/login?via=sign">Sign in</a>\';'
                        b'document.write(document.cookie.includes("seen") ? b + a : a + b);'
                        b'document.cookie = "seen=1";</script></body></html>'),
+    # load never fires and the URL moves without a response of its own
+    "/stall-push": (200, [], b'<html><body>stalled push<img src="/never"><script>'
+                             b'history.pushState({}, "", "/pushed");</script></body></html>'),
+    # loads, then sends itself to a host that does not resolve
+    "/to-dead": (200, [], b'<html><body>going<script>setTimeout(() => { location.href = '
+                          b'"http://nonexistent.invalid/"; }, 100);</script></body></html>'),
     # a favicon the page asks for itself, as a link and as an image
     "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
                         b'<body>icons<img src="/favicon.ico"></body></html>'),

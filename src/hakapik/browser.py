@@ -122,7 +122,7 @@ def classify(error: str | None, status: int | None) -> str:
             return "connect_fail"
         if re.search(r"ERR_(CERT|SSL)_", error):
             return "tls_error"
-        if error.startswith("TimeoutError"):
+        if error.startswith(("TimeoutError", "load timeout")):
             return "timeout"
         return "error"
     if status is not None and status >= 400:
@@ -400,13 +400,19 @@ class Browser:
             navigated = error is None or load_timeout
             if navigated:
                 await asyncio.sleep(self.settle_s)  # JS and meta-refresh redirects
+                if page.url.startswith("chrome-error:"):
+                    # It moved on to a navigation that failed: that is the outcome.
+                    error, load_timeout, navigated = nav.failure or "navigation failed", False, False
             deadline = loop.time() + self.nav_timeout_s
             bounded = functools.partial(self._bounded, deadline=deadline)
             if navigated:
                 await self._freeze(page, cdp, rec, deadline)
             if not page.url.startswith(BLANK):
                 final_url = page.url
-            if (resp := nav.response_for(final_url)) is not None:
+            doc_url = final_url
+            if doc_url is None and classify(error, None) == "download" and nav.chain:
+                doc_url = nav.chain[-1]  # the page stayed blank; the response is the download's
+            if (resp := nav.response_for(doc_url)) is not None:
                 status = resp.status
                 addr = await bounded(resp.server_addr())
                 server_ip = (addr or {}).get("ipAddress")
@@ -458,7 +464,9 @@ class Browser:
             except PlaywrightError:
                 log.debug("context close failed", exc_info=True)
         finished = _now()
-        outcome = classify(None if load_timeout else error, status)
+        # A load timeout is still "live" when the final URL's document arrived;
+        # without that document it is a timeout.
+        outcome = classify(None if load_timeout and status is not None else error, status)
         page_result = PageResult(
             profile=profile, outcome=outcome, http_status=status,
             final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),

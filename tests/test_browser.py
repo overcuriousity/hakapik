@@ -25,6 +25,7 @@ def test_classify_table():
     assert classify("net::ERR_CERT_DATE_INVALID", None) == "tls_error"
     assert classify("net::ERR_SSL_PROTOCOL_ERROR", None) == "tls_error"
     assert classify("TimeoutError: Timeout 10000ms exceeded.", None) == "timeout"
+    assert classify("load timeout", None) == "timeout"
     assert classify("Download is starting", None) == "download"
     assert classify("something odd", None) == "error"
     assert classify(None, 404) == "http_error" and classify(None, 200) == "live"
@@ -153,6 +154,9 @@ async def test_meta_refresh_loop_terminates(site, browser):
 async def test_download_is_refused(site, browser):
     c = await browser.capture(site.url("/apk"), "mobile")
     assert c.page.outcome == "download" and c.screenshot is None
+    # the page never left about:blank, but the download's response is known
+    assert c.page.final_url is None and c.page.redirects == (site.url("/apk"),)
+    assert c.page.http_status == 200 and c.page.server_ip == "127.0.0.1"
 
 
 @session_loop
@@ -172,6 +176,24 @@ async def test_load_timeout_with_committed_document(site, browser):
     assert c.page.outcome == "live" and c.page.http_status == 200
     assert "load timeout" in c.page.error
     assert c.screenshot.startswith(b"\x89PNG") and b"stalled" in c.dom
+
+
+@session_loop
+async def test_load_timeout_without_a_final_document_is_timeout(site, browser):
+    # the document arrived, but the final URL has no response of its own
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        c = await b.capture(site.url("/stall-push"), "mobile")
+    assert c.page.final_url == site.url("/pushed") and c.page.http_status is None
+    assert c.page.outcome == "timeout" and c.page.error == "load timeout"
+    assert c.screenshot.startswith(b"\x89PNG") and b"stalled push" in c.dom
+
+
+@session_loop
+async def test_landing_that_moves_to_a_dead_host_is_its_failure(site, browser):
+    c = await browser.capture(site.url("/to-dead"), "mobile")
+    assert c.page.outcome == "dns_fail" and c.page.final_url is None
+    assert "ERR_NAME_NOT_RESOLVED" in c.page.error and c.page.http_status is None
+    assert c.page.redirects[0] == site.url("/to-dead") and c.screenshot is None
 
 
 @session_loop
@@ -207,10 +229,18 @@ async def test_click_through_capped_at_three(site, browser):
 
 
 @session_loop
-async def test_click_through_follows_popup(site, browser):
+async def test_click_through_follows_popup(site, browser, caplog):
     c = await browser.capture(site.url("/popup"), "desktop", click_through=True)
     assert len(c.clicks) == 1 and c.clicks[0].page.final_url == site.url("/login")
     assert b'type="password"' in c.clicks[0].dom
+    # the popup's first request comes before its page exists; it still counts
+    assert c.clicks[0].page.http_status == 200 and c.clicks[0].page.server_ip == "127.0.0.1"
+    assert c.clicks[0].page.redirects == (site.url("/login"),)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # the popup's exchanges share the WARC
+    responses = [(r.rec_headers.get_header("WARC-Target-URI"), r.content_stream().read())
+                 for r in ArchiveIterator(io.BytesIO(c.warc)) if r.rec_type == "response"]
+    assert any(u == site.url("/login") and b'type="password"' in body for u, body in responses)
 
 
 @session_loop

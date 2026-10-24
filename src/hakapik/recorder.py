@@ -56,6 +56,7 @@ class Recorder:
         self.tasks: list[asyncio.Task] = []
         self.blocked: set = set()
         self.navs: dict = {}  # page -> Nav
+        self.waiting: list = []  # (handler, event) whose page did not exist yet
         self.open = True
 
     def watch(self, context):
@@ -64,6 +65,7 @@ class Recorder:
         context.on("requestfailed", _safe(self._on_failed))
         context.on("request", _safe(self._on_request))
         context.on("response", _safe(self._on_response))
+        context.on("page", _safe(self._on_page))
 
     def nav(self, page) -> Nav:
         """``page``'s navigations; pages the site opens are tracked on their own."""
@@ -72,18 +74,30 @@ class Recorder:
             page.on("framenavigated", _safe(self._on_navigated, page))
         return self.navs[page]
 
-    def _main_nav(self, req) -> Nav | None:
+    def _main_nav(self, req, handler, event) -> Nav | None:
+        """``req``'s page's Nav if it is a main-frame navigation. A popup's
+        first request comes before playwright has its page: then ``handler``
+        runs again with ``event`` once the page exists."""
         if not req.is_navigation_request():
             return None
-        frame = req.frame
+        try:
+            frame = req.frame
+        except PlaywrightError:  # frame not attached to a page yet
+            self.waiting.append((handler, event))
+            return None
         return self.nav(frame.page) if frame.parent_frame is None else None
 
+    def _on_page(self, page):
+        waiting, self.waiting = self.waiting, []
+        for handler, event in waiting:  # in arrival order
+            handler(event)
+
     def _on_request(self, req):
-        if nav := self._main_nav(req):
+        if nav := self._main_nav(req, self._on_request, req):
             nav.add(req.url)  # every hop, HTTP redirects included
 
     def _on_failed(self, req):
-        if nav := self._main_nav(req):
+        if nav := self._main_nav(req, self._on_failed, req):
             nav.failure = req.failure
 
     def _on_navigated(self, page, frame):
@@ -93,7 +107,7 @@ class Recorder:
             nav.add(frame.url)
 
     def _on_response(self, resp):
-        if ((nav := self._main_nav(resp.request))
+        if ((nav := self._main_nav(resp.request, self._on_response, resp))
                 and not (300 <= resp.status < 400 and "location" in resp.headers)):
             nav.responses[urldefrag(resp.url).url] = resp
 
