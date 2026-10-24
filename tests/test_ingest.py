@@ -639,7 +639,7 @@ async def test_readonly_log_without_cursor_is_not_tailed(ix, sup, bs, cfg, conn,
         await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 2)
     assert src.calls == []
     assert await get_cursor(conn, READONLY_INFO.log_id) is None
-    assert "skipped" in caplog.text
+    assert "skipped (readonly, no cursor)" in caplog.text
 
 
 async def test_readonly_log_with_cursor_reads_to_size_then_returns(
@@ -651,7 +651,8 @@ async def test_readonly_log_with_cursor_reads_to_size_then_returns(
         await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 5)
     assert src.calls and src.calls[0][0] == 1 and src.calls[-1][1] == 3
     assert await get_cursor(conn, READONLY_INFO.log_id) == 4
-    assert "followed until caught up" in caplog.text
+    assert "following until caught up (readonly, 3 entries left)" in caplog.text
+    assert "caught up (readonly)" in caplog.text
 
 
 async def test_usable_log_keeps_running_when_caught_up(ix, sup, bs, cfg, conn):
@@ -663,3 +664,16 @@ async def test_usable_log_keeps_running_when_caught_up(ix, sup, bs, cfg, conn):
     assert not task.done()
     stop.set()
     await asyncio.wait_for(task, 2)
+
+
+@pytest.mark.parametrize("cursor", [4, 9])
+async def test_readonly_log_cursor_at_or_beyond_size_returns_at_once(
+    ix, sup, bs, cfg, conn, caplog, cursor
+):
+    src = FakeSource([b"x"] * 4, READONLY_INFO)
+    await cursor_at(conn, READONLY_INFO.log_id, cursor)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 1)
+    assert src.calls == []
+    assert "caught up (readonly)" in caplog.text
+    assert await get_cursor(conn, READONLY_INFO.log_id) == cursor

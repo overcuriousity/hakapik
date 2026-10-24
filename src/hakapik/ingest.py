@@ -450,14 +450,21 @@ async def tail_log(
             async with _borrow(db) as conn:
                 cursor = await get_cursor(conn, src.info.log_id)
                 await conn.rollback()
+            size = await src.tree_size() if cursor is not None else 0
         except Exception as e:
             failures.warn("readonly check", e, IDLE_SLEEP_S)
             await _sleep_or_stop(stop, IDLE_SLEEP_S)
             continue
+        # A cursor that appears after this read was made by another process,
+        # which then tails the log; skipping here is right. Cursors are never
+        # deleted, so one seen here is still there for the batches below.
         if cursor is None:
-            log.info("readonly log without cursor: skipped (it no longer grows)")
+            log.info("skipped (readonly, no cursor)")
             return
-        log.info("readonly log with cursor %d: followed until caught up", cursor)
+        if cursor >= size:
+            log.info("caught up (readonly)")
+            return
+        log.info("following until caught up (readonly, %d entries left)", size - cursor)
         break
     async def one_batch():
         async with _borrow(db) as conn:
@@ -471,7 +478,10 @@ async def tail_log(
             n, next_index, size = batch.result()
             progress.note(n, next_index, size)
             if readonly and next_index >= size:
-                log.info("readonly log caught up at %d; task ends", next_index)
+                # No final progress.note(): this line and the one above carry
+                # the end state, and a rate over the last partial interval
+                # would say nothing useful about a log that has stopped.
+                log.info("caught up (readonly)")
                 return
         except Exception as e:
             failures.warn("batch", e, IDLE_SLEEP_S)
