@@ -1,6 +1,5 @@
 import base64
 import errno
-import fcntl
 import json
 import os
 import threading
@@ -148,142 +147,36 @@ def test_new_key_is_synced_before_it_is_published(tmp_path, monkeypatch):
     assert events[:2] == ["fsync", "link"] and events[2:] == ["fsync"]
 
 
-def _no_link(a, b):
-    raise OSError(errno.EPERM, "hard links not supported")
-
-
-def test_key_created_without_hard_links(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
+def test_concurrent_creators_share_one_key(tmp_path):
+    # Several creators race; link() lets exactly one publish, the rest read it.
     p = tmp_path / "node.key"
-    k = NodeKey.load_or_create(p)
-    assert len(p.read_bytes()) == 32 and p.stat().st_mode & 0o777 == 0o600
-    assert NodeKey.load_or_create(p).node_id == k.node_id
+    barrier = threading.Barrier(8)
+    ids = []
+
+    def create():
+        barrier.wait()
+        ids.append(NodeKey.load_or_create(p).node_id)
+
+    threads = [threading.Thread(target=create) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(ids) == 8 and len(set(ids)) == 1
+    assert ids[0] == NodeKey(p.read_bytes()).node_id
     assert [x.name for x in tmp_path.iterdir()] == ["node.key"]
 
 
-def test_no_link_waits_for_a_concurrent_creator_and_never_overwrites(tmp_path,
-                                                                     monkeypatch):
-    # Another process holds the lock and publishes its key whole (by rename)
-    # a moment later: this one waits, then uses that key.
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    p = tmp_path / "node.key"
-    (tmp_path / "node.key.lock").touch()
-    theirs = NodeKey(b"\x05" * 32)
-
-    def other_process():
-        src = tmp_path / "theirs.tmp"
-        src.write_bytes(b"\x05" * 32)
-        src.chmod(0o600)
-        os.rename(src, p)
-
-    timer = threading.Timer(0.2, other_process)
-    timer.start()
-    try:
-        assert NodeKey.load_or_create(p).node_id == theirs.node_id
-    finally:
-        timer.join()
-    assert p.read_bytes() == b"\x05" * 32
-
-
-def test_no_link_rename_does_not_replace_a_key_that_appeared(tmp_path, monkeypatch):
-    # The key appears between the exists() check and taking the lock.
-    p = tmp_path / "node.key"
-
-    def link_then_other_wins(a, b):
-        p.write_bytes(b"\x06" * 32)
-        p.chmod(0o600)
-        _no_link(a, b)
-
-    monkeypatch.setattr(protocol.os, "link", link_then_other_wins)
-    assert NodeKey.load_or_create(p).node_id == NodeKey(b"\x06" * 32).node_id
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
-
-
-@pytest.mark.parametrize("code", [errno.ENOSYS, errno.EMLINK, errno.ENOTSUP])
-def test_every_missing_link_errno_takes_the_fallback(tmp_path, monkeypatch, code):
+@pytest.mark.parametrize("code", [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP,
+                                  errno.ENOSYS, errno.EMLINK])
+def test_no_hard_links_is_a_clear_error(tmp_path, monkeypatch, code):
     def no_link(a, b):
         raise OSError(code, os.strerror(code))
 
     monkeypatch.setattr(protocol.os, "link", no_link)
-    p = tmp_path / "node.key"
-    NodeKey.load_or_create(p)
-    assert len(p.read_bytes()) == 32 and sorted(x.name for x in tmp_path.iterdir()) == [
-        "node.key"]
-
-
-def test_no_link_lock_without_a_holder_is_taken_over(tmp_path, monkeypatch, caplog):
-    # A lock file nobody holds an flock on: its creator died (the kernel drops
-    # the flock with the process). The waiter removes it and creates the key.
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
-    (tmp_path / "node.key.lock").touch()
-    p = tmp_path / "node.key"
-    with caplog.at_level("WARNING", logger="hakapik.protocol"):
-        NodeKey.load_or_create(p)
-    assert len(p.read_bytes()) == 32
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
-    assert any("node.key.lock" in r.getMessage() for r in caplog.records)
-
-
-def test_no_link_lock_with_a_live_holder_is_reported(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    monkeypatch.setattr(protocol, "KEY_LOCK_WAIT_S", 0.1)
-    lock = tmp_path / "node.key.lock"
-    holder = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)  # an fd of its own: a live creator
-    try:
-        fcntl.flock(holder, fcntl.LOCK_EX)
-        with pytest.raises(RuntimeError, match="node.key.lock"):
-            NodeKey.load_or_create(tmp_path / "node.key")
-        assert lock.exists() and not (tmp_path / "node.key").exists()
-    finally:
-        os.close(holder)
-
-
-def test_no_link_creator_removes_the_lock_under_its_flock(tmp_path, monkeypatch):
-    lock = tmp_path / "node.key.lock"
-    seen = []
-    real_rename, real_unlink = os.rename, os.unlink
-
-    def probe(what):
-        fd = os.open(lock, os.O_RDWR)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            seen.append((what, "free"))
-        except BlockingIOError:
-            seen.append((what, "held"))
-        finally:
-            os.close(fd)
-
-    def rename(a, b):
-        probe("rename")
-        real_rename(a, b)
-
-    def unlink(p):
-        if os.fspath(p) == os.fspath(lock):
-            probe("unlink")
-        real_unlink(p)
-
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-    monkeypatch.setattr(protocol.os, "rename", rename)
-    monkeypatch.setattr(protocol.os, "unlink", unlink)
-    NodeKey.load_or_create(tmp_path / "node.key")
-    assert seen == [("rename", "held"), ("unlink", "held")]
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["node.key"]
-
-
-def test_no_link_lock_fd_closed_when_flock_fails(tmp_path, monkeypatch):
-    monkeypatch.setattr(protocol.os, "link", _no_link)
-
-    def broken(fd, op):
-        raise OSError(errno.ENOLCK, "no locks")
-
-    before = set(os.listdir("/proc/self/fd"))
-    monkeypatch.setattr(protocol.fcntl, "flock", broken)
-    with pytest.raises(OSError, match="no locks"):
+    with pytest.raises(RuntimeError, match="must be on a filesystem that supports hard links"):
         NodeKey.load_or_create(tmp_path / "node.key")
-    monkeypatch.undo()
-    assert set(os.listdir("/proc/self/fd")) <= before
-    assert list(tmp_path.iterdir()) == []  # no lock file left behind
+    assert list(tmp_path.iterdir()) == []  # no temp file, no key
 
 
 def test_other_link_errors_are_raised(tmp_path, monkeypatch):

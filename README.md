@@ -24,6 +24,10 @@ plan for this stage is in `docs/superpowers/plans/`.
 Python 3.13, [uv](https://docs.astral.sh/uv/), Docker or Podman with compose
 for Postgres.
 
+`data_dir` must be on a local filesystem with hard links (ext4, xfs and btrfs
+all qualify): the node key is published atomically with a hard link, and
+hakapik stops with a clear error where that is not supported.
+
 ## Quick start
 
 ```sh

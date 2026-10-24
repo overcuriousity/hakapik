@@ -110,7 +110,7 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
     and closed here, as is the ASN database.
     """
     bs = BlobStore(cfg.data_dir / "blobs")
-    # In a thread: creating the key may wait for another process (protocol.py).
+    # In a thread: creating the key writes and fsyncs files (blocking I/O).
     key = await asyncio.to_thread(NodeKey.load_or_create, cfg.data_dir / "node.key")
     conn = await connect(cfg.database_url)
     try:

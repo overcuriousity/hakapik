@@ -7,16 +7,13 @@ node key file.
 
 import base64
 import binascii
-import contextlib
 import dataclasses
 import errno
-import fcntl
 import hashlib
 import json
 import logging
 import os
 import tempfile
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -186,10 +183,9 @@ class NodeKey:
         return self._sk.sign(data)
 
 
-KEY_LOCK_WAIT_S = 5.0  # how long to wait for another process creating the key
-# link() errors meaning "no hard link here": not permitted, not supported, not
-# implemented, or too many links. (EXDEV cannot occur: the temporary file is
-# in the key's own directory.)
+# link() errors meaning "no hard links on this filesystem": not permitted,
+# not supported, not implemented, or too many links. (EXDEV cannot occur: the
+# temporary file is in the key's own directory.)
 _NO_LINK_ERRNOS = (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS,
                    errno.EMLINK)
 
@@ -197,9 +193,10 @@ _NO_LINK_ERRNOS = (errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS,
 def _create_key(path: Path, seed: bytes) -> None:
     """Write a new key file 0o600; never overwrite one another process wrote first.
 
-    The key is written and fsynced under a temporary name, then published
-    whole, then the directory is fsynced: no reader or crash ever sees a
-    short key under the final name.
+    The key is written and fsynced under a temporary name, published whole by
+    link(), then the directory is fsynced: no reader or crash ever sees a
+    short key under the final name. The data directory must support hard
+    links (README, Requirements).
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     # mkstemp creates the file 0o600; link() publishes it atomically and
@@ -213,98 +210,20 @@ def _create_key(path: Path, seed: bytes) -> None:
         try:
             os.link(tmp, path)
         except FileExistsError:
-            return
+            return  # another process published its key first; that one is used
         except OSError as e:
-            if e.errno not in _NO_LINK_ERRNOS:
-                raise
-            # No hard links on this filesystem. rename() would overwrite, so
-            # an exclusively created lock file decides who renames.
-            if not _rename_under_lock(tmp, path):
-                return
+            if e.errno in _NO_LINK_ERRNOS:
+                raise RuntimeError(
+                    f"data_dir {path.parent} must be on a filesystem that supports "
+                    "hard links (needed to publish the node key atomically)") from e
+            raise
     finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(tmp)
+        os.unlink(tmp)
     dfd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(dfd)
     finally:
         os.close(dfd)
-
-
-def _rename_under_lock(tmp: str, path: Path, *, retried: bool = False) -> bool:
-    """Rename ``tmp`` to ``path`` unless another process creates it; True if renamed.
-
-    The creator of ``<key>.lock`` (O_EXCL) holds an flock on it from creation
-    until after it has removed it. The kernel drops an flock when its holder
-    dies, so a waiter whose wait expires and gets the flock knows the creator
-    is gone (in any PID namespace): it removes the lock under that flock and
-    tries once more.
-    """
-    lock = path.with_name(path.name + ".lock")
-    try:
-        lfd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return _wait_for_key(tmp, path, lock, retried)
-    try:
-        try:
-            fcntl.flock(lfd, fcntl.LOCK_EX)
-        except BaseException:
-            os.unlink(lock)  # never leave a lock file nobody holds
-            raise
-        if os.fstat(lfd).st_ino != _inode(lock):
-            # A waiter took this lock for dead before the flock was taken (the
-            # creator stalled for KEY_LOCK_WAIT_S): the waiter creates the key.
-            return _wait_for_key(tmp, path, lock, retried=True)
-        try:
-            if path.exists():
-                return False
-            os.rename(tmp, path)
-            return True
-        finally:
-            os.unlink(lock)  # still under the flock
-    finally:
-        os.close(lfd)
-
-
-def _inode(p: Path) -> int | None:
-    try:
-        return os.stat(p).st_ino
-    except FileNotFoundError:
-        return None
-
-
-def _wait_for_key(tmp: str, path: Path, lock: Path, retried: bool) -> bool:
-    """Wait for another creator's key; take over its lock once if it died."""
-    deadline = time.monotonic() + KEY_LOCK_WAIT_S
-    while not path.exists():
-        if time.monotonic() > deadline:
-            if not retried and _remove_dead_lock(lock):
-                log.warning("removed %s left by a process that is gone", lock)
-                return _rename_under_lock(tmp, path, retried=True)
-            raise RuntimeError(
-                f"node key {path} not created while {lock} exists and is held; "
-                "another hakapik process is still creating it"
-            )
-        time.sleep(0.05)
-    return False
-
-
-def _remove_dead_lock(lock: Path) -> bool:
-    """Remove ``lock`` if no live process holds its flock; True if removed (or gone)."""
-    try:
-        fd = os.open(lock, os.O_RDWR)
-    except FileNotFoundError:
-        return True
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return False  # its creator is alive
-        if os.fstat(fd).st_ino == _inode(lock):  # not replaced since we opened it
-            os.unlink(lock)
-        return True
-    finally:
-        os.close(fd)
 
 
 def seal(r: AttemptResult, key: NodeKey) -> bytes:
