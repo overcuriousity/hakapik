@@ -450,7 +450,15 @@ async def tail_log(
             async with _borrow(db) as conn:
                 cursor = await get_cursor(conn, src.info.log_id)
                 await conn.rollback()
-            size = await src.tree_size() if cursor is not None else 0
+            size = 0
+            if cursor is not None:
+                # Stop-aware like a batch: retry_get can wait minutes on 429/5xx.
+                # (The first batch asks for the tree size again; sharing it
+                # would change _tail_once's signature for one request.)
+                probe = asyncio.create_task(src.tree_size())
+                if not await _finish_or_stop(probe, stop):
+                    return
+                size = probe.result()
         except Exception as e:
             failures.warn("readonly check", e, IDLE_SLEEP_S)
             await _sleep_or_stop(stop, IDLE_SLEEP_S)

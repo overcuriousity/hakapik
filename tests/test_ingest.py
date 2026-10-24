@@ -677,3 +677,45 @@ async def test_readonly_log_cursor_at_or_beyond_size_returns_at_once(
     assert src.calls == []
     assert "caught up (readonly)" in caplog.text
     assert await get_cursor(conn, READONLY_INFO.log_id) == cursor
+
+
+async def test_readonly_startup_tree_size_obeys_stop(ix, sup, bs, cfg, conn, monkeypatch):
+    monkeypatch.setattr(ingest, "STOP_GRACE_S", 0.05)
+
+    class Hanging(FakeSource):
+        async def tree_size(self):
+            await asyncio.Event().wait()
+
+    await cursor_at(conn, READONLY_INFO.log_id, 1)
+    stop = asyncio.Event()
+    task = asyncio.create_task(
+        tail_log(Hanging([b"x"] * 4, READONLY_INFO), cfg, ix, sup, bs, conn, stop)
+    )
+    await asyncio.sleep(0.1)
+    assert not task.done()
+    stop.set()
+    await asyncio.wait_for(task, 1)
+
+
+async def test_readonly_startup_failure_warns_retries_then_follows(
+    ix, sup, bs, cfg, conn, monkeypatch, caplog
+):
+    monkeypatch.setattr(ingest, "IDLE_SLEEP_S", 0.01)
+
+    class FlakyOnce(FakeSource):
+        failed = False
+
+        async def tree_size(self):
+            if not FlakyOnce.failed:
+                FlakyOnce.failed = True
+                raise httpx.ConnectError("down")
+            return await super().tree_size()
+
+    src = FlakyOnce([b"x"] * 4, READONLY_INFO)
+    await cursor_at(conn, READONLY_INFO.log_id, 1)
+    with caplog.at_level("INFO"):
+        await asyncio.wait_for(tail_log(src, cfg, ix, sup, bs, conn, asyncio.Event()), 5)
+    warns = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warns) == 1 and "readonly check failed" in warns[0].getMessage()
+    assert "following until caught up (readonly, 3 entries left)" in caplog.text
+    assert await get_cursor(conn, READONLY_INFO.log_id) == 4
