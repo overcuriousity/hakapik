@@ -35,12 +35,30 @@ uv run hakapik --config hakapik.toml tail     # follow all logs live
 uv run hakapik --config hakapik.toml stats    # per-log, per-day volumes
 uv run hakapik --config hakapik.toml sample --n 200 --out candidates.csv
 uv run hakapik --config hakapik.toml prune    # apply raw-entry retention
+
+uv run playwright install chromium --no-shell # once, for fetch
+uv run hakapik --config hakapik.toml enqueue example.com   # or --file names.txt
+uv run hakapik --config hakapik.toml fetch    # --once for a single pass
+uv run hakapik --config hakapik.toml show example.com
 ```
 
 There is no history backfill. `tail` starts each log it has not seen before
 at the log's current tree size and emits candidates from its first batch on;
 the first-seen index fills from the live stream, so early candidates include
 names that are not actually new, and that share falls as the index grows.
+
+`enqueue` queues names by hand (one name per line with `--file`, `#` starts a
+comment) and prints `name`, a tab and the outcome: `queued`, `already_open`,
+`invalid` or `wildcard`. `fetch` resolves and fetches the queued names with a
+browser; `show` prints a name's candidates, jobs, attempts and latest manifest.
+No running `tail` is needed.
+
+`fetch` contacts sites from this machine's own address, or through
+`fetch_proxy` if that is set. Rate limits (`fetch_per_ip_interval_s`,
+`fetch_daily_cap`) are off unless configured.
+
+For ASN enrichment, set `asn_mmdb` to a GeoLite2-ASN file (this needs a
+MaxMind account); refresh it by replacing the file. Without it, ASNs are null.
 
 ## Tests
 
@@ -53,5 +71,5 @@ Database tests need a Postgres database whose name ends in `_test`; see
 
 ## Status
 
-Ingest and first-seen are implemented and reviewed. Next: resolve and fetch.
+Ingest and first-seen, and resolve and fetch, are implemented.
 No measuring run gates the later stages; their sizes are configuration.

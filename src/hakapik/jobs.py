@@ -153,3 +153,43 @@ async def enqueue_manual(
             continue
         out.append((name, "queued"))
     return out
+
+
+async def show_fqdn(conn: psycopg.AsyncConnection, fqdn: str) -> list[dict]:
+    """Read-only history of an FQDN: candidates with jobs, attempts, latest manifest."""
+    cur = await conn.execute(
+        "SELECT id, reason, created_at FROM candidate WHERE fqdn = %s ORDER BY id",
+        (fqdn,),
+    )
+    out = []
+    for cid, reason, created_at in await cur.fetchall():
+        cur = await conn.execute(
+            """SELECT id, state, step, due_at FROM fetch_job
+               WHERE candidate_id = %s ORDER BY id""",
+            (cid,),
+        )
+        jobs = []
+        for jid, state, step, due_at in await cur.fetchall():
+            cur = await conn.execute(
+                """SELECT step, started_at, outcome, http_status, final_url,
+                          asn, asn_org
+                   FROM attempt WHERE job_id = %s ORDER BY step""",
+                (jid,),
+            )
+            attempts = [
+                dict(zip(("step", "started_at", "outcome", "http_status",
+                          "final_url", "asn", "asn_org"), r))
+                for r in await cur.fetchall()
+            ]
+            jobs.append({"state": state, "step": step, "due_at": due_at,
+                         "attempts": attempts})
+        cur = await conn.execute(
+            """SELECT version, sha256 FROM manifest
+               WHERE candidate_id = %s ORDER BY version DESC LIMIT 1""",
+            (cid,),
+        )
+        m = await cur.fetchone()
+        out.append({"id": cid, "reason": reason, "created_at": created_at,
+                    "jobs": jobs,
+                    "manifest": {"version": m[0], "sha256": m[1]} if m else None})
+    return out

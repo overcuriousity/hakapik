@@ -9,3 +9,6 @@ and run, for example,
 `HAKAPIK_TEST_DB=postgresql://hakapik:hakapik@172.20.0.2:5432/hakapik_test uv run pytest -v -W error`
 (172.20.0.2 is the compose container's IP; use `127.0.0.1` where the port
 forward works).
+
+The browser tests need the Chromium install
+(`uv run playwright install chromium --no-shell`) and are skipped without it.
