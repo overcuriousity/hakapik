@@ -130,20 +130,22 @@ _SCHEMA = [
 # (index name, DDL). CREATE INDEX IF NOT EXISTS takes a SHARE lock on the table
 # even when the index exists, which conflicts with writers, and migrate() runs
 # on every command start; so each runs only while pg_indexes lacks the index.
+# The statements still say IF NOT EXISTS: two first starts can both see the
+# index missing, and the loser must not fail.
 _INDEXES = [
     ("candidate_log_index",
-     "CREATE INDEX candidate_log_index ON candidate (log_id, log_index)"),
+     "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)"),
     ("raw_batch_created_at",
-     "CREATE INDEX raw_batch_created_at ON raw_batch (created_at)"),
+     "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)"),
     ("raw_batch_blob_sha256",
-     "CREATE INDEX raw_batch_blob_sha256 ON raw_batch (blob_sha256)"),
-    ("candidate_fqdn", "CREATE INDEX candidate_fqdn ON candidate (fqdn)"),
+     "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)"),
+    ("candidate_fqdn", "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)"),
     ("fetch_job_open_fqdn",
-     "CREATE UNIQUE INDEX fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'"),
+     "CREATE UNIQUE INDEX IF NOT EXISTS fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'"),
     ("fetch_job_due",
-     "CREATE INDEX fetch_job_due ON fetch_job (priority DESC, due_at DESC) "
+     "CREATE INDEX IF NOT EXISTS fetch_job_due ON fetch_job (priority DESC, due_at DESC) "
      "WHERE state = 'open'"),
-    ("fetch_job_fqdn", "CREATE INDEX fetch_job_fqdn ON fetch_job (fqdn)"),
+    ("fetch_job_fqdn", "CREATE INDEX IF NOT EXISTS fetch_job_fqdn ON fetch_job (fqdn)"),
 ]
 
 # Changes to tables that may predate stage two, as (table, column, change, DDL).

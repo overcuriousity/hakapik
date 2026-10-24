@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -73,8 +74,8 @@ def _validate_types(raw: dict) -> None:
             kind, low = "a list of integers", None
         else:
             continue
-        if not ok:
-            raise ValueError(f"{key} must be {kind}")
+        if not ok or (key in _FLOAT_MIN and not math.isfinite(value)):
+            raise ValueError(f"{key} must be {kind}" + (" (finite)" if ok else ""))
         if low is not None and value < low:
             raise ValueError(f"{key} must be at least {low}")
 

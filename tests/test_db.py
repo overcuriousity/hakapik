@@ -247,3 +247,13 @@ async def test_add_candidates_empty_list(conn):
     await add_candidates(conn, [])
     assert await _count(conn, "candidate") == 0
     assert await _count(conn, "fetch_job") == 0
+
+
+async def test_index_statements_survive_losing_the_creation_race(conn):
+    # Two first starts can both see an index missing; the loser then runs the
+    # CREATE for an index that exists. Every statement must tolerate that.
+    from hakapik.db import _INDEXES
+
+    for name, stmt in _INDEXES:
+        assert "IF NOT EXISTS" in stmt, name
+        await conn.execute(stmt)

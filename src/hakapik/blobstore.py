@@ -6,12 +6,14 @@ clarity but is not recorded here; callers record it in Postgres.
 """
 
 import hashlib
+import logging
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import BinaryIO
 
+_log = logging.getLogger(__name__)
 _HEX64 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -40,11 +42,16 @@ class BlobStore:
         """Store ``data`` and return its hex SHA-256. ``media_type`` is ignored."""
         digest = hashlib.sha256(data).hexdigest()
         dest = self.path(digest)
-        if dest.exists():
+        try:
             # Content-addressed, so the bytes are right; the mode is not
             # guaranteed if someone touched the file.
             if (dest.stat().st_mode & 0o777) != 0o444:
                 os.chmod(dest, 0o444)
+            return digest
+        except FileNotFoundError:
+            pass  # absent, or pruned meanwhile: write it
+        except PermissionError:
+            _log.warning("blob %s exists but its mode cannot be fixed; keeping it", digest)
             return digest
         dest.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".tmp-")

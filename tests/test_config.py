@@ -136,3 +136,10 @@ def test_valid_custom_ladder_and_numbers(tmp_path):
     cfg = _load(tmp_path, "retry_ladder_s = [0, 30]\nfetch_per_ip_interval_s = 2\nqueue_cap = 0\n")
     assert cfg.retry_ladder_s == (0, 30)
     assert cfg.fetch_per_ip_interval_s == 2 and cfg.queue_cap == 0
+
+
+@pytest.mark.parametrize("key", ["fetch_per_ip_interval_s", "ageout_hours", "nav_timeout_s"])
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_non_finite_floats_rejected(tmp_path, key, bad):
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, f"{key} = {bad}\n")

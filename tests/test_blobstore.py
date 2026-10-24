@@ -54,3 +54,40 @@ def test_blobstore_put_restores_mode_of_existing_blob(tmp_path):
     bs.path(h).chmod(0o666)
     assert bs.put(b"abc", "x") == h
     assert (bs.path(h).stat().st_mode & 0o777) == 0o444
+
+
+def test_blobstore_put_rewrites_a_blob_pruned_between_check_and_stat(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"abc", "x")
+    real = Path.stat
+    calls = []
+
+    def stat(self, *a, **kw):
+        if self == bs.path(h) and not calls:
+            calls.append(1)
+            self.chmod(0o644)
+            self.unlink()  # pruned after exists() said yes
+            raise FileNotFoundError(str(self))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    assert bs.put(b"abc", "x") == h
+    assert calls and bs.path(h).read_bytes() == b"abc"
+
+
+def test_blobstore_put_tolerates_unfixable_mode_of_existing_blob(tmp_path, monkeypatch, caplog):
+    import os
+
+    bs = BlobStore(tmp_path)
+    h = bs.put(b"abc", "x")
+    bs.path(h).chmod(0o666)
+
+    def deny(path, mode):
+        raise PermissionError("not owner")
+
+    monkeypatch.setattr(os, "chmod", deny)
+    with caplog.at_level("WARNING", logger="hakapik.blobstore"):
+        assert bs.put(b"abc", "x") == h
+    assert any(h in r.getMessage() for r in caplog.records)
