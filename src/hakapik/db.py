@@ -6,7 +6,7 @@ No function here commits; the caller owns the transaction.
 import logging
 import os
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 import psycopg
 from psycopg.rows import dict_row
@@ -381,14 +381,33 @@ async def sample_candidates(conn: psycopg.AsyncConnection, n: int) -> list[dict]
         return await cur.fetchall()
 
 
+async def lock_blob(conn: psycopg.AsyncConnection, sha256: str) -> None:
+    """Take a transaction-level advisory lock on a blob digest.
+
+    Held until commit or rollback. ``prune_raw`` takes it before deciding to
+    unlink a blob; ingest takes it before writing a raw blob and keeps it
+    until the row referencing that blob commits. So prune never unlinks a
+    blob that a concurrent batch has just found existing and is about to
+    reference (identical bytes, e.g. a re-read range). Distinct digests may
+    share a lock key; that only makes one wait for the other.
+    """
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (sha256,))
+
+
 async def prune_raw(
-    conn: psycopg.AsyncConnection, bs: BlobStore, older_than: date
+    conn: psycopg.AsyncConnection, bs: BlobStore, older_than: datetime
 ) -> int:
-    """Delete raw batches older than ``older_than`` that hold no candidate.
+    """Delete raw batches created before ``older_than`` that hold no candidate.
+
+    ``older_than`` is an aware timestamp, compared with ``created_at`` as is
+    (a date would be cast to midnight in the session's time zone).
 
     A batch is kept if any candidate on the same log has a log_index inside
     its [start_index, end_index]. Blob files are unlinked unless another
-    remaining batch still references the same (content-addressed) blob.
+    remaining batch still references the same (content-addressed) blob; each
+    check and unlink runs under ``lock_blob``. A blob that cannot be unlinked
+    (other than already gone) is logged and skipped: its row is deleted, so
+    later prunes do not retry it.
 
     This is the one db function that commits: file deletion must follow a
     durable delete, so the DELETE is committed before any blob is unlinked.
@@ -407,20 +426,26 @@ async def prune_raw(
     shas = {r[0] for r in await cur.fetchall()}
     count = cur.rowcount
     await conn.commit()
-    for sha in shas:
-        cur = await conn.execute(
-            "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)
-        )
-        if await cur.fetchone():
-            continue
+    for sha in sorted(shas):
         try:
             path = bs.path(sha)
         except ValueError:
             _log.warning("raw_batch row holds an invalid blob digest %r; not unlinking", sha)
             continue
         try:
-            os.chmod(path, 0o644)
-            path.unlink()
-        except FileNotFoundError:
-            pass
+            await lock_blob(conn, sha)
+            cur = await conn.execute(
+                "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)
+            )
+            if await cur.fetchone():
+                continue
+            try:
+                os.chmod(path, 0o644)
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink blob %s: %r; left in place", sha, e)
+        finally:
+            await conn.rollback()  # ends the read and releases the lock
     return count

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
 import struct
@@ -69,6 +70,7 @@ from hakapik.db import (
     connect,
     get_cursor,
     init_cursor,
+    lock_blob,
     migrate,
 )
 from hakapik.dedup import cert_key
@@ -301,7 +303,11 @@ async def _process_batch(
                 )
                 batch.candidates_recheck += 1
         last = entries[-1][0]
-        blob = bs.put(pack_entries(entries), RAW_MEDIA_TYPE)
+        data = pack_entries(entries)
+        # Held until the commit: prune cannot unlink this blob between put()
+        # (which keeps an existing file) and the commit referencing it.
+        await lock_blob(conn, hashlib.sha256(data).hexdigest())
+        blob = bs.put(data, RAW_MEDIA_TYPE)
         await add_raw_batch(conn, log_id, start, last, blob, len(entries), batch.bytes)
         await add_candidates(conn, rows)
         day = datetime.now(timezone.utc).date()

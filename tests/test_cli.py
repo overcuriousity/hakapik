@@ -2,13 +2,22 @@ import asyncio
 import csv
 import os
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
 from hakapik import cli
 from hakapik.blobstore import BlobStore
 from hakapik.cli import main
-from hakapik.db import CandidateRow, add_candidates, add_raw_batch, bump_stat, prune_raw
+from hakapik.db import (
+    CandidateRow,
+    add_candidates,
+    add_raw_batch,
+    bump_stat,
+    connect,
+    lock_blob,
+    prune_raw,
+)
 
 needs_db = pytest.mark.skipif(
     not os.getenv("HAKAPIK_TEST_DB"), reason="needs postgres"
@@ -69,12 +78,14 @@ async def test_sample_writes_csv(tmp_path, conn, cfg_path):
     }
 
 
-async def _batch(conn, bs, log_id, start, end, data, age_days):
+async def _batch(conn, bs, log_id, start, end, data, age_days, age_hours=0):
     sha = bs.put(data, "application/octet-stream")
     await add_raw_batch(conn, log_id, start, end, sha, end - start + 1, len(data))
-    ts = datetime.now(timezone.utc) - timedelta(days=age_days)
+    ts = datetime.now(timezone.utc) - timedelta(days=age_days, hours=age_hours)
     await conn.execute(
-        "UPDATE raw_batch SET created_at = %s WHERE blob_sha256 = %s", (ts, sha)
+        """UPDATE raw_batch SET created_at = %s
+           WHERE blob_sha256 = %s AND log_id = %s AND start_index = %s""",
+        (ts, sha, log_id, start),
     )
     return sha
 
@@ -145,7 +156,7 @@ async def test_prune_commit_failure_keeps_blob_and_row(tmp_path, conn, monkeypat
         raise RuntimeError("commit failed")
 
     monkeypatch.setattr(conn, "commit", boom)
-    cutoff = date.today() - timedelta(days=7)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     with pytest.raises(RuntimeError, match="commit failed"):
         await prune_raw(conn, bs, cutoff)
     monkeypatch.undo()
@@ -164,7 +175,7 @@ async def test_prune_skips_invalid_digest(tmp_path, conn):
         "UPDATE raw_batch SET created_at = now() - interval '30 days' WHERE start_index = 10"
     )
     await conn.commit()
-    assert await prune_raw(conn, bs, date.today() - timedelta(days=7)) == 2
+    assert await prune_raw(conn, bs, datetime.now(timezone.utc) - timedelta(days=7)) == 2
     assert not bs.path(good).exists()
 
 
@@ -180,3 +191,96 @@ def test_second_interrupt_exits_130_without_traceback(tmp_path, capsys, monkeypa
     monkeypatch.setattr(cli, "_cmd_tail", interrupted)
     assert main(["--config", str(cfg), "tail"]) == 130
     assert capsys.readouterr().err.strip().endswith("hakapik: interrupted")
+
+
+def _cutoff(days=7):
+    return datetime.now(timezone.utc) - timedelta(days=days)
+
+
+@needs_db
+async def test_prune_cutoff_is_a_timestamp_not_a_date(tmp_path, conn, cfg_path):
+    # retention 7 days: an hour short of it is kept, an hour past it pruned,
+    # whatever the time of day (a date cutoff would be off by up to a day).
+    bs = BlobStore(tmp_path / "data" / "blobs")
+    young = await _batch(conn, bs, "L", 0, 9, b"young", 7, age_hours=-1)
+    old = await _batch(conn, bs, "L", 10, 19, b"old", 7, age_hours=1)
+    await conn.commit()
+    assert await run_main(["--config", cfg_path, "prune"]) == 0
+    assert bs.path(young).exists() and not bs.path(old).exists()
+
+
+@needs_db
+async def test_prune_keeps_a_blob_shared_with_a_remaining_batch(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    old = await _batch(conn, bs, "L", 0, 9, b"same", 30)
+    again = await _batch(conn, bs, "L", 20, 29, b"same", 1)  # same bytes, fresh
+    assert old == again
+    await conn.commit()
+    assert await prune_raw(conn, bs, _cutoff()) == 1
+    assert bs.path(old).exists()
+
+
+@needs_db
+async def test_prune_tolerates_a_blob_file_already_gone(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    gone = await _batch(conn, bs, "L", 0, 9, b"gone", 30)
+    other = await _batch(conn, bs, "L", 10, 19, b"other", 30)
+    await conn.commit()
+    os.chmod(bs.path(gone), 0o644)
+    bs.path(gone).unlink()
+    assert await prune_raw(conn, bs, _cutoff()) == 2
+    assert not bs.path(other).exists()
+
+
+@needs_db
+async def test_prune_keeps_batch_with_candidate_at_start_index(tmp_path, conn):
+    bs = BlobStore(tmp_path / "blobs")
+    kept = await _batch(conn, bs, "L", 10, 19, b"keep", 30)
+    await add_candidates(conn, [_cand(10, "L")])
+    await conn.commit()
+    assert await prune_raw(conn, bs, _cutoff()) == 0
+    assert bs.path(kept).exists()
+
+
+@needs_db
+async def test_prune_unlink_error_is_logged_and_the_rest_continue(
+    tmp_path, conn, monkeypatch, caplog
+):
+    bs = BlobStore(tmp_path / "blobs")
+    stuck = await _batch(conn, bs, "L", 0, 9, b"stuck", 30)
+    other = await _batch(conn, bs, "L", 10, 19, b"other", 30)
+    await conn.commit()
+    real_unlink = Path.unlink
+
+    def unlink(self, *a, **kw):
+        if self.name == stuck:
+            raise PermissionError("read-only filesystem")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    with caplog.at_level("WARNING"):
+        assert await prune_raw(conn, bs, _cutoff()) == 2
+    assert f"cannot unlink blob {stuck}" in caplog.text
+    assert bs.path(stuck).exists() and not bs.path(other).exists()
+
+
+@needs_db
+async def test_prune_waits_for_a_batch_about_to_reference_the_blob(tmp_path, conn):
+    # Ingest found the blob existing (put() kept it) and holds lock_blob until
+    # its row commits; prune must not unlink the blob in between.
+    bs = BlobStore(tmp_path / "blobs")
+    sha = await _batch(conn, bs, "L", 0, 9, b"same", 30)
+    await conn.commit()
+    ingest_conn = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        await lock_blob(ingest_conn, sha)
+        assert bs.put(b"same", "application/octet-stream") == sha
+        await add_raw_batch(ingest_conn, "L", 0, 9, sha, 10, 4)
+        prune = asyncio.create_task(prune_raw(conn, bs, _cutoff()))
+        await asyncio.sleep(0.2)
+        assert not prune.done()  # deleted the old row, now waits on the lock
+        await ingest_conn.commit()
+        assert await prune == 1
+    finally:
+        await ingest_conn.close()
+    assert bs.path(sha).exists()

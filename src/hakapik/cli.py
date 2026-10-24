@@ -35,6 +35,11 @@ SAMPLE_COLUMNS = (
 async def _with_conn(cfg: Config, fn, commit: bool = True):
     conn = await connect(cfg.database_url)
     try:
+        # Every command migrates, the read-only ones (stats, sample, show)
+        # too: on a fresh or older database they then see the current schema
+        # instead of failing. Once the schema is current, migrate changes
+        # nothing and takes no lock that conflicts with a writer (db.migrate's
+        # checks), so it does not block a running tail or fetch.
         await migrate(conn)
         result = await fn(conn)
         if commit:
@@ -78,9 +83,7 @@ def _cmd_sample(cfg: Config, args) -> int:
 
 
 def _cmd_prune(cfg: Config, args) -> int:
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
-    ).date()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
     bs = BlobStore(cfg.data_dir / "blobs")
     n = asyncio.run(_with_conn(cfg, lambda c: prune_raw(c, bs, cutoff), commit=False))
     print(n)

@@ -860,3 +860,26 @@ async def test_pool_close_closes_every_idle_connection_despite_errors():
     pool._idle = [good, bad]  # close() pops bad first
     await pool.close()
     assert bad.closed and good.closed and pool._idle == []
+
+
+async def test_batch_locks_its_blob_before_writing_it(fake, ix, sup, tmp_path, conn, monkeypatch):
+    # The lock (held to the commit) keeps prune from unlinking the blob
+    # between put() and the commit of the row referencing it.
+    order = []
+    real_lock = ingest.lock_blob
+
+    async def lock(c, sha):
+        order.append(("lock", sha))
+        await real_lock(c, sha)
+
+    class Recording(BlobStore):
+        def put(self, data, media_type):
+            sha = super().put(data, media_type)
+            order.append(("put", sha))
+            return sha
+
+    monkeypatch.setattr(ingest, "lock_blob", lock)
+    await process_batch(
+        fake, 0, 1, ix=ix, sup=sup, bs=Recording(tmp_path / "b"), conn=conn, stats=StatCounter()
+    )
+    assert [o[0] for o in order] == ["lock", "put"] and order[0][1] == order[1][1]
