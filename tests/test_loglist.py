@@ -4,7 +4,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from hakapik.ct.loglist import LogInfo, fetch_log_lists, parse_log_list
+from hakapik.ct.loglist import LogInfo, fetch_log_lists, parse_log_list, retired_ids
 
 FIXTURES = Path(__file__).parent / "fixtures"
 V3_URL = "https://example.test/v3/log_list.json"
@@ -31,7 +31,7 @@ def test_parse_marks_tiled_logs(v3_fixture):
     assert classic and all(l.monitoring_url is None for l in classic)
 
 
-def test_parse_drops_retired_and_pending(v3_fixture):
+def test_parse_drops_retired(v3_fixture):
     logs = parse_log_list(v3_fixture)
     assert all(l.state in ALLOWED for l in logs)
     assert {l.state for l in logs} == {"usable", "qualified"}
@@ -56,8 +56,65 @@ async def test_fetch_merges_and_dedups(respx_mock, v3_fixture, apple_fixture):
     v3_ids = {l.log_id for l in parse_log_list(v3_fixture)}
     apple_ids = {l.log_id for l in parse_log_list(apple_fixture)}
     assert v3_ids & apple_ids
-    assert set(ids) == v3_ids | apple_ids
+    # The fixture's rKswcGzr is retired in v3 but readonly in Apple's list:
+    # retired in any list means it is not tailed.
+    retired = retired_ids(v3_fixture) | retired_ids(apple_fixture)
+    assert retired & apple_ids
+    assert set(ids) == (v3_ids | apple_ids) - retired
     assert len(ids) < len(v3_ids) + len(apple_ids)
+
+
+def _list(*logs):
+    return {"operators": [{"name": "Op", "logs": list(logs)}]}
+
+
+def _log(log_id, state, url="https://x/"):
+    return {"log_id": log_id, "description": log_id, "url": url, "state": state}
+
+
+async def test_fetch_retired_in_later_list_drops_log(respx_mock):
+    respx_mock.get(V3_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("a", {"usable": {}}))))
+    respx_mock.get(APPLE_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("a", {"retired": {}}), _log("b", {"usable": {}}))))
+    async with httpx.AsyncClient() as client:
+        logs = await fetch_log_lists([V3_URL, APPLE_URL], client)
+    assert [l.log_id for l in logs] == ["b"]
+
+
+async def test_fetch_dedup_first_list_wins(respx_mock):
+    respx_mock.get(V3_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("a", {"usable": {}}, url="https://first/"))))
+    respx_mock.get(APPLE_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("a", {"readonly": {}}, url="https://second/"))))
+    async with httpx.AsyncClient() as client:
+        logs = await fetch_log_lists([V3_URL, APPLE_URL], client)
+    assert [(l.url, l.state) for l in logs] == [("https://first/", "usable")]
+
+
+async def test_fetch_survives_one_failing_list(respx_mock, caplog):
+    respx_mock.get(V3_URL).mock(return_value=httpx.Response(503))
+    respx_mock.get(APPLE_URL).mock(return_value=httpx.Response(
+        200, json=_list(_log("b", {"usable": {}}))))
+    async with httpx.AsyncClient() as client:
+        logs = await fetch_log_lists([V3_URL, APPLE_URL], client)
+    assert [l.log_id for l in logs] == ["b"]
+    assert V3_URL in caplog.text
+
+
+async def test_fetch_raises_when_every_list_fails(respx_mock):
+    respx_mock.get(V3_URL).mock(return_value=httpx.Response(503))
+    respx_mock.get(APPLE_URL).mock(side_effect=httpx.ConnectError("down"))
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(httpx.ConnectError):
+            await fetch_log_lists([V3_URL, APPLE_URL], client)
+
+
+def test_parse_skips_malformed_entry(caplog):
+    broken = {"log_id": "bad", "url": "https://x/", "state": {"usable": {}}}  # no description
+    data = _list(broken, _log("ok", {"usable": {}}))
+    assert [l.log_id for l in parse_log_list(data)] == ["ok"]
+    assert "bad" in caplog.text
 
 
 def test_parse_drops_pending_and_rejected():
