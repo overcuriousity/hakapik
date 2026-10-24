@@ -6,7 +6,8 @@ import pytest
 from hakapik.ct.leaf import ParsedLeaf, parse_tile_leaf
 from hakapik.ct.loglist import LogInfo
 from hakapik.ct.rfc6962 import Rfc6962Log
-from hakapik.ct.source import base_url, make_source
+from hakapik.ct._url import base_url
+from hakapik.ct.source import make_source
 from hakapik.ct.static_ct import StaticCtLog, parse_checkpoint, tile_path
 
 MON = "https://mon.example.test/tiled/"
@@ -29,8 +30,18 @@ def _leaf_slices() -> list[bytes]:
 
 
 def make_tile(width: int, base: int = 0) -> tuple[bytes, list[bytes]]:
+    """A tile of `width` distinct leaves.
+
+    The fixture holds only a few real leaves, so they would repeat with a short
+    period and a wrongly sliced result could still compare equal. The 8-byte
+    timestamp at the start of each leaf is set to its global index, which keeps
+    every leaf unique and parseable.
+    """
     pool = _leaf_slices()
-    leaves = [pool[(base + i) % len(pool)] for i in range(width)]
+    leaves = [
+        (base + i).to_bytes(8, "big") + pool[(base + i) % len(pool)][8:]
+        for i in range(width)
+    ]
     return b"".join(leaves), leaves
 
 
@@ -106,6 +117,54 @@ async def test_truncated_tile_raises(respx_mock, tlog):
     respx_mock.get(MON + "tile/data/000").respond(content=t[:-5])
     with pytest.raises(RuntimeError, match="cannot delimit"):
         await tlog.entries(0, 255)
+
+
+async def test_truncated_tile_and_short_tile_raise_different_errors(respx_mock, tlog):
+    t, leaves = make_tile(256)
+    respx_mock.get(MON + "checkpoint").respond(text=checkpoint(256))
+    respx_mock.get(MON + "tile/data/000").respond(content=b"".join(leaves[:255]))
+    with pytest.raises(RuntimeError, match="holds 255 leaves, expected 256"):
+        await tlog.entries(0, 255)
+
+
+async def test_checkpoint_fetched_once_for_tree_size_and_entries(respx_mock, tlog):
+    t0, _ = make_tile(256)
+    cp = respx_mock.get(MON + "checkpoint").respond(text=checkpoint(300))
+    respx_mock.get(MON + "tile/data/000").respond(content=t0)
+    assert await tlog.tree_size() == 300
+    assert len(await tlog.entries(0, 255)) == 256
+    assert len(await tlog.entries(0, 10)) == 11
+    assert cp.call_count == 1
+    await tlog.tree_size()
+    assert cp.call_count == 2
+
+
+async def test_entries_without_prior_tree_size_fetches_checkpoint(respx_mock, tlog):
+    t, _ = make_tile(44)
+    cp = respx_mock.get(MON + "checkpoint").respond(text=checkpoint(44))
+    respx_mock.get(MON + "tile/data/000.p/44").respond(content=t)
+    assert len(await tlog.entries(0, 43)) == 44
+    assert cp.call_count == 1
+
+
+def test_tiled_log_without_monitoring_url_is_rejected():
+    with pytest.raises(ValueError, match="monitoring_url"):
+        StaticCtLog(_info(mon=None), httpx.AsyncClient())
+
+
+def test_make_source_unknown_kind_is_rejected():
+    with pytest.raises(ValueError, match="unknown log kind"):
+        make_source(_info("weird"), httpx.AsyncClient())
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["", "origin\n12\n", "origin\nabc\nAAAA\n", "origin\n-5\nAAAA\n",
+     "origin\n12\nnot base64!\n", "origin\n\u0663\nAAAA\n"],
+)
+def test_parse_checkpoint_rejects_malformed(text):
+    with pytest.raises(ValueError, match="checkpoint"):
+        parse_checkpoint(text)
 
 
 def test_make_source_dispatch():

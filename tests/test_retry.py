@@ -75,3 +75,16 @@ async def test_4xx_not_retried(respx_mock, delays):
         with pytest.raises(httpx.HTTPStatusError):
             await retry_get(c, URL)
     assert route.call_count == 1 and delays == []
+
+
+async def test_retry_after_ignores_non_ascii_digits(respx_mock, delays):
+    # b"\xb2" decodes to "\u00b2" (superscript two): str.isdigit() is true and
+    # float() would raise ValueError. It is no integer Retry-After, so the
+    # normal backoff applies.
+    respx_mock.get(URL).mock(
+        side_effect=[httpx.Response(429, headers={"Retry-After": b"\xb2"}),
+                     httpx.Response(200)]
+    )
+    async with httpx.AsyncClient() as c:
+        await retry_get(c, URL)
+    assert delays == [1]
