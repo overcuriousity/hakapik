@@ -175,6 +175,7 @@ class Browser:
         self._browser = None
         self._brands: list[dict] = []
         self._full_versions: list[dict] = []
+        self._late_closes: set[asyncio.Task] = set()
 
     async def __aenter__(self) -> "Browser":
         self._pw = await async_playwright().start()
@@ -377,14 +378,21 @@ class Browser:
             # playwright reports them only after the click.
             targets = await asyncio.wait_for(cdp.send("Target.getTargets"), left())
             before = {t["targetId"] for t in targets["targetInfos"]}
-            chain_before = len(nav.chain)
+            unanswered_before = set(nav.unanswered)
+            budget = left()
             try:
-                # Playwright's click waits for a navigation it starts to commit.
-                await asyncio.wait_for(element.click(timeout=left() * 1000), left())
-            except (PlaywrightError, TimeoutError) as e:
-                if len(nav.chain) == chain_before:
+                # Playwright's click waits, within its timeout, for a
+                # navigation it starts to commit; asyncio's bound is a margin
+                # behind it, so playwright's timeout (with its log) comes first.
+                await asyncio.wait_for(element.click(timeout=budget * 1000), budget + 0.5)
+            except PlaywrightTimeout as e:
+                # Hung only if the click went out (playwright logged it) and a
+                # navigation started since is still unanswered; a moving URL
+                # or a blocked click is a failed click.
+                if "click action done" not in e.message or not (
+                        nav.unanswered - unanswered_before):
                     raise
-                hung = True  # the click went out; its navigation never committed
+                hung = True
                 nav_error = _error_text(e)
             clicked = not hung
         except _ClickFailed as e:
@@ -436,6 +444,18 @@ class Browser:
             final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),
             error=error, started_at=_rfc3339(started), finished_at=_rfc3339(_now())))
 
+    def _close_late_context(self, create: asyncio.Future):
+        if create.cancelled() or create.exception() is not None:
+            return
+        task = asyncio.ensure_future(create.result().close())
+        self._late_closes.add(task)  # a reference until it is done
+
+        def done(t: asyncio.Task):
+            self._late_closes.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.warning("closing a late context failed: %s", t.exception())
+        task.add_done_callback(done)
+
     @staticmethod
     async def _end_hop(rec: Recorder, pages: list, tasks: list, deadline: float):
         """Close a hop's pages once its exchanges are in, as the final drain
@@ -463,8 +483,15 @@ class Browser:
             except TimeoutError:
                 raise TimeoutError("browser setup took over nav_timeout_s") from None
 
-        # Raises if the browser is wedged: there is no page yet to blame.
-        context = await setup(self._browser.new_context(**settings, accept_downloads=False))
+        # Raises if the browser is wedged: there is no page yet to blame. A
+        # context that arrives after that is closed then, not left open.
+        create = asyncio.ensure_future(
+            self._browser.new_context(**settings, accept_downloads=False))
+        try:
+            context = await setup(asyncio.shield(create))
+        except TimeoutError:
+            create.add_done_callback(self._close_late_context)
+            raise
         rec = Recorder()
         nav = Nav()  # replaced by the page's once it exists
         hint_tasks: list[asyncio.Task] = []  # prepare_page of pages the site opens

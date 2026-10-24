@@ -75,6 +75,11 @@ PAGES = {
     # opens a popup of its own on every visit; the login link opens another
     "/popup-own": (200, [], b'<html><body><script>window.open("/?own");</script>'
                             b'<a href="/login" target="_blank">Login</a></body></html>'),
+    # the login link is under an overlay; a timer keeps moving the URL
+    "/overlay-push": (200, [], b'<html><body><a href="/login">Sign in</a><div style="position:'
+                               b'fixed; inset: 0; background: #fff"></div><script>let i = 0;'
+                               b'setInterval(() => history.pushState({}, "", "/moved" + i++), 50);'
+                               b'</script></body></html>'),
     "/hang-login": (200, [], b'<html><body><a href="/hang">Sign in</a></body></html>'),
     # asks for high-entropy client hints; its login popup loads an image
     "/popup-hints": (200, [("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, "

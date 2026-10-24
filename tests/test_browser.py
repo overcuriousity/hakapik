@@ -293,6 +293,17 @@ async def test_hop_budget_bounds_a_hanging_click_target(site, browser):
 
 
 @session_loop
+async def test_a_blocked_click_is_an_error_even_if_the_url_moves(site):
+    # Nothing is clicked (an overlay takes the pointer) while the page's timer
+    # moves its URL: no navigation of the click hangs, so no timeout.
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        c = await b.capture(site.url("/overlay-push"), "desktop", click_through=True)
+    click = c.clicks[0]
+    assert click.page.outcome == "error" and click.page.error.startswith("click failed: ")
+    assert "/login" not in site.paths_requested
+
+
+@session_loop
 async def test_click_pages_are_closed_after_their_hop(site, browser, monkeypatch):
     real = browser._click
     open_pages = []
@@ -524,6 +535,27 @@ async def test_a_context_that_never_closes_does_not_hang_the_capture(site, brows
     finally:
         for _, close in contexts:
             await close()
+
+
+@session_loop
+async def test_a_context_created_after_the_setup_timeout_is_closed(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 0.5)
+    real_new_context = browser._browser.new_context
+    made = []
+
+    async def slow_new_context(**kwargs):
+        await asyncio.sleep(1.5)  # the browser recovers after the capture gave up
+        made.append(await real_new_context(**kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(browser._browser, "new_context", slow_new_context)
+    with pytest.raises(TimeoutError, match="browser setup"):
+        await browser.capture(site.url("/"), "mobile")
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if made and not browser._browser.contexts:
+            break
+    assert len(made) == 1 and browser._browser.contexts == []
 
 
 class _LocalResolver:

@@ -39,6 +39,7 @@ class Nav:
         self.chain: list[str] = []
         self.responses: dict = {}  # URL -> last non-redirect main-frame response
         self.failure: str | None = None  # error of the last failed navigation
+        self.unanswered: set = set()  # navigation requests with no response or failure yet
 
     def add(self, url: str):
         if len(self.chain) < MAX_CHAIN and not url.startswith(BLANK):
@@ -95,10 +96,12 @@ class Recorder:
     def _on_request(self, req):
         if nav := self._main_nav(req, self._on_request, req):
             nav.add(req.url)  # every hop, HTTP redirects included
+            nav.unanswered.add(req)
 
     def _on_failed(self, req):
         if nav := self._main_nav(req, self._on_failed, req):
             nav.failure = req.failure
+            nav.unanswered.discard(req)
 
     def _on_navigated(self, page, frame):
         # Same-document navigations have no request of their own.
@@ -107,9 +110,10 @@ class Recorder:
             nav.add(frame.url)
 
     def _on_response(self, resp):
-        if ((nav := self._main_nav(resp.request, self._on_response, resp))
-                and not (300 <= resp.status < 400 and "location" in resp.headers)):
-            nav.responses[urldefrag(resp.url).url] = resp
+        if nav := self._main_nav(resp.request, self._on_response, resp):
+            nav.unanswered.discard(resp.request)
+            if not (300 <= resp.status < 400 and "location" in resp.headers):
+                nav.responses[urldefrag(resp.url).url] = resp
 
     def _spawn(self, failed: bool, req):
         if self.open and req not in self.blocked:
