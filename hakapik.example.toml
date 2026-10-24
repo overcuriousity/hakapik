@@ -22,9 +22,6 @@ log_lists = [
   "https://valid.apple.com/ct/log_list/current_log_list.json",
 ]
 
-# Reserved for concurrent fetches per CT log; not used yet (one batch at a time).
-per_log_concurrency = 2
-
 # Entries fetched per get-entries batch.
 batch_size = 256
 

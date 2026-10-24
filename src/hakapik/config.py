@@ -19,7 +19,6 @@ class Config:
     tranco_top_n: int = 100_000
     public_apexes: tuple[str, ...] = ()
     log_lists: tuple[str, ...] = DEFAULT_LOG_LISTS
-    per_log_concurrency: int = 2  # reserved, not used yet
     batch_size: int = 256
     max_db_connections: int = 64
     fetch_workers: int = 2
@@ -39,9 +38,9 @@ class Config:
 
 # Minimum for each numeric key (None = no lower bound beyond the type).
 _INT_MIN = {
-    "raw_retention_days": 0, "tranco_top_n": 0, "per_log_concurrency": 1,
-    "batch_size": 1, "max_db_connections": 1, "fetch_workers": 1,
-    "fetch_daily_cap": 0, "recheck_days": 0, "queue_cap": 0, "lease_s": 1,
+    "raw_retention_days": 0, "tranco_top_n": 0, "batch_size": 1,
+    "max_db_connections": 1, "fetch_workers": 1, "fetch_daily_cap": 0,
+    "recheck_days": 0, "queue_cap": 0, "lease_s": 1,
 }
 _FLOAT_MIN = {
     "fetch_per_ip_interval_s": 0.0, "ageout_hours": 0.0, "nav_timeout_s": 0.0,

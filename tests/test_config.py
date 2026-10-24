@@ -42,6 +42,12 @@ def test_unknown_key_raises(tmp_path):
         load_config(_write(tmp_path, "bogus = 1\n"))
 
 
+def test_per_log_concurrency_is_not_a_key(tmp_path):
+    # It was reserved and never used; ingest runs one batch per log at a time.
+    with pytest.raises(ValueError, match="per_log_concurrency"):
+        load_config(_write(tmp_path, "per_log_concurrency = 2\n"))
+
+
 def test_example_config_loads_and_states_the_defaults():
     cfg = load_config(Path(__file__).parent.parent / "hakapik.example.toml")
     assert cfg.max_db_connections == 64

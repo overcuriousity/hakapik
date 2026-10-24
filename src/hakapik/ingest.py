@@ -20,10 +20,9 @@ applied only after the commit succeeds. Consequences:
 The raw blob is written before the commit; after a failure it may be an
 orphan (harmless: content-addressed, reclaimed by pruning).
 
-Concurrency: one in-flight batch per log. ``Config.per_log_concurrency`` is
-reserved and not used. Log tasks share one ``FirstSeenIndex`` on one event
-loop and borrow Postgres connections from a ``ConnPool`` capped at
-``Config.max_db_connections``. Two logs can both read an FQDN as new before either applies its
+Concurrency: one in-flight batch per log. Log tasks share one
+``FirstSeenIndex`` on one event loop and borrow Postgres connections from a
+``ConnPool`` capped at ``Config.max_db_connections``. Two logs can both read an FQDN as new before either applies its
 post-commit writes (a batch awaits the DB in between); that too yields at
 most a duplicate candidate, and ``first_seen`` keeps the first writer's
 sighting.
