@@ -328,6 +328,23 @@ async def test_popup_requests_agree_with_the_profile(site, browser):
 
 
 @session_loop
+async def test_login_matching_ignores_the_pages_own_javascript(site, browser):
+    # the page rewrites DOM and RegExp methods in its own world; the matcher
+    # runs in an isolated world, where they are untouched
+    c = await browser.capture(site.url("/evil-login"), "desktop", click_through=True)
+    assert [k.label for k in c.clicks] == ["Sign in"]
+    assert c.clicks[0].page.final_url == site.url("/login")
+    assert b'type="password"' in c.clicks[0].dom
+
+
+@session_loop
+async def test_login_label_cannot_reach_the_selector_syntax(site, browser):
+    c = await browser.capture(site.url("/odd-label"), "desktop", click_through=True)
+    assert [k.label for k in c.clicks] == ['Sign in >> "now" \u00fc']
+    assert c.clicks[0].page.final_url == site.url("/login")
+
+
+@session_loop
 async def test_no_click_through_by_default(site, browser):
     c = await browser.capture(site.url("/"), "desktop")
     assert c.clicks == ()

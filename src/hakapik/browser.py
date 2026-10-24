@@ -13,11 +13,12 @@ outcome.
 import asyncio
 import base64
 import functools
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
@@ -68,7 +69,12 @@ DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
 
 # Visible login elements in document order: with n < 0 their labels, else
 # the n-th element if its label is still ``label``, else the first element
-# with that label, else null.
+# with that label, else null. It never runs in the page's own JS world, where
+# the page could rewrite querySelectorAll, innerText or RegExp to hide its
+# login: labels come from a CDP isolated world (_login_labels), the element
+# from a playwright content-script selector engine (_LOGIN_ENGINE), which
+# runs in playwright's isolated utility world. Both see the DOM, not the
+# page's JS objects.
 _LOGIN_JS = """([pattern, n, label]) => {
   const re = new RegExp(pattern, "i");
   const found = [];
@@ -84,6 +90,21 @@ _LOGIN_JS = """([pattern, n, label]) => {
   const same = found.find(f => f[1] === label);
   return same ? same[0] : null;
 }""" % (MAX_LABEL, MAX_CLICKS)
+
+# Selector body: the URI-encoded JSON of [pattern, n, label], so no label
+# text can reach playwright's selector syntax.
+_LOGIN_ENGINE = "hakapik-login"
+_LOGIN_ENGINE_JS = """{
+  queryAll(root, selector) {
+    const el = (%s)(JSON.parse(decodeURIComponent(selector)));
+    return el ? [el] : [];
+  },
+  query(root, selector) { return this.queryAll(root, selector)[0] || null; },
+}""" % _LOGIN_JS
+
+
+def _login_selector(n: int, label: str) -> str:
+    return f"{_LOGIN_ENGINE}={quote(json.dumps([LOGIN_PATTERN.pattern, n, label]), safe='')}"
 
 
 @dataclass(frozen=True)
@@ -158,6 +179,8 @@ class Browser:
     async def __aenter__(self) -> "Browser":
         self._pw = await async_playwright().start()
         try:
+            await self._pw.selectors.register(_LOGIN_ENGINE, _LOGIN_ENGINE_JS,
+                                              content_script=True)
             self._browser = await self._pw.chromium.launch(
                 channel="chromium",
                 args=list(self.LAUNCH_ARGS),
@@ -279,6 +302,19 @@ class Browser:
             await bounded(cdp.send("Page.stopLoading"))
 
     @staticmethod
+    async def _login_labels(cdp):
+        """The landing's login labels, matched in an isolated world of its
+        main frame (works with the page's scripts disabled)."""
+        tree = await cdp.send("Page.getFrameTree")
+        world = await cdp.send("Page.createIsolatedWorld", {
+            "frameId": tree["frameTree"]["frame"]["id"], "worldName": "hakapik"})
+        args = json.dumps([LOGIN_PATTERN.pattern, -1, None])
+        r = await cdp.send("Runtime.evaluate", {
+            "expression": f"({_LOGIN_JS})({args})", "returnByValue": True,
+            "contextId": world["executionContextId"]})
+        return r["result"].get("value")
+
+    @staticmethod
     async def _new_popup(context, popups: list, before: set, left, notes: list[str]):
         """The first of ``popups`` whose target is not in ``before``, with a
         CDP session; (None, None) if there is none."""
@@ -333,9 +369,9 @@ class Browser:
                 if not nav.responses:
                     raise
             await asyncio.sleep(min(self.settle_s, left()))
-            handle = await asyncio.wait_for(
-                page.evaluate_handle(_LOGIN_JS, [LOGIN_PATTERN.pattern, n, label]), left())
-            if (element := handle.as_element()) is None:
+            element = await asyncio.wait_for(
+                page.query_selector(_login_selector(n, label)), left())
+            if element is None:
                 raise _ClickFailed("element changed")
             # Targets that exist now are not the click's popups, even when
             # playwright reports them only after the click.
@@ -502,8 +538,7 @@ class Browser:
                 cert_chain = tuple(base64.b64decode(c) for c in (cert or {}).get("tableNames", ()))
             labels = []
             if click_through and navigated and dom is not None:
-                found = await bounded(
-                    page.evaluate(_LOGIN_JS, [LOGIN_PATTERN.pattern, -1, None]))
+                found = await bounded(self._login_labels(cdp))
                 labels = [str(x)[:MAX_LABEL] for x in found[:MAX_CLICKS]] if isinstance(
                     found, list) else []
             for n, label in enumerate(labels):

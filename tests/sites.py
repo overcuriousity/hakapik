@@ -82,6 +82,17 @@ PAGES = {
                      b'<html><body><a href="/hinted" target="_blank">Login</a></body></html>'),
     "/hinted": (200, [], b'<html><body>hinted<script>setTimeout(() => fetch("/late-pic"), 300);'
                          b'</script></body></html>'),
+    # hides its login link from any matcher that runs in the page's own JS world
+    "/evil-login": (200, [], b'<html><body><a href="/login">Sign in</a><script>'
+                             b'Document.prototype.querySelectorAll = () => [];'
+                             b'Object.defineProperty(HTMLElement.prototype, "innerText",'
+                             b' {get() { return ""; }});'
+                             b'RegExp.prototype.test = () => false;'
+                             b'Element.prototype.checkVisibility = () => false;'
+                             b'</script></body></html>'),
+    # a label with playwright selector syntax, quotes and non-ASCII in it
+    "/odd-label": (200, [], '<html><body><a href="/login">Sign in &gt;&gt; "now" \u00fc</a>'
+                            '</body></html>'.encode()),
     "/fetch-big": (200, [], b'<html><body>big<script>fetch("/big");</script></body></html>'),
     # a favicon the page asks for itself, as a link and as an image
     "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
