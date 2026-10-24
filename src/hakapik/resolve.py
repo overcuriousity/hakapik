@@ -31,6 +31,11 @@ class Resolver:
     dnspython does not say which server produced an NXDOMAIN, so each server
     gets its own resolver: the recorded ``resolver`` is then the one that
     actually answered.
+
+    Servers are tried one after another, never in parallel, so the first
+    configured server answers whenever it can. The cost: a query whose servers
+    all time out takes len(nameservers) * timeout_s, and ``resolve`` runs two
+    such rounds (names, then PTRs), so its worst case is twice that.
     """
 
     def __init__(self, nameservers: tuple[str, ...] = (), *, port: int = 53,
@@ -92,11 +97,12 @@ class Resolver:
                     failures[0])
 
     async def resolve(self, fqdn: str, registrable: str) -> tuple[DnsAnswer, ...]:
-        fqdn, registrable = fqdn.rstrip("."), registrable.rstrip(".")
+        # DNS names are case-insensitive; one spelling keeps qname lookups exact.
+        fqdn, registrable = fqdn.rstrip(".").lower(), registrable.rstrip(".").lower()
         queries = [(fqdn, t) for t in _TYPES]
         if registrable != fqdn:
             queries.append((registrable, "NS"))
-        first = await asyncio.gather(*(self._query(n, t) for n, t in queries))
+        first = tuple(await asyncio.gather(*(self._query(n, t) for n, t in queries)))
         ptr_names = sorted({
             dns.reversename.from_address(ip).to_text(omit_final_dot=True)
             for ip in addresses(first, fqdn)
