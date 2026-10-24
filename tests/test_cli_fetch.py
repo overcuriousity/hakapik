@@ -71,3 +71,44 @@ def test_fetch_help(capsys):
         main(["--config", "x.toml", "fetch", "--help"])
     assert e.value.code == 0
     assert "--once" in capsys.readouterr().out
+
+
+def test_fetch_first_signal_stops_cleanly(tmp_path, monkeypatch, capsys):
+    import signal
+
+    from hakapik import fetchloop
+
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(f'data_dir = "{tmp_path}"\ndatabase_url = "postgresql://unused"\n')
+    seen = {}
+
+    async def fake_run_fetch(cfg, *, stop, once):
+        seen["once"] = once
+        os.kill(os.getpid(), signal.SIGINT)
+        await stop.wait()
+
+    monkeypatch.setattr(fetchloop, "run_fetch", fake_run_fetch)
+    assert main(["--config", str(cfg), "fetch", "--once"]) == 0
+    assert seen == {"once": True}
+    assert capsys.readouterr().err == ""
+
+
+def test_fetch_second_signal_exits_130_without_traceback(tmp_path, monkeypatch, capsys):
+    import signal
+
+    from hakapik import fetchloop
+
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(f'data_dir = "{tmp_path}"\ndatabase_url = "postgresql://unused"\n')
+
+    async def stuck_run_fetch(cfg, *, stop, once):
+        os.kill(os.getpid(), signal.SIGINT)
+        await stop.wait()
+        os.kill(os.getpid(), signal.SIGINT)  # the operator presses Ctrl-C again
+        await asyncio.Event().wait()  # a capture that does not end on stop
+
+    monkeypatch.setattr(fetchloop, "run_fetch", stuck_run_fetch)
+    assert main(["--config", str(cfg), "fetch"]) == 130
+    err = capsys.readouterr().err
+    assert err.strip() == "hakapik: interrupted"
+    assert "Traceback" not in err

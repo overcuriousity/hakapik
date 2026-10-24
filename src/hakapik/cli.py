@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import csv
 import logging
-import signal
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +23,7 @@ from hakapik.db import (
 )
 from hakapik.jobs import enqueue_manual, show_fqdn
 from hakapik.names import normalize
+from hakapik.signals import stop_on_signals
 
 log = logging.getLogger("hakapik.cli")
 
@@ -110,21 +110,8 @@ def _cmd_enqueue(cfg: Config, args) -> int:
 
 async def _fetch(cfg: Config, once: bool) -> None:
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    main = asyncio.current_task()
-
-    def on_signal() -> None:
-        if stop.is_set() and main is not None:
-            main.cancel()
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, on_signal)
-    try:
+    with stop_on_signals(stop):
         await fetchloop.run_fetch(cfg, stop=stop, once=once)
-    finally:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)
 
 
 def _cmd_fetch(cfg: Config, args) -> int:

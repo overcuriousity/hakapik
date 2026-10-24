@@ -34,7 +34,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import signal
 import struct
 import time
 from dataclasses import asdict, dataclass, fields
@@ -65,6 +64,7 @@ from hakapik.dedup import cert_key
 from hakapik.firstseen import FirstSeenIndex
 from hakapik.jobs import last_fetched
 from hakapik.names import NameRecord, normalize
+from hakapik.signals import stop_on_signals
 from hakapik.suppress import Suppressor
 
 RAW_MEDIA_TYPE = "application/x-hakapik-ctbatch"
@@ -534,55 +534,46 @@ async def run(cfg: Config) -> None:
     ``_tail_once``). The tasks share one HTTP client, one first-seen index and
     a ``ConnPool`` of at most ``cfg.max_db_connections`` connections.
     SIGINT/SIGTERM set the stop event (tail stops between batches); a second
-    signal cancels the run.
+    signal cancels the run. The log lists are read once, here: a log added to
+    them later is tailed from the next start on.
     """
     root = logging.getLogger(__name__)
     sup = _load_suppressor(cfg)
     bs = BlobStore(cfg.data_dir / "blobs")
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    main = asyncio.current_task()
-
-    def on_signal() -> None:
-        if stop.is_set() and main is not None:
-            main.cancel()
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, on_signal)
     pool = ConnPool(cfg.database_url, cfg.max_db_connections)
-    try:
-        conn = await connect(cfg.database_url)
+    with stop_on_signals(stop):
         try:
-            await migrate(conn)
+            conn = await connect(cfg.database_url)
+            try:
+                await migrate(conn)
+            finally:
+                await conn.close()
+
+            async with httpx.AsyncClient(
+                timeout=60, headers={"User-Agent": USER_AGENT}
+            ) as client:
+                logs = await fetch_log_lists(cfg.log_lists, client)
+                root.info("%d active logs", len(logs))
+                with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
+
+                    async def one(info) -> None:
+                        # Never raises: a failing log must not end gather() early,
+                        # which would close the shared index and client under the
+                        # sibling tasks still using them.
+                        log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
+                        try:
+                            src = make_source(info, client)
+                            await tail_log(src, cfg, ix, sup, bs, pool, stop)
+                        except Exception:
+                            log.exception("log task failed (%s)", info.description)
+
+                    results = await asyncio.gather(
+                        *(one(info) for info in logs), return_exceptions=True
+                    )
+                    for info, res in zip(logs, results):
+                        if isinstance(res, BaseException):
+                            root.error("log task %s escaped: %r", info.log_id, res)
         finally:
-            await conn.close()
+            await pool.close()
 
-        async with httpx.AsyncClient(
-            timeout=60, headers={"User-Agent": USER_AGENT}
-        ) as client:
-            logs = await fetch_log_lists(cfg.log_lists, client)
-            root.info("%d active logs", len(logs))
-            with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
-
-                async def one(info) -> None:
-                    # Never raises: a failing log must not end gather() early,
-                    # which would close the shared index and client under the
-                    # sibling tasks still using them.
-                    log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
-                    try:
-                        src = make_source(info, client)
-                        await tail_log(src, cfg, ix, sup, bs, pool, stop)
-                    except Exception:
-                        log.exception("log task failed (%s)", info.description)
-
-                results = await asyncio.gather(
-                    *(one(info) for info in logs), return_exceptions=True
-                )
-                for info, res in zip(logs, results):
-                    if isinstance(res, BaseException):
-                        root.error("log task %s escaped: %r", info.log_id, res)
-    finally:
-        await pool.close()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)
