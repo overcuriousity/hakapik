@@ -4,8 +4,9 @@ Proof of concept for finding phishing sites within minutes to hours of their
 first machine-visible signal: the certificate appearing in a Certificate
 Transparency (CT) log.
 
-This repository currently holds the first stage of the pipeline, ingest and
-first-seen:
+This repository holds the first two stages of the pipeline.
+
+Ingest and first-seen:
 
 - tails every active CT log, both RFC 6962 and static-CT (tiled) logs,
 - deduplicates certificates across logs, normalises every SAN (IDNA, Public
@@ -15,9 +16,19 @@ first-seen:
   index, and emits the remaining first-seen names as fetch candidates,
 - reports per-log, per-day volumes (`hakapik stats`).
 
+Resolve and fetch:
+
+- queues each candidate as a fetch job and retries it along a ladder of
+  delays, with lease-based claims, age-out and an optional queue cap,
+- resolves the name, renders it in Chromium (Playwright) on a mobile and,
+  if live, a desktop profile with login click-through, and keeps WARC,
+  screenshot, DOM and certificate chain in the blob store,
+- seals each attempt as an Ed25519-signed result that the head verifies
+  before storing it, with versioned manifests and optional ASN enrichment.
+
 The design and the literature it rests on are in
 `docs/superpowers/specs/2026-10-23-hakapik-design.md`; the implementation
-plan for this stage is in `docs/superpowers/plans/`.
+plans for both stages are in `docs/superpowers/plans/`.
 
 ## Requirements
 
