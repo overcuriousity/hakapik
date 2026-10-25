@@ -116,7 +116,8 @@ async def test_daily_cap_counts_tasks_in_flight(conn, tmp_path, monkeypatch):
     assert await _count(conn, "attempt") == 1
 
 
-async def test_stop_set_claims_nothing(conn, tmp_path):
+async def test_stop_set_claims_nothing(conn, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="hakapik.fetchloop")
     cfg = _cfg(tmp_path)
     await _queue(conn, "a.example.com")
     stop = asyncio.Event()
@@ -124,9 +125,10 @@ async def test_stop_set_claims_nothing(conn, tmp_path):
     await run_fetch(cfg, stop=stop, resolver=FakeResolver(), browser=FakeBrowser())
     assert await _count(conn, "fetch_job", "claimed_until IS NOT NULL") == 0
     assert await _count(conn, "node") == 1
+    assert "stopping" not in caplog.text  # nothing was running
 
 
-async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch):
+async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(fetchloop, "IDLE_SLEEP_S", 0.01)
     gate = asyncio.Event()
     started = asyncio.Event()
@@ -143,12 +145,17 @@ async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch):
     task = asyncio.create_task(run_fetch(
         cfg, stop=stop, resolver=FakeResolver(), browser=SlowBrowser()))
     await asyncio.wait_for(started.wait(), 10)
+    caplog.set_level(logging.INFO, logger="hakapik.fetchloop")
     stop.set()
     await asyncio.sleep(0.05)
     assert not task.done()
+    stopping = [r for r in caplog.records if r.getMessage().startswith("stopping")]
+    assert [(r.levelno, r.getMessage()) for r in stopping] == [
+        (logging.INFO, "stopping; 1 running job(s) finish first (Ctrl-C again aborts)")]
     gate.set()
     await asyncio.wait_for(task, 10)
     assert await _count(conn, "attempt") == 1
+    assert len([r for r in caplog.records if r.getMessage().startswith("stopping")]) == 1
 
 
 async def test_rejected_result_is_logged_and_rolled_back(conn, tmp_path, monkeypatch,

@@ -62,6 +62,9 @@ comment) and prints `name`, a tab and the outcome: `queued`, `already_open`,
 browser; `show` prints a name's candidates, jobs, attempts and latest manifest.
 No running `tail` is needed.
 
+Ctrl-C stops claiming/tailing and lets running work finish (tail: a running
+batch gets 5 s; fetch: up to job_timeout_s); a second Ctrl-C aborts.
+
 `fetch` contacts sites from this machine's own address, or through
 `fetch_proxy` if that is set. Rate limits (`fetch_per_ip_interval_s`,
 `fetch_daily_cap`) are off unless configured.

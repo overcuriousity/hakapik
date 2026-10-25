@@ -230,4 +230,7 @@ async def _loop(cfg: Config, stop: asyncio.Event, once: bool, pool: ConnPool,
             task.cancel()
         await asyncio.gather(*running, return_exceptions=True)
         raise
+    if stop.is_set() and running:
+        log.info("stopping; %d running job(s) finish first (Ctrl-C again aborts)",
+                 len(running))
     await asyncio.gather(*running)
