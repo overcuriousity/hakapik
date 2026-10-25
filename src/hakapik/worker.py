@@ -51,9 +51,8 @@ class IpSpacer:
     Each wait reserves the next free slot synchronously (no await between
     reading and writing the slot), so concurrent waits on one IP are spaced.
     Slots already passed are forgotten, so the map holds only IPs with a
-    future slot. A waiter cancelled while sleeping gives its slot back if no
-    later waiter has reserved after it; otherwise the gap stays (spacing is
-    never shortened).
+    future slot. A waiter cancelled while sleeping keeps its slot: spacing
+    can only lengthen, never shorten.
     """
 
     def __init__(self, interval_s: float | None, *,
@@ -70,19 +69,10 @@ class IpSpacer:
         now = self._clock()
         for passed in [k for k, t in self._next.items() if t <= now]:
             del self._next[passed]
-        prev = self._next.get(ip)
-        start = max(now, prev or now)
-        end = self._next[ip] = start + self.interval_s
+        start = max(now, self._next.get(ip, now))
+        self._next[ip] = start + self.interval_s
         if start > now:
-            try:
-                await self._sleep(start - now)
-            except asyncio.CancelledError:
-                if self._next.get(ip) == end:
-                    if prev is None:
-                        del self._next[ip]
-                    else:
-                        self._next[ip] = prev
-                raise
+            await self._sleep(start - now)
 
 
 def _store(bs: BlobStore, blobs: list[BlobRef], profile: str, kind: str,

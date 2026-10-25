@@ -161,7 +161,7 @@ async def test_ip_spacer_forgets_passed_slots():
     assert list(s._next) == ["198.51.100.1"]
 
 
-async def test_ip_spacer_cancelled_waiter_gives_its_slot_back():
+async def test_ip_spacer_cancelled_waiter_keeps_its_slot():
     c = FakeClock()
     sleeps = []
 
@@ -179,33 +179,8 @@ async def test_ip_spacer_cancelled_waiter_gives_its_slot_back():
     await asyncio.sleep(0)
     late.cancel()
     await asyncio.gather(late, return_exceptions=True)
-    # The cancelled waiter's slot (0.2..0.4) was released, so the next waiter
-    # takes it instead of queueing behind it.
-    assert sleeps == [0.2, 0.2]
-
-
-async def test_ip_spacer_cancel_keeps_slots_reserved_after_it():
-    c = FakeClock()
-    sleeps = []
-
-    async def blocking_sleep(d):
-        sleeps.append(round(d, 6))
-        await asyncio.Event().wait()
-
-    s = IpSpacer(0.2, clock=c, sleep=blocking_sleep)
-    await s.wait("1.1.1.1")
-    second = asyncio.create_task(s.wait("1.1.1.1"))
-    third = asyncio.create_task(s.wait("1.1.1.1"))
-    await asyncio.sleep(0)
-    second.cancel()
-    await asyncio.gather(second, return_exceptions=True)
-    fourth = asyncio.create_task(s.wait("1.1.1.1"))
-    await asyncio.sleep(0)
-    for t in (third, fourth):
-        t.cancel()
-    await asyncio.gather(third, fourth, return_exceptions=True)
-    # The third waiter's later slot stays reserved; the fourth queues after it.
-    assert sleeps == [0.2, 0.4, 0.6]
+    # The cancelled waiter's slot (0.2..0.4) stays reserved: spacing only lengthens.
+    assert sleeps == [0.2, 0.4]
 
 
 class RecordingSpacer(IpSpacer):
