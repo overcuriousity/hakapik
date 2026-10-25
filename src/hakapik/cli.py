@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import csv
 import logging
-import signal
 import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -21,9 +20,11 @@ from hakapik.db import (
     prune_raw,
     read_stats,
     sample_candidates,
+    sweep_orphan_blobs,
 )
 from hakapik.jobs import enqueue_manual, show_fqdn
 from hakapik.names import normalize
+from hakapik.signals import stop_on_signals
 
 log = logging.getLogger("hakapik.cli")
 
@@ -35,6 +36,11 @@ SAMPLE_COLUMNS = (
 async def _with_conn(cfg: Config, fn, commit: bool = True):
     conn = await connect(cfg.database_url)
     try:
+        # Every command migrates, the read-only ones (stats, sample, show)
+        # too: on a fresh or older database they then see the current schema
+        # instead of failing. Once the schema is current, migrate changes
+        # nothing and takes no lock that conflicts with a writer (db.migrate's
+        # checks), so it does not block a running tail or fetch.
         await migrate(conn)
         result = await fn(conn)
         if commit:
@@ -78,12 +84,16 @@ def _cmd_sample(cfg: Config, args) -> int:
 
 
 def _cmd_prune(cfg: Config, args) -> int:
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
-    ).date()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=cfg.raw_retention_days)
     bs = BlobStore(cfg.data_dir / "blobs")
-    n = asyncio.run(_with_conn(cfg, lambda c: prune_raw(c, bs, cutoff), commit=False))
-    print(n)
+
+    async def prune(conn):
+        batches = await prune_raw(conn, bs, cutoff)
+        orphans, tmps = await sweep_orphan_blobs(conn, bs, cfg.orphan_margin_hours * 3600)
+        return batches, orphans, tmps
+
+    batches, orphans, tmps = asyncio.run(_with_conn(cfg, prune, commit=False))
+    print(f"raw_batches\t{batches}\norphan_blobs\t{orphans}\ntemp_files\t{tmps}")
     return 0
 
 
@@ -110,21 +120,8 @@ def _cmd_enqueue(cfg: Config, args) -> int:
 
 async def _fetch(cfg: Config, once: bool) -> None:
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    main = asyncio.current_task()
-
-    def on_signal() -> None:
-        if stop.is_set() and main is not None:
-            main.cancel()
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, on_signal)
-    try:
+    with stop_on_signals(stop):
         await fetchloop.run_fetch(cfg, stop=stop, once=once)
-    finally:
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)
 
 
 def _cmd_fetch(cfg: Config, args) -> int:
@@ -207,6 +204,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:  # operator-facing: message, not traceback
         print(f"hakapik: error: {e}", file=sys.stderr)
         return 1
+    except (KeyboardInterrupt, asyncio.CancelledError):  # second Ctrl-C
+        print("hakapik: interrupted", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

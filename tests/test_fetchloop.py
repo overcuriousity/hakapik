@@ -1,14 +1,17 @@
 import asyncio
+import hashlib
 import logging
+import threading
 
 import pytest
 from conftest import _test_db_url
 from test_worker import T, FakeBrowser
 
 from hakapik import fetchloop
+from hakapik.asn import AsnDb
 from hakapik.config import Config
 from hakapik.fetchloop import run_fetch
-from hakapik.jobs import enqueue_manual
+from hakapik.jobs import claim_jobs, enqueue_manual
 from hakapik.protocol import DnsAnswer, NodeKey
 from hakapik.store import ResultRejected
 
@@ -113,7 +116,8 @@ async def test_daily_cap_counts_tasks_in_flight(conn, tmp_path, monkeypatch):
     assert await _count(conn, "attempt") == 1
 
 
-async def test_stop_set_claims_nothing(conn, tmp_path):
+async def test_stop_set_claims_nothing(conn, tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="hakapik.fetchloop")
     cfg = _cfg(tmp_path)
     await _queue(conn, "a.example.com")
     stop = asyncio.Event()
@@ -121,9 +125,10 @@ async def test_stop_set_claims_nothing(conn, tmp_path):
     await run_fetch(cfg, stop=stop, resolver=FakeResolver(), browser=FakeBrowser())
     assert await _count(conn, "fetch_job", "claimed_until IS NOT NULL") == 0
     assert await _count(conn, "node") == 1
+    assert "stopping" not in caplog.text  # nothing was running
 
 
-async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch):
+async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(fetchloop, "IDLE_SLEEP_S", 0.01)
     gate = asyncio.Event()
     started = asyncio.Event()
@@ -140,12 +145,17 @@ async def test_stop_lets_running_tasks_finish(conn, tmp_path, monkeypatch):
     task = asyncio.create_task(run_fetch(
         cfg, stop=stop, resolver=FakeResolver(), browser=SlowBrowser()))
     await asyncio.wait_for(started.wait(), 10)
+    caplog.set_level(logging.INFO, logger="hakapik.fetchloop")
     stop.set()
     await asyncio.sleep(0.05)
     assert not task.done()
+    stopping = [r for r in caplog.records if r.getMessage().startswith("stopping")]
+    assert [(r.levelno, r.getMessage()) for r in stopping] == [
+        (logging.INFO, "stopping; 1 running job(s) finish first (Ctrl-C again aborts)")]
     gate.set()
     await asyncio.wait_for(task, 10)
     assert await _count(conn, "attempt") == 1
+    assert len([r for r in caplog.records if r.getMessage().startswith("stopping")]) == 1
 
 
 async def test_rejected_result_is_logged_and_rolled_back(conn, tmp_path, monkeypatch,
@@ -208,3 +218,277 @@ def _fast(monkeypatch):
     # once=True never sleeps, but keep any stray wait short.
     monkeypatch.setattr(fetchloop, "IDLE_SLEEP_S", 0.01, raising=False)
     monkeypatch.setattr(fetchloop, "CAP_SLEEP_S", 0.01, raising=False)
+
+
+async def test_loaded_asn_snapshot_has_its_blob_row(conn, tmp_path, asn_mmdb):
+    path = asn_mmdb()
+    cfg = _cfg(tmp_path, asn_mmdb=path)
+    await _once(cfg)  # nothing queued: no attempt, so no ASN hit
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    assert await _count(conn, "attempt") == 0
+    assert await _count(conn, "blob", f"sha256 = '{sha}'") == 1
+
+
+async def test_sweep_failure_does_not_block_claims(conn, tmp_path, monkeypatch, caplog):
+    async def broken_sweep(*a, **k):
+        raise RuntimeError("sweep broke")
+
+    monkeypatch.setattr(fetchloop, "sweep", broken_sweep)
+    cfg = _cfg(tmp_path)
+    await _queue(conn, "a.example.com")
+    await _once(cfg)
+    assert await _count(conn, "attempt") == 1
+    assert any("sweep" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+async def test_unreadable_result_is_not_stored_and_logged_failed(conn, tmp_path, monkeypatch,
+                                                                 caplog):
+    # The outcome is read before storing, so "failed" is never logged for a
+    # job whose attempt was stored.
+    def unreadable(*a, **k):
+        raise ValueError("cannot open")
+
+    monkeypatch.setattr(fetchloop, "open_envelope", unreadable)
+    cfg = _cfg(tmp_path)
+    await _queue(conn, "a.example.com")
+    await _once(cfg)
+    assert any("failed" in r.getMessage() and r.exc_info for r in caplog.records)
+    assert await _count(conn, "attempt") == 0
+    assert "finished job" not in caplog.text
+
+
+async def test_default_resolver_and_browser_are_built_from_config_and_closed(
+        conn, tmp_path, monkeypatch):
+    made = {}
+
+    class StubResolver(FakeResolver):
+        def __init__(self, nameservers, *, query_deadline_s):
+            made["nameservers"] = (nameservers, query_deadline_s)
+
+    class StubBrowser(FakeBrowser):
+        def __init__(self, *, proxy, nav_timeout_s):
+            super().__init__()
+            made["browser"] = (proxy, nav_timeout_s)
+            made["events"] = []
+
+        async def __aenter__(self):
+            made["events"].append("enter")
+            return self
+
+        async def __aexit__(self, *exc):
+            made["events"].append("exit")
+
+    monkeypatch.setattr(fetchloop, "Resolver", StubResolver)
+    monkeypatch.setattr(fetchloop, "Browser", StubBrowser)
+    cfg = _cfg(tmp_path, resolver_nameservers=("192.0.2.53",),
+               resolver_query_deadline_s=4.5, fetch_proxy="socks5://127.0.0.1:9", nav_timeout_s=7)
+    await _queue(conn, "a.example.com")
+    await run_fetch(cfg, stop=asyncio.Event(), once=True)
+    assert made["nameservers"] == (("192.0.2.53",), 4.5)
+    assert made["browser"] == ("socks5://127.0.0.1:9", 7)
+    assert made["events"] == ["enter", "exit"]
+    assert await _count(conn, "attempt", "outcome = 'live'") == 1
+
+
+async def test_asn_db_is_closed_when_fetch_ends(conn, tmp_path, asn_mmdb, monkeypatch):
+    closed = []
+    real_close = AsnDb.close
+    monkeypatch.setattr(AsnDb, "close", lambda self: (closed.append(self), real_close(self))[1])
+    await _once(_cfg(tmp_path, asn_mmdb=asn_mmdb()))
+    assert len(closed) == 1
+
+
+async def test_heartbeat_keeps_a_slow_job_leased_then_stops(conn, tmp_path, monkeypatch,
+                                                            caplog):
+    # lease_s = 1 and a capture that takes longer: without the heartbeat the
+    # job would be claimable again while it runs.
+    gate, started = asyncio.Event(), asyncio.Event()
+    beats = []
+    real_extend = fetchloop.extend_lease
+
+    async def counting_extend(*a, **k):
+        beats.append(True)
+        return await real_extend(*a, **k)
+
+    class SlowBrowser(FakeBrowser):
+        async def capture(self, url, profile, *, click_through=False):
+            started.set()
+            await gate.wait()
+            return await super().capture(url, profile, click_through=click_through)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", counting_extend)
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=SlowBrowser(), once=True))
+    await asyncio.wait_for(started.wait(), 10)
+    await asyncio.sleep(2.5)  # well past the first lease
+    assert await claim_jobs(conn, 5, 1) == []  # a second claimer finds nothing due
+    await conn.rollback()
+    assert await _count(conn, "fetch_job", "claimed_until > now()") == 1
+    assert len(beats) >= 3
+    gate.set()
+    await asyncio.wait_for(task, 10)
+    assert await _count(conn, "attempt") == 1
+    after = len(beats)
+    await asyncio.sleep(0.8)  # more than two ticks
+    assert len(beats) == after
+    assert "lease lost" not in caplog.text
+
+
+async def test_heartbeat_failure_is_logged_and_retried(conn, tmp_path, monkeypatch, caplog):
+    gate, started = asyncio.Event(), asyncio.Event()
+    calls = []
+    real_extend = fetchloop.extend_lease
+
+    async def flaky_extend(*a, **k):
+        calls.append(True)
+        if len(calls) == 1:
+            raise RuntimeError("db hiccup")
+        return await real_extend(*a, **k)
+
+    class SlowBrowser(FakeBrowser):
+        async def capture(self, url, profile, *, click_through=False):
+            started.set()
+            await gate.wait()
+            return await super().capture(url, profile, click_through=click_through)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", flaky_extend)
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=SlowBrowser(), once=True))
+    await asyncio.wait_for(started.wait(), 10)
+    while len(calls) < 2:
+        await asyncio.sleep(0.05)
+    gate.set()
+    await asyncio.wait_for(task, 10)
+    assert await _count(conn, "attempt", "outcome = 'live'") == 1
+    assert any("lease extension failed" in r.getMessage() and r.exc_info
+               for r in caplog.records)
+
+
+async def test_node_key_is_loaded_off_the_event_loop(conn, tmp_path, monkeypatch):
+    threads = []
+    real = NodeKey.load_or_create.__func__
+
+    def recording(cls, path):
+        threads.append(threading.current_thread())
+        return real(cls, path)
+
+    monkeypatch.setattr(NodeKey, "load_or_create", classmethod(recording))
+    await _once(_cfg(tmp_path))
+    assert threads and threads[0] is not threading.main_thread()
+
+
+class GatedBrowser(FakeBrowser):
+    """Captures wait for ``gate``; ``started`` is set at the first capture."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate, self.started = asyncio.Event(), asyncio.Event()
+
+    async def capture(self, url, profile, *, click_through=False):
+        self.started.set()
+        await self.gate.wait()
+        return await super().capture(url, profile, click_through=click_through)
+
+
+def _count_extends(monkeypatch):
+    calls = []
+    real = fetchloop.extend_lease
+
+    async def counting(*a, **k):
+        t = asyncio.get_running_loop().time()
+        try:
+            return await real(*a, **k)
+        finally:
+            calls.append(asyncio.get_running_loop().time() - t)
+
+    monkeypatch.setattr(fetchloop, "extend_lease", counting)
+    return calls
+
+
+async def _until(pred, timeout=5.0):
+    for _ in range(int(timeout / 0.02)):
+        if pred():
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError("condition not reached")
+
+
+async def test_hung_job_times_out_stores_nothing_and_stays_leased(conn, tmp_path,
+                                                                  monkeypatch, caplog):
+    calls = _count_extends(monkeypatch)
+    b = GatedBrowser()  # the gate never opens: the capture hangs
+    cfg = _cfg(tmp_path, lease_s=1, job_timeout_s=0.8)
+    await _queue(conn, "a.example.com")
+    await asyncio.wait_for(_once(cfg, browser=b), 10)
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert any("a.example.com" in r.getMessage() and "timed out" in r.getMessage()
+               for r in errors)
+    assert await _count(conn, "attempt") == 0
+    assert await _count(conn, "fetch_job", "step = 0 AND claimed_until > now()") == 1
+    after = len(calls)
+    await asyncio.sleep(0.8)
+    assert len(calls) == after  # the heartbeat stopped with the job
+
+
+async def test_heartbeat_stops_when_another_holder_claims(conn, tmp_path, monkeypatch,
+                                                          caplog):
+    calls = _count_extends(monkeypatch)
+    b = GatedBrowser()
+    cfg = _cfg(tmp_path, lease_s=1)
+    await _queue(conn, "a.example.com")
+    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
+                                         browser=b, once=True))
+    await asyncio.wait_for(b.started.wait(), 10)
+    cur = await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() + interval '1 hour' "
+        "RETURNING claimed_until")
+    theirs = (await cur.fetchone())[0]
+    await conn.commit()
+    await _until(lambda: "lease lost" in caplog.text)
+    after = len(calls)
+    await asyncio.sleep(0.8)
+    assert len(calls) == after
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job")
+    assert (await cur.fetchone())[0] == theirs  # never extended
+    await conn.rollback()
+    b.gate.set()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_timeout_raised_inside_run_job_is_a_plain_failure(conn, tmp_path, monkeypatch,
+                                                                caplog):
+    async def inner_timeout(job, **kw):
+        raise TimeoutError("from inside")
+
+    monkeypatch.setattr(fetchloop, "run_job", inner_timeout)
+    await _queue(conn, "a.example.com")
+    await _once(_cfg(tmp_path, job_timeout_s=60))
+    assert "timed out" not in caplog.text
+    failed = [r for r in caplog.records if "failed" in r.getMessage() and r.exc_info]
+    assert failed and failed[0].levelno == logging.ERROR
+    assert "from inside" in caplog.text
+
+
+async def test_heartbeat_ends_before_the_store(conn, tmp_path, monkeypatch, caplog):
+    # run_job has returned: no tick runs while store_result holds the row,
+    # even when the store outlasts several ticks.
+    calls = _count_extends(monkeypatch)
+    real_store = fetchloop.store_result
+    during = []
+
+    async def slow_store(*a, **k):
+        n = len(calls)
+        await asyncio.sleep(1.0)  # three ticks at lease_s = 1
+        during.append(len(calls) - n)
+        return await real_store(*a, **k)
+
+    monkeypatch.setattr(fetchloop, "store_result", slow_store)
+    await _queue(conn, "a.example.com")
+    await asyncio.wait_for(_once(_cfg(tmp_path, lease_s=1)), 10)
+    assert during == [0]
+    assert await _count(conn, "attempt") == 1
+    assert "lease lost" not in caplog.text

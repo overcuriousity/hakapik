@@ -16,31 +16,39 @@ applied only after the commit succeeds. Consequences:
   certificate naming such an FQDN can then emit a duplicate candidate; a
   candidate is never lost. Later stages dedup candidates by fqdn.
 - Re-running an already committed and indexed batch emits nothing new.
+- The cursor advance is a compare-and-set (``advance_cursor``): of two
+  processes tailing the same log from the same cursor, only the first commit
+  wins; the other batch rolls back (``CursorMoved``) and is retried from the
+  new cursor, so a range is not stored or emitted twice.
 
-The raw blob is written before the commit; after a failure it may be an
-orphan (harmless: content-addressed, reclaimed by pruning).
+The raw blob is written before the commit, under ``lock_blob`` held to the
+commit. A batch that fails, is cancelled or loses the cursor
+(``CursorMoved``) leaves its blob unreferenced unless another commit stores
+the same bytes; stale worker results leave unreferenced blobs too.
+``prune`` reclaims such orphans once they are older than
+``orphan_margin_hours`` (``db.sweep_orphan_blobs``).
 
-Concurrency: one in-flight batch per log. ``Config.per_log_concurrency`` is
-reserved and not used. Log tasks share one ``FirstSeenIndex`` on one event
-loop and borrow Postgres connections from a ``ConnPool`` capped at
-``Config.max_db_connections``. Two logs can both read an FQDN as new before either applies its
-post-commit writes (a batch awaits the DB in between); that too yields at
-most a duplicate candidate, and ``first_seen`` keeps the first writer's
-sighting.
+Concurrency: one in-flight batch per log. Log tasks share one
+``FirstSeenIndex`` on one event loop and borrow Postgres connections from a
+``ConnPool`` capped at ``Config.max_db_connections``. Two logs can both
+read an FQDN as new before either applies its post-commit writes (a batch
+awaits the DB in between); that too yields at most a duplicate candidate,
+and ``first_seen`` keeps the first writer's sighting.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 import os
-import signal
 import struct
 import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 import zstandard
@@ -55,16 +63,19 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
+    advance_cursor,
     bump_stat,
     connect,
     get_cursor,
+    init_cursor,
+    lock_blob,
     migrate,
-    set_cursor,
 )
 from hakapik.dedup import cert_key
 from hakapik.firstseen import FirstSeenIndex
-from hakapik.jobs import last_fetched
+from hakapik.jobs import last_fetched, open_job_fqdns
 from hakapik.names import NameRecord, normalize
+from hakapik.signals import stop_on_signals
 from hakapik.suppress import Suppressor
 
 RAW_MEDIA_TYPE = "application/x-hakapik-ctbatch"
@@ -72,6 +83,7 @@ USER_AGENT = "hakapik/0.1 (CT monitor)"
 IDLE_SLEEP_S = 10.0
 PROGRESS_INTERVAL_S = 60.0  # per-log rate/lag log line
 TRACEBACK_INTERVAL_S = 600.0  # at most one full traceback per log per window
+STOP_GRACE_S = 5.0  # after stop, a running batch may finish this long, then is cancelled
 
 _HEAD = struct.Struct(">QI")
 _LEN = struct.Struct(">I")
@@ -103,6 +115,17 @@ class StatCounter:
     def add(self, other: StatCounter) -> None:
         for f in fields(self):
             setattr(self, f.name, getattr(self, f.name) + getattr(other, f.name))
+
+
+class CursorMoved(RuntimeError):
+    """Another writer advanced the log's cursor while this batch ran."""
+
+
+class _Recheck(NamedTuple):
+    rec: NameRecord
+    ts_ms: int
+    index: int
+    cert_key: bytes
 
 
 def pack_entries(entries: list[tuple[int, bytes, bytes]]) -> bytes:
@@ -137,11 +160,13 @@ def unpack_entries(data: bytes) -> list[tuple[int, bytes, bytes]]:
 def _batch_end(src: LogSource, pos: int, size: int, batch_size: int) -> int:
     """Inclusive end index of the batch starting at ``pos``.
 
-    Tiled logs serve whole 256-entry tiles, so their batches end at the next
-    tile boundary (each tile is fetched once); other logs use ``batch_size``.
+    Tiled logs serve whole 256-entry tiles, so their batches end on a tile
+    boundary (each tile is fetched once) and span ``batch_size // 256`` tiles,
+    at least one; other logs use ``batch_size``.
     """
     if src.info.kind == "tiled":
-        return min((pos // TILE_WIDTH + 1) * TILE_WIDTH, size) - 1
+        tiles = max(1, batch_size // TILE_WIDTH)
+        return min((pos // TILE_WIDTH + tiles) * TILE_WIDTH, size) - 1
     return min(pos + batch_size, size) - 1
 
 
@@ -197,12 +222,19 @@ async def _process_batch(
         entries = await src.entries(start, end)
         if not entries:
             return 0, start
+        # The cursor advances to last + 1, so a gap or a shifted range would
+        # skip entries unseen; the clients build contiguous prefixes, this
+        # holds any LogSource to it.
+        if any(e[0] != start + i for i, e in enumerate(entries)) or entries[-1][0] > end:
+            raise ValueError(
+                f"{log_id}: entries for {start}..{end} are not contiguous from {start}"
+            )
         batch = StatCounter(entries=len(entries))
         rows: list[CandidateRow] = []
         new_certs: set[bytes] = set()
         new_fqdns: dict[str, tuple[int, int]] = {}  # NameRecord.key -> (ts_ms, index)
         # Already-indexed, unsuppressed names seen again: re-check contenders.
-        recheck: dict[str, tuple[NameRecord, int, int, bytes]] = {}
+        recheck: dict[str, _Recheck] = {}
         for index, leaf, extra in entries:
             batch.bytes += len(leaf) + len(extra)
             parsed = _parse(src.info.kind, leaf)
@@ -221,21 +253,22 @@ async def _process_batch(
                 if rec.key in new_fqdns:
                     continue
                 if ix.get(rec.key) is not None:
-                    if (
-                        not rec.wildcard
-                        and rec.fqdn not in recheck
-                        and sup.reason(rec) is None
-                    ):
-                        recheck[rec.fqdn] = (rec, parsed.timestamp_ms, index, key)
+                    # sup.reason is a few set lookups, cheap enough per SAN; it
+                    # keeps suppressed names (wildcards included) out of the
+                    # last_fetched query below.
+                    if rec.fqdn not in recheck and sup.reason(rec) is None:
+                        recheck[rec.fqdn] = _Recheck(rec, parsed.timestamp_ms, index, key)
                     continue
                 new_fqdns[rec.key] = (parsed.timestamp_ms, index)
                 batch.fqdns_new += 1
                 reason = sup.reason(rec)
                 if reason is not None:
                     batch.suppressed += 1
+                    # Every reason for a valid name has a supp_* column; a new
+                    # reason without one fails here (AttributeError) instead of
+                    # vanishing from the split.
                     by_reason = f"supp_{reason}"
-                    if hasattr(batch, by_reason):
-                        setattr(batch, by_reason, getattr(batch, by_reason) + 1)
+                    setattr(batch, by_reason, getattr(batch, by_reason) + 1)
                 else:
                     rows.append(
                         CandidateRow(
@@ -245,25 +278,40 @@ async def _process_batch(
                     )
         batch.candidates = len(rows)
         if recheck:
-            last_at = await last_fetched(conn, list(recheck))
+            names = list(recheck)
+            last_at = await last_fetched(conn, names)
+            # A name with an open job is being fetched already, e.g. after the
+            # same certificate reached another log's batch first: no second
+            # candidate. (Two batches committing at once can still both add
+            # one; the open-job index then keeps a single job.)
+            busy = await open_job_fqdns(conn, names)
             cutoff = datetime.now(timezone.utc) - timedelta(days=recheck_days)
-            for fqdn, (rec, ts_ms, index, key) in recheck.items():
+            for fqdn, r in recheck.items():
                 done = last_at.get(fqdn)  # never attempted: not re-checked
-                if done is None or done >= cutoff or sup.top_listed(rec.registrable):
+                if (
+                    done is None or done >= cutoff or fqdn in busy
+                    or sup.top_listed(r.rec.registrable)
+                ):
                     continue
                 rows.append(
                     CandidateRow(
-                        fqdn, rec.registrable, log_id, index, key, ts_ms, "recheck"
+                        fqdn, r.rec.registrable, log_id, r.index, r.cert_key, r.ts_ms,
+                        "recheck",
                     )
                 )
                 batch.candidates_recheck += 1
         last = entries[-1][0]
-        blob = bs.put(pack_entries(entries), RAW_MEDIA_TYPE)
+        data = pack_entries(entries)
+        # Held until the commit: prune cannot unlink this blob between put()
+        # (which keeps an existing file) and the commit referencing it.
+        await lock_blob(conn, hashlib.sha256(data).hexdigest())
+        blob = bs.put(data, RAW_MEDIA_TYPE)
         await add_raw_batch(conn, log_id, start, last, blob, len(entries), batch.bytes)
         await add_candidates(conn, rows)
         day = datetime.now(timezone.utc).date()
         await bump_stat(conn, log_id, day, **batch.increments())
-        await set_cursor(conn, log_id, last + 1)
+        if not await advance_cursor(conn, log_id, start, last + 1):
+            raise CursorMoved(f"{log_id}: cursor is no longer at {start}")
         await conn.commit()
     except BaseException:
         await conn.rollback()
@@ -291,9 +339,13 @@ class _Progress:
         if dt < PROGRESS_INTERVAL_S:
             return
         rate = self._n / dt if dt > 0 else 0.0
+        # next_index > size happens when a log's tree head (STH/checkpoint)
+        # lags behind the entries it already serves; the lag is then 0.
+        ahead = next_index - size
         self._log.info(
-            "tail %.1f entries/s lag=%d next_index=%d tree_size=%d",
-            rate, size - next_index, next_index, size,
+            "tail %.1f entries/s lag=%d next_index=%d tree_size=%d%s",
+            rate, max(0, -ahead), next_index, size,
+            f" (tree head {ahead} behind served entries)" if ahead > 0 else "",
         )
         self._t0 = time.monotonic()
         self._n = 0
@@ -352,12 +404,18 @@ class ConnPool:
                 return
             except Exception:
                 pass
+            except BaseException:  # cancelled mid-rollback: state unknown
+                with contextlib.suppress(Exception):
+                    await conn.close()
+                raise
         with contextlib.suppress(Exception):
             await conn.close()
 
     async def close(self) -> None:
+        """Close the idle connections; one failing to close does not stop the rest."""
         while self._idle:
-            await self._idle.pop().close()
+            with contextlib.suppress(Exception):
+                await self._idle.pop().close()
 
 
 def _borrow(db):
@@ -379,13 +437,18 @@ async def _tail_once(
     size = await src.tree_size()
     if next_index is None:
         try:
-            await set_cursor(conn, log_id, size)
+            created = await init_cursor(conn, log_id, size)
             await conn.commit()
         except BaseException:
             await conn.rollback()
             raise
-        _logger(src).info("no cursor; starting at tree_size=%d", size)
-        return 0, size, size
+        if created:
+            _logger(src).info("no cursor; starting at tree_size=%d", size)
+            return 0, size, size
+        # Another process created the cursor first; its value stands.
+        existing = await get_cursor(conn, log_id)
+        await conn.rollback()
+        return 0, size if existing is None else existing, size
     if next_index >= size:
         return 0, next_index, size
     end = _batch_end(src, next_index, size, cfg.batch_size)
@@ -423,20 +486,87 @@ async def tail_log(
 
     ``db`` is a ``ConnPool`` (a connection is borrowed per batch) or a
     connection. Logs entries/s and lag every PROGRESS_INTERVAL_S.
+
+    A readonly log no longer grows, so it is not tailed without a cursor
+    (it would start at its tree size and never yield an entry); with a cursor
+    it is followed until the cursor reaches the tree size, then this returns.
     """
     log = _logger(src)
     progress = _Progress(log)
     failures = _Failures(log)
-    while not stop.is_set():
+    readonly = src.info.state == "readonly"
+    while readonly and not stop.is_set():
         try:
             async with _borrow(db) as conn:
-                n, next_index, size = await _tail_once(src, cfg, ix, sup, bs, conn)
+                cursor = await get_cursor(conn, src.info.log_id)
+                await conn.rollback()
+            size = 0
+            if cursor is not None:
+                # Stop-aware like a batch: retry_get can wait minutes on 429/5xx.
+                # (The first batch asks for the tree size again; sharing it
+                # would change _tail_once's signature for one request.)
+                probe = asyncio.create_task(src.tree_size())
+                if not await _finish_or_stop(probe, stop):
+                    return
+                size = probe.result()
+        except Exception as e:
+            failures.warn("readonly check", e, IDLE_SLEEP_S)
+            await _sleep_or_stop(stop, IDLE_SLEEP_S)
+            continue
+        # A cursor that appears after this read was made by another process,
+        # which then tails the log; skipping here is right. Cursors are never
+        # deleted, so one seen here is still there for the batches below.
+        if cursor is None:
+            log.info("skipped (readonly, no cursor)")
+            return
+        if cursor >= size:
+            log.info("caught up (readonly)")
+            return
+        log.info("following until caught up (readonly, %d entries left)", size - cursor)
+        break
+    async def one_batch():
+        async with _borrow(db) as conn:
+            return await _tail_once(src, cfg, ix, sup, bs, conn)
+
+    while not stop.is_set():
+        batch = asyncio.create_task(one_batch())
+        if not await _finish_or_stop(batch, stop):
+            return  # stopped mid-batch; nothing was committed, nothing skipped
+        try:
+            n, next_index, size = batch.result()
             progress.note(n, next_index, size)
+            if readonly and next_index >= size:
+                # No final progress.note(): this line and the one above carry
+                # the end state, and a rate over the last partial interval
+                # would say nothing useful about a log that has stopped.
+                log.info("caught up (readonly)")
+                return
         except Exception as e:
             failures.warn("batch", e, IDLE_SLEEP_S)
             n = 0
         if n == 0:
             await _sleep_or_stop(stop, IDLE_SLEEP_S)
+
+
+async def _finish_or_stop(task: asyncio.Task, stop: asyncio.Event) -> bool:
+    """Wait for ``task``; True once it is done, False if stop ended it.
+
+    A log stuck in rate limiting keeps a batch in retry_get for up to
+    Retry-After (600 s), so a set ``stop`` gives the batch STOP_GRACE_S to
+    commit and then cancels it. Cancelling is safe: the cursor advances only
+    with the batch's commit, so the next run repeats the batch.
+    """
+    stopper = asyncio.create_task(stop.wait())
+    try:
+        await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+        if not task.done():
+            await asyncio.wait({task}, timeout=STOP_GRACE_S)
+    finally:
+        stopper.cancel()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    return not task.cancelled()
 
 
 def _load_suppressor(cfg: Config) -> Suppressor:
@@ -455,55 +585,46 @@ async def run(cfg: Config) -> None:
     ``_tail_once``). The tasks share one HTTP client, one first-seen index and
     a ``ConnPool`` of at most ``cfg.max_db_connections`` connections.
     SIGINT/SIGTERM set the stop event (tail stops between batches); a second
-    signal cancels the run.
+    signal cancels the run. The log lists are read once, here: a log added to
+    them later is tailed from the next start on.
     """
     root = logging.getLogger(__name__)
     sup = _load_suppressor(cfg)
     bs = BlobStore(cfg.data_dir / "blobs")
     stop = asyncio.Event()
-    loop = asyncio.get_running_loop()
-    main = asyncio.current_task()
-
-    def on_signal() -> None:
-        if stop.is_set() and main is not None:
-            main.cancel()
-        stop.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, on_signal)
     pool = ConnPool(cfg.database_url, cfg.max_db_connections)
-    try:
-        conn = await connect(cfg.database_url)
+    with stop_on_signals(stop):
         try:
-            await migrate(conn)
+            conn = await connect(cfg.database_url)
+            try:
+                await migrate(conn)
+            finally:
+                await conn.close()
+
+            async with httpx.AsyncClient(
+                timeout=60, headers={"User-Agent": USER_AGENT}
+            ) as client:
+                logs = await fetch_log_lists(cfg.log_lists, client)
+                root.info("%d active logs", len(logs))
+                with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
+
+                    async def one(info) -> None:
+                        # Never raises: a failing log must not end gather() early,
+                        # which would close the shared index and client under the
+                        # sibling tasks still using them.
+                        log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
+                        try:
+                            src = make_source(info, client)
+                            await tail_log(src, cfg, ix, sup, bs, pool, stop)
+                        except Exception:
+                            log.exception("log task failed (%s)", info.description)
+
+                    results = await asyncio.gather(
+                        *(one(info) for info in logs), return_exceptions=True
+                    )
+                    for info, res in zip(logs, results):
+                        if isinstance(res, BaseException):
+                            root.error("log task %s escaped: %r", info.log_id, res)
         finally:
-            await conn.close()
+            await pool.close()
 
-        async with httpx.AsyncClient(
-            timeout=60, headers={"User-Agent": USER_AGENT}
-        ) as client:
-            logs = await fetch_log_lists(cfg.log_lists, client)
-            root.info("%d active logs", len(logs))
-            with FirstSeenIndex(cfg.data_dir / "firstseen") as ix:
-
-                async def one(info) -> None:
-                    # Never raises: a failing log must not end gather() early,
-                    # which would close the shared index and client under the
-                    # sibling tasks still using them.
-                    log = logging.getLogger(f"hakapik.ingest.{info.log_id}")
-                    try:
-                        src = make_source(info, client)
-                        await tail_log(src, cfg, ix, sup, bs, pool, stop)
-                    except Exception:
-                        log.exception("log task failed (%s)", info.description)
-
-                results = await asyncio.gather(
-                    *(one(info) for info in logs), return_exceptions=True
-                )
-                for info, res in zip(logs, results):
-                    if isinstance(res, BaseException):
-                        root.error("log task %s escaped: %r", info.log_id, res)
-    finally:
-        await pool.close()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(sig)

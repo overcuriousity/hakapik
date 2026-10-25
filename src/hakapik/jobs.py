@@ -7,10 +7,11 @@ transactions short.
 """
 
 from datetime import datetime
+from typing import NamedTuple
 
 import psycopg
 
-from hakapik.names import normalize
+from hakapik.names import NameRecord, normalize
 from hakapik.protocol import Job
 
 
@@ -18,7 +19,17 @@ class _LostRace(Exception):
     pass
 
 
-async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> list[Job]:
+class Claim(NamedTuple):
+    """A leased job and the claimed_until this claim set: the claim's token.
+
+    The token stays out of ``Job``, which is the worker protocol's wire type.
+    """
+
+    job: Job
+    claimed_until: datetime
+
+
+async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> list[Claim]:
     """Lease up to ``n`` due open jobs, highest priority and newest first."""
     cur = await conn.execute(
         """UPDATE fetch_job SET claimed_until = now() + make_interval(secs => %s)
@@ -29,11 +40,34 @@ async def claim_jobs(conn: psycopg.AsyncConnection, n: int, lease_s: int) -> lis
              ORDER BY priority DESC, due_at DESC
              LIMIT %s
              FOR UPDATE SKIP LOCKED)
-           RETURNING id, candidate_id, fqdn, registrable, step, priority, due_at""",
+           RETURNING id, candidate_id, fqdn, registrable, step, priority, due_at,
+                     claimed_until""",
         (lease_s, n),
     )
     rows = sorted(await cur.fetchall(), key=lambda r: (-r[5], -r[6].timestamp()))
-    return [Job(r[0], r[1], r[2], r[3], r[4], f"https://{r[2]}/") for r in rows]
+    return [Claim(Job(r[0], r[1], r[2], r[3], r[4], f"https://{r[2]}/"), r[7])
+            for r in rows]
+
+
+async def extend_lease(
+    conn: psycopg.AsyncConnection, job_id: int, step: int, lease_s: int,
+    claimed_until: datetime,
+) -> datetime | None:
+    """Push a held lease to now() + lease_s; the new token, or None if not held.
+
+    The lease is held while the job is open at ``step`` and its claimed_until
+    is still ``claimed_until`` (the token this holder last wrote). None means
+    the claim was lost (re-claimed after expiry) or the job moved on.
+    """
+    cur = await conn.execute(
+        """UPDATE fetch_job SET claimed_until = now() + make_interval(secs => %s)
+           WHERE id = %s AND claimed_until = %s
+             AND state = 'open' AND step = %s  -- belt
+           RETURNING claimed_until""",
+        (lease_s, job_id, claimed_until, step),
+    )
+    row = await cur.fetchone()
+    return None if row is None else row[0]
 
 
 async def advance_job(
@@ -56,15 +90,24 @@ async def advance_job(
 
 
 async def sweep(
-    conn: psycopg.AsyncConnection, ageout_hours: float, queue_cap: int | None
+    conn: psycopg.AsyncConnection, ageout_hours: float, queue_cap: int | None,
+    ladder: tuple[int, ...],
 ) -> int:
-    """Age out stale untried jobs, then the lowest-ranked excess over the cap."""
+    """Age out stale jobs, then the lowest-ranked untried excess over the cap.
+
+    Stale: an untried (step 0) job older than ageout_hours, or any open job
+    older than the last ladder step plus ageout_hours (a job whose retries
+    keep failing to store would otherwise stay open for ever). Leased jobs
+    are spared.
+    """
     cur = await conn.execute(
         """UPDATE fetch_job SET state = 'aged_out'
-           WHERE state = 'open' AND step = 0
+           WHERE state = 'open'
              AND (claimed_until IS NULL OR claimed_until <= now())
-             AND created_at < now() - make_interval(secs => %s * 3600)""",
-        (ageout_hours,),
+             AND (
+               (step = 0 AND created_at < now() - make_interval(secs => %s * 3600))
+               OR created_at < now() - make_interval(secs => %s + %s * 3600))""",
+        (ageout_hours, ladder[-1], ageout_hours),
     )
     count = cur.rowcount
     if queue_cap is not None:
@@ -109,87 +152,114 @@ async def last_fetched(
     return dict(await cur.fetchall())
 
 
+async def open_job_fqdns(conn: psycopg.AsyncConnection, fqdns: list[str]) -> set[str]:
+    """The FQDNs among ``fqdns`` that have an open fetch job."""
+    cur = await conn.execute(
+        "SELECT fqdn FROM fetch_job WHERE state = 'open' AND fqdn = ANY(%s)", (fqdns,)
+    )
+    return {r[0] for r in await cur.fetchall()}
+
+
 async def enqueue_manual(
     conn: psycopg.AsyncConnection, names: list[str]
 ) -> list[tuple[str, str]]:
-    """Queue names by hand: (input, queued | already_open | invalid | wildcard)."""
-    out: list[tuple[str, str]] = []
-    for name in names:
+    """Queue names by hand: (input, queued | already_open | invalid | wildcard).
+
+    Results come back in input order.
+    """
+    status: dict[int, str] = {}
+    valid = []
+    for i, name in enumerate(names):
         rec = normalize(name)
         if rec.wildcard:
-            out.append((name, "wildcard"))
-            continue
-        if not rec.valid:
-            out.append((name, "invalid"))
-            continue
-        cur = await conn.execute(
-            "SELECT 1 FROM fetch_job WHERE fqdn = %s AND state = 'open'", (rec.fqdn,)
-        )
-        if await cur.fetchone():
-            out.append((name, "already_open"))
-            continue
-        # The SELECT above is only a fast path. A concurrent enqueue can still win
-        # the unique open-job index, so the job insert reports whether it created a
-        # row; if not, the savepoint rolls the candidate back (no orphan).
-        try:
-            async with conn.transaction():
-                cur = await conn.execute(
-                    """INSERT INTO candidate (fqdn, registrable, reason)
-                       VALUES (%s, %s, 'manual') RETURNING id""",
-                    (rec.fqdn, rec.registrable),
-                )
-                cid = (await cur.fetchone())[0]
-                cur = await conn.execute(
-                    """INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
-                       VALUES (%s, %s, %s, now())
-                       ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING
-                       RETURNING id""",
-                    (cid, rec.fqdn, rec.registrable),
-                )
-                if await cur.fetchone() is None:
-                    raise _LostRace
-        except _LostRace:
-            out.append((name, "already_open"))
-            continue
-        out.append((name, "queued"))
-    return out
+            status[i] = "wildcard"
+        elif not rec.valid:
+            status[i] = "invalid"
+        else:
+            valid.append((i, rec))
+    # Insert in one global order by fqdn, as db.add_candidates does: a
+    # concurrent tail or enqueue waits on the same unique open-job index, and
+    # one order for everyone rules out deadlocks.
+    for i, rec in sorted(valid, key=lambda v: v[1].fqdn):
+        status[i] = await _enqueue_one(conn, rec)
+    return [(name, status[i]) for i, name in enumerate(names)]
+
+
+async def _enqueue_one(conn: psycopg.AsyncConnection, rec: NameRecord) -> str:
+    cur = await conn.execute(
+        "SELECT 1 FROM fetch_job WHERE fqdn = %s AND state = 'open'", (rec.fqdn,)
+    )
+    if await cur.fetchone():
+        return "already_open"
+    # The SELECT above is only a fast path. A concurrent enqueue can still win
+    # the unique open-job index, so the job insert reports whether it created a
+    # row; if not, the savepoint rolls the candidate back (no orphan).
+    try:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """INSERT INTO candidate (fqdn, registrable, reason)
+                   VALUES (%s, %s, 'manual') RETURNING id""",
+                (rec.fqdn, rec.registrable),
+            )
+            cid = (await cur.fetchone())[0]
+            cur = await conn.execute(
+                """INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
+                   VALUES (%s, %s, %s, now())
+                   ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING
+                   RETURNING id""",
+                (cid, rec.fqdn, rec.registrable),
+            )
+            if await cur.fetchone() is None:
+                raise _LostRace
+    except _LostRace:
+        return "already_open"
+    return "queued"
 
 
 async def show_fqdn(conn: psycopg.AsyncConnection, fqdn: str) -> list[dict]:
-    """Read-only history of an FQDN: candidates with jobs, attempts, latest manifest."""
+    """Read-only history of an FQDN: candidates with jobs, attempts, latest manifest.
+
+    Four queries whatever the history's length (one per table).
+    """
     cur = await conn.execute(
         "SELECT id, reason, created_at FROM candidate WHERE fqdn = %s ORDER BY id",
         (fqdn,),
     )
-    out = []
-    for cid, reason, created_at in await cur.fetchall():
-        cur = await conn.execute(
-            """SELECT id, state, step, due_at FROM fetch_job
-               WHERE candidate_id = %s ORDER BY id""",
-            (cid,),
+    cands = await cur.fetchall()
+    cids = [c[0] for c in cands]
+    cur = await conn.execute(
+        """SELECT id, candidate_id, state, step, due_at FROM fetch_job
+           WHERE candidate_id = ANY(%s) ORDER BY id""",
+        (cids,),
+    )
+    jobs = await cur.fetchall()
+    cur = await conn.execute(
+        """SELECT job_id, step, started_at, outcome, http_status, final_url,
+                  asn, asn_org
+           FROM attempt WHERE job_id = ANY(%s) ORDER BY job_id, step""",
+        ([j[0] for j in jobs],),
+    )
+    attempts: dict[int, list[dict]] = {}
+    for jid, *rest in await cur.fetchall():
+        attempts.setdefault(jid, []).append(
+            dict(zip(("step", "started_at", "outcome", "http_status",
+                      "final_url", "asn", "asn_org"), rest))
         )
-        jobs = []
-        for jid, state, step, due_at in await cur.fetchall():
-            cur = await conn.execute(
-                """SELECT step, started_at, outcome, http_status, final_url,
-                          asn, asn_org
-                   FROM attempt WHERE job_id = %s ORDER BY step""",
-                (jid,),
-            )
-            attempts = [
-                dict(zip(("step", "started_at", "outcome", "http_status",
-                          "final_url", "asn", "asn_org"), r))
-                for r in await cur.fetchall()
-            ]
-            jobs.append({"state": state, "step": step, "due_at": due_at,
-                         "attempts": attempts})
-        cur = await conn.execute(
-            """SELECT version, sha256 FROM manifest
-               WHERE candidate_id = %s ORDER BY version DESC LIMIT 1""",
-            (cid,),
+    cur = await conn.execute(
+        """SELECT DISTINCT ON (candidate_id) candidate_id, version, sha256
+           FROM manifest WHERE candidate_id = ANY(%s)
+           ORDER BY candidate_id, version DESC""",
+        (cids,),
+    )
+    manifests = {r[0]: {"version": r[1], "sha256": r[2]} for r in await cur.fetchall()}
+    by_cand: dict[int, list[dict]] = {}
+    for jid, cid, state, step, due_at in jobs:
+        by_cand.setdefault(cid, []).append(
+            {"state": state, "step": step, "due_at": due_at,
+             "attempts": attempts.get(jid, [])}
         )
-        m = await cur.fetchone()
-        out.append({"id": cid, "reason": reason, "created_at": created_at,
-                    "jobs": jobs,
-                    "manifest": {"version": m[0], "sha256": m[1]} if m else None})
-    return out
+    return [
+        {"id": cid, "reason": reason, "created_at": created_at,
+         "jobs": by_cand.get(cid, []), "manifest": manifests.get(cid)}
+        for cid, reason, created_at in cands
+    ]

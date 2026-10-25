@@ -13,7 +13,9 @@ RETRY_AFTER_CAP = 600.0
 
 def _retry_after(response: httpx.Response) -> float | None:
     value = response.headers.get("Retry-After")
-    if value is not None and value.strip().isdigit():
+    # isascii(): str.isdigit() also accepts e.g. Arabic-Indic digits, which
+    # float() would then parse as a number the log never meant.
+    if value is not None and value.strip().isascii() and value.strip().isdigit():
         return min(float(value), RETRY_AFTER_CAP)
     return None
 

@@ -13,17 +13,19 @@ outcome.
 import asyncio
 import base64
 import functools
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from urllib.parse import urldefrag, urlsplit
+from urllib.parse import quote, urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from playwright.async_api import async_playwright
 
 from hakapik.protocol import PageResult
+from hakapik.recorder import BLANK, Nav, Recorder
 from hakapik.warc import Exchange, build_warc
 
 log = logging.getLogger(__name__)
@@ -59,17 +61,20 @@ _HINTS: dict[str, dict] = {
                 "model": "", "mobile": False, "bitness": "64", "wow64": False},
 }
 
-MAX_CHAIN = 50
 MAX_CLICKS = 3
 MAX_LABEL = 200
 LOGIN_PATTERN = re.compile(r"log ?in|sign ?in|anmelden|einloggen|connexion|se connecter|"
                            r"iniciar sesi[oó]n|accedi|inloggen", re.IGNORECASE)
 DRAIN_FLOOR_S = 2.0  # minimum wait for in-flight exchanges, however late
-_BLANK = ("about:blank", "chrome-error:")
 
 # Visible login elements in document order: with n < 0 their labels, else
 # the n-th element if its label is still ``label``, else the first element
-# with that label, else null.
+# with that label, else null. It never runs in the page's own JS world, where
+# the page could rewrite querySelectorAll, innerText or RegExp to hide its
+# login: labels come from a CDP isolated world (_login_labels), the element
+# from a playwright content-script selector engine (_LOGIN_ENGINE), which
+# runs in playwright's isolated utility world. Both see the DOM, not the
+# page's JS objects.
 _LOGIN_JS = """([pattern, n, label]) => {
   const re = new RegExp(pattern, "i");
   const found = [];
@@ -85,6 +90,21 @@ _LOGIN_JS = """([pattern, n, label]) => {
   const same = found.find(f => f[1] === label);
   return same ? same[0] : null;
 }""" % (MAX_LABEL, MAX_CLICKS)
+
+# Selector body: the URI-encoded JSON of [pattern, n, label], so no label
+# text can reach playwright's selector syntax.
+_LOGIN_ENGINE = "hakapik-login"
+_LOGIN_ENGINE_JS = """{
+  queryAll(root, selector) {
+    const el = (%s)(JSON.parse(decodeURIComponent(selector)));
+    return el ? [el] : [];
+  },
+  query(root, selector) { return this.queryAll(root, selector)[0] || null; },
+}""" % _LOGIN_JS
+
+
+def _login_selector(n: int, label: str) -> str:
+    return f"{_LOGIN_ENGINE}={quote(json.dumps([LOGIN_PATTERN.pattern, n, label]), safe='')}"
 
 
 @dataclass(frozen=True)
@@ -123,7 +143,7 @@ def classify(error: str | None, status: int | None) -> str:
             return "connect_fail"
         if re.search(r"ERR_(CERT|SSL)_", error):
             return "tls_error"
-        if error.startswith("TimeoutError"):
+        if error.startswith(("TimeoutError", "load timeout")):
             return "timeout"
         return "error"
     if status is not None and status >= 400:
@@ -139,129 +159,13 @@ def _error_text(e: Exception) -> str:
     return msg if isinstance(e, PlaywrightError) else f"{type(e).__name__}: {msg}"
 
 
-def _safe(fn, *args):
-    """An event handler; an exception in it would surface inside playwright's
-    dispatcher."""
-    def handler(x):
-        try:
-            fn(*args, x)
-        except Exception:
-            log.warning("event handler %s failed", fn.__name__, exc_info=True)
-    return handler
-
-
-class _Nav:
-    """One page's main-frame URL chain and document responses."""
-
-    def __init__(self):
-        self.chain: list[str] = []
-        self.responses: dict = {}  # URL -> last non-redirect main-frame response
-        self.failure: str | None = None  # error of the last failed navigation
-
-    def add(self, url: str):
-        if len(self.chain) < MAX_CHAIN and not url.startswith(_BLANK):
-            self.chain.append(url)
-
-    def response_for(self, url: str | None):
-        """The document response for ``url``, never another document's."""
-        return self.responses.get(urldefrag(url).url) if url else None
-
-
-class _Recorder:
-    """Collects one context's exchanges and each of its pages' navigations."""
-
-    def __init__(self):
-        self.tasks: list[asyncio.Task] = []
-        self.blocked: set = set()
-        self.navs: dict = {}  # page -> _Nav
-        self.open = True
-
-    def watch(self, context):
-        context.on("requestfinished", _safe(self._spawn, False))
-        context.on("requestfailed", _safe(self._spawn, True))
-        context.on("requestfailed", _safe(self._on_failed))
-        context.on("request", _safe(self._on_request))
-        context.on("response", _safe(self._on_response))
-
-    def nav(self, page) -> _Nav:
-        """``page``'s navigations; pages the site opens are tracked on their own."""
-        if page not in self.navs:
-            self.navs[page] = _Nav()
-            page.on("framenavigated", _safe(self._on_navigated, page))
-        return self.navs[page]
-
-    def _main_nav(self, req) -> _Nav | None:
-        if not req.is_navigation_request():
-            return None
-        frame = req.frame
-        return self.nav(frame.page) if frame.parent_frame is None else None
-
-    def _on_request(self, req):
-        if nav := self._main_nav(req):
-            nav.add(req.url)  # every hop, HTTP redirects included
-
-    def _on_failed(self, req):
-        if nav := self._main_nav(req):
-            nav.failure = req.failure
-
-    def _on_navigated(self, page, frame):
-        # Same-document navigations have no request of their own.
-        nav = self.navs[page]
-        if frame == page.main_frame and (not nav.chain or nav.chain[-1] != frame.url):
-            nav.add(frame.url)
-
-    def _on_response(self, resp):
-        if ((nav := self._main_nav(resp.request))
-                and not (300 <= resp.status < 400 and "location" in resp.headers)):
-            nav.responses[urldefrag(resp.url).url] = resp
-
-    def _spawn(self, failed: bool, req):
-        if self.open and req not in self.blocked:
-            self.tasks.append(asyncio.ensure_future(self._exchange(req, failed)))
-
-    async def _exchange(self, req, failed: bool) -> Exchange:
-        start = req.timing.get("startTime", -1)
-        at = datetime.fromtimestamp(start / 1000, UTC) if start > 0 else _now()
-        resp = None if failed else await req.response()
-        req_headers = tuple((h["name"], h["value"]) for h in await req.headers_array())
-        status, status_text, resp_headers, body, ip = 0, "", (), b"", None
-        unavailable = False
-        if resp is not None:
-            status, status_text = resp.status, resp.status_text
-            resp_headers = tuple((h["name"], h["value"]) for h in await resp.headers_array())
-            try:
-                body = await resp.body()
-            except PlaywrightError:  # redirects have none; evicted bodies are marked
-                unavailable = not (300 <= status < 400 and "location" in resp.headers)
-            ip = ((await resp.server_addr()) or {}).get("ipAddress")
-        return Exchange(url=req.url, method=req.method, request_headers=req_headers,
-                        request_body=req.post_data_buffer, status=status,
-                        status_text=status_text, response_headers=resp_headers,
-                        body=body, server_ip=ip, at=at, body_unavailable=unavailable)
-
-    async def exchanges(self, timeout_s: float) -> list[Exchange]:
-        """Stop recording and return what finished within ``timeout_s``."""
-        self.open = False
-        if not self.tasks:
-            return []
-        await asyncio.wait(self.tasks, timeout=timeout_s)
-        for t in self.tasks:
-            t.cancel()
-        results = await asyncio.gather(*self.tasks, return_exceptions=True)
-        out = []
-        for r in results:
-            if isinstance(r, Exchange):
-                out.append(r)
-            elif not isinstance(r, asyncio.CancelledError):
-                log.debug("exchange not recorded: %r", r)
-        return out
-
-
 class _ClickFailed(Exception):
     """A click hop that cannot click; its message is the reason."""
 
 
 class Browser:
+    LAUNCH_ARGS: tuple[str, ...] = ("--disable-blink-features=AutomationControlled",)
+
     def __init__(self, *, proxy: str | None, nav_timeout_s: float, settle_s: float = 3.0):
         self.proxy = proxy
         self.nav_timeout_s = nav_timeout_s
@@ -271,13 +175,16 @@ class Browser:
         self._browser = None
         self._brands: list[dict] = []
         self._full_versions: list[dict] = []
+        self._late_closes: set[asyncio.Task] = set()
 
     async def __aenter__(self) -> "Browser":
         self._pw = await async_playwright().start()
         try:
+            await self._pw.selectors.register(_LOGIN_ENGINE, _LOGIN_ENGINE_JS,
+                                              content_script=True)
             self._browser = await self._pw.chromium.launch(
                 channel="chromium",
-                args=["--disable-blink-features=AutomationControlled"],
+                args=list(self.LAUNCH_ARGS),
                 proxy={"server": self.proxy} if self.proxy else None)
         except BaseException:
             await self._pw.stop()
@@ -293,7 +200,12 @@ class Browser:
     async def _chromium_brands(self) -> tuple[list[dict], list[dict]]:
         """Chromium's own brand lists (GREASE included), as navigator.userAgentData
         reports them. userAgentData needs a secure context: a routed https page,
-        no network involved."""
+        no network involved.
+
+        This costs one context and blank page per Browser, once at startup.
+        No cheaper source exists: Browser.getVersion has no brand list, and the
+        GREASE brand is Chromium's own choice per version, so copying its
+        algorithm would break silently on an update."""
         context = await self._browser.new_context()
         try:
             async def blank(route):
@@ -309,6 +221,9 @@ class Browser:
             await context.close()
 
     async def __aexit__(self, *exc):
+        for t in self._late_closes:  # the browser's close ends those contexts anyway
+            t.cancel()
+        await asyncio.gather(*self._late_closes, return_exceptions=True)
         try:
             await self._browser.close()
         finally:
@@ -354,7 +269,7 @@ class Browser:
             return None
 
     @classmethod
-    async def _freeze(cls, page, cdp, rec: _Recorder, deadline: float):
+    async def _freeze(cls, page, cdp, rec: Recorder, deadline: float):
         """Stop ``page`` where it is: a page that keeps navigating never yields
         a frame or DOM. ``cdp`` may be None (then only navigations are held).
 
@@ -366,10 +281,19 @@ class Browser:
         bounded = functools.partial(cls._bounded, deadline=deadline)
 
         async def hold(route):
+            # Never leaves the route unresolved: that would hang the request.
             req = route.request
             try:
-                if req.is_navigation_request() and req.frame == page.main_frame:
-                    rec.blocked.add(req)  # our doing, not the site's: kept out of the WARC
+                ours = req.is_navigation_request() and req.frame == page.main_frame
+            except Exception:  # cannot judge it: let it through
+                log.debug("navigation hold cannot judge %s", req, exc_info=True)
+                ours = False
+            try:
+                if ours:
+                    # Our doing, not the site's: kept out of the WARC. Its URL
+                    # stays in the page's chain (the site asked for it), so
+                    # the chain may end past final_url.
+                    rec.blocked.add(req)
                     await route.abort("aborted")
                 else:
                     await route.fallback()
@@ -381,7 +305,35 @@ class Browser:
             await bounded(cdp.send("Emulation.setScriptExecutionDisabled", {"value": True}))
             await bounded(cdp.send("Page.stopLoading"))
 
-    async def _click(self, context, rec: _Recorder, url: str, profile: str, n: int,
+    @staticmethod
+    async def _login_labels(cdp):
+        """The landing's login labels, matched in an isolated world of its
+        main frame (works with the page's scripts disabled)."""
+        tree = await cdp.send("Page.getFrameTree")
+        world = await cdp.send("Page.createIsolatedWorld", {
+            "frameId": tree["frameTree"]["frame"]["id"], "worldName": "hakapik"})
+        args = json.dumps([LOGIN_PATTERN.pattern, -1, None])
+        r = await cdp.send("Runtime.evaluate", {
+            "expression": f"({_LOGIN_JS})({args})", "returnByValue": True,
+            "contextId": world["executionContextId"]})
+        return r["result"].get("value")
+
+    @staticmethod
+    async def _new_popup(context, popups: list, before: set, left, notes: list[str]):
+        """The first of ``popups`` whose target is not in ``before``, with a
+        CDP session; (None, None) if there is none."""
+        for p in popups:
+            try:
+                cdp = await asyncio.wait_for(context.new_cdp_session(p), left())
+                info = await asyncio.wait_for(cdp.send("Target.getTargetInfo"), left())
+            except (PlaywrightError, TimeoutError) as e:
+                notes.append(f"popup unreadable: {_error_text(e)}")
+                continue
+            if info["targetInfo"]["targetId"] not in before:
+                return p, cdp
+        return None, None
+
+    async def _click(self, context, rec: Recorder, url: str, profile: str, n: int,
                      label: str, deadline: float) -> ClickCapture:
         """Hop ``n`` (from 0): a new page goes to ``url``, settles, clicks the
         login element labelled ``label`` (the n-th, unless the page moved it)
@@ -392,7 +344,10 @@ class Browser:
         for DOMContentLoaded only, at most a third of nav_timeout_s, so a dead
         tracker cannot use up the hop. If the click opened a popup, the first
         one is captured instead of the page. Nothing on the clicked page is
-        clicked. A failed click is outcome "error".
+        clicked. A failed click is outcome "error"; a click whose navigation
+        never commits is outcome "timeout". Only playwright's own click
+        timeout can tell that; if asyncio's bound fires first (a wedged
+        driver), the hop is "error".
         """
         loop = asyncio.get_running_loop()
         started = _now()
@@ -404,9 +359,9 @@ class Browser:
 
         notes: list[str] = []  # evidence kept all the same, as on the landing page
         nav_error = status = server_ip = final_url = None
-        clicked = False
+        clicked = hung = False
         screenshot = dom = None
-        nav = _Nav()
+        nav = Nav()
         try:
             page = await asyncio.wait_for(context.new_page(), left())
             nav = rec.nav(page)
@@ -420,13 +375,35 @@ class Browser:
                 if not nav.responses:
                     raise
             await asyncio.sleep(min(self.settle_s, left()))
-            handle = await asyncio.wait_for(
-                page.evaluate_handle(_LOGIN_JS, [LOGIN_PATTERN.pattern, n, label]), left())
-            if (element := handle.as_element()) is None:
+            element = await asyncio.wait_for(
+                page.query_selector(_login_selector(n, label)), left())
+            if element is None:
                 raise _ClickFailed("element changed")
-            popups.clear()  # only a popup of the click counts, not the landing's own
-            await asyncio.wait_for(element.click(timeout=left() * 1000), left())
-            clicked = True
+            # Targets that exist now are not the click's popups, even when
+            # playwright reports them only after the click.
+            targets = await asyncio.wait_for(cdp.send("Target.getTargets"), left())
+            before = {t["targetId"] for t in targets["targetInfos"]}
+            unanswered_before = set(nav.unanswered)
+            budget = left()
+            try:
+                # Playwright's click waits, within its timeout, for a
+                # navigation it starts to commit; asyncio's bound is a margin
+                # behind it (within the reserve, so never past ``deadline``),
+                # so playwright's timeout, with its log, comes first.
+                await asyncio.wait_for(element.click(timeout=budget * 1000),
+                                       budget + min(0.5, reserve))
+            except PlaywrightTimeout as e:
+                # Hung only if the click went out (playwright logged it) and a
+                # navigation started since is still unanswered; a moving URL
+                # or a blocked click is a failed click. The log line is
+                # playwright 1.64.x's (pinned in pyproject.toml); guarded by
+                # test_hop_budget_bounds_a_hanging_click_target.
+                if "click action done" not in e.message or not (
+                        nav.unanswered - unanswered_before):
+                    raise
+                hung = True
+                nav_error = _error_text(e)
+            clicked = not hung
         except _ClickFailed as e:
             nav_error = f"click failed: {e}"
         except Exception as e:  # anything the page does; the hop's budget included
@@ -436,16 +413,16 @@ class Browser:
             try:
                 await asyncio.wait_for(
                     page.wait_for_load_state("load", timeout=left() * 1000), left())
+                await asyncio.sleep(min(self.settle_s, left()))
+                # A navigation the page starts later (a timer, say) may have
+                # committed during the settle: its document loads first.
+                await asyncio.wait_for(
+                    page.wait_for_load_state("load", timeout=left() * 1000), left())
             except (PlaywrightError, TimeoutError):
                 notes.append("load timeout")
-            await asyncio.sleep(min(self.settle_s, left()))
-            if popups:
-                target = popups[0]
-                try:
-                    cdp = await asyncio.wait_for(context.new_cdp_session(target), left())
-                except (PlaywrightError, TimeoutError) as e:
-                    cdp = None
-                    notes.append(f"popup not frozen: {_error_text(e)}")
+            popup, popup_cdp = await self._new_popup(context, popups, before, left, notes)
+            if popup is not None:
+                target, cdp = popup, popup_cdp
                 try:
                     await asyncio.wait_for(
                         target.wait_for_load_state("load", timeout=left() * 1000), left())
@@ -458,7 +435,7 @@ class Browser:
                 await self._freeze(target, cdp, rec, deadline)
                 screenshot = await bounded(target.screenshot(
                     type="png", timeout=max(deadline - loop.time(), 0.001) * 1000))
-            if not target.url.startswith(_BLANK):
+            if not target.url.startswith(BLANK):
                 final_url = target.url
             elif not nav_error:  # e.g. a popup that never got a document
                 nav_error = "no document"
@@ -469,20 +446,65 @@ class Browser:
             dom = content.encode("utf-8") if content is not None else None
             outcome = classify(nav_error, status)
         else:
-            outcome = "error"
+            outcome = classify(nav_error, None) if hung else "error"
         error = "; ".join(([nav_error] if nav_error else []) + notes) or None
         return ClickCapture(label=label, screenshot=screenshot, dom=dom, page=PageResult(
             profile=f"{profile}-click{n + 1}", outcome=outcome, http_status=status,
             final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),
             error=error, started_at=_rfc3339(started), finished_at=_rfc3339(_now())))
 
+    def _close_late_context(self, create: asyncio.Future):
+        """Close a context that arrived after its capture gave up."""
+        if create.cancelled() or create.exception() is not None:  # retrieved: no warning
+            return
+        task = asyncio.ensure_future(create.result().close())
+        self._late_closes.add(task)  # a reference until it is done
+
+        def done(t: asyncio.Task):
+            self._late_closes.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                log.warning("closing a late context failed: %s", t.exception())
+        task.add_done_callback(done)
+
+    @staticmethod
+    async def _end_hop(rec: Recorder, pages: list, tasks: list, deadline: float):
+        """Close a hop's pages once its exchanges are in, as the final drain
+        would wait for them (what is left of ``deadline``, at least
+        DRAIN_FLOOR_S); requests still open then end with the hop."""
+        loop = asyncio.get_running_loop()
+        if tasks:
+            await asyncio.wait(tasks, timeout=max(deadline - loop.time(), DRAIN_FLOOR_S))
+        for p in pages:
+            try:
+                await asyncio.wait_for(p.close(), DRAIN_FLOOR_S)
+            except (PlaywrightError, TimeoutError):
+                log.debug("closing a click page failed", exc_info=True)
+
     async def capture(self, url: str, profile: str, *, click_through: bool = False) -> Capture:
         settings = self._profile(profile)
         started = _now()
         loop = asyncio.get_running_loop()
-        context = await self._browser.new_context(**settings, accept_downloads=False)
-        rec = _Recorder()
-        nav = _Nav()  # replaced by the page's once it exists
+        setup_by = loop.time() + self.nav_timeout_s
+
+        async def setup(coro):
+            """A step before navigation: only a wedged browser takes long."""
+            try:
+                return await asyncio.wait_for(coro, max(setup_by - loop.time(), 0.001))
+            except TimeoutError:
+                raise TimeoutError("browser setup took over nav_timeout_s") from None
+
+        # Raises if the browser is wedged: there is no page yet to blame. A
+        # context that arrives after that, or after the capture was cancelled,
+        # is closed then, not left open.
+        create = asyncio.ensure_future(
+            self._browser.new_context(**settings, accept_downloads=False))
+        try:
+            context = await setup(asyncio.shield(create))
+        except BaseException:
+            create.add_done_callback(self._close_late_context)
+            raise
+        rec = Recorder()
+        nav = Nav()  # replaced by the page's once it exists
         hint_tasks: list[asyncio.Task] = []  # prepare_page of pages the site opens
         error = status = server_ip = final_url = deadline = None
         load_timeout = False
@@ -495,14 +517,24 @@ class Browser:
                 rec.blocked.add(route.request)
                 await route.abort()
 
-            await context.route("**/favicon.ico", no_favicon)
+            await setup(context.route("**/favicon.ico", no_favicon))
             rec.watch(context)
-            page = await context.new_page()
+            page = await setup(context.new_page())
             nav = rec.nav(page)
-            cdp = await self.prepare_page(context, page, profile)
-            # Pages the site opens itself get the same client hints (best effort:
-            # a popup's first request may leave before this lands). Our own click
-            # pages get them twice, with the same values.
+            cdp = await setup(self.prepare_page(context, page, profile))
+            # Pages the site opens itself get the same client hints, from when
+            # playwright reports them: only after their first document has
+            # committed. Requests before that carry the profile's UA string and
+            # Chromium's brands, but the rest of UA-CH is what Chromium gives a
+            # new window: its own values for a link popup (sec-ch-ua-platform
+            # "Linux" on a Linux host), playwright's guess from the UA for
+            # window.open. Playwright has no earlier hook: a route cannot change
+            # sec-ch-* headers (Chromium sets them again), aborting the first
+            # navigation to repeat it makes playwright never report the page,
+            # and browser-level auto-attach needs a flat CDP session playwright
+            # does not expose. Pinned by test_popup_requests_agree_with_the_profile.
+            # Our own pages are prepared before they navigate; click pages get
+            # the hints twice, with the same values.
             context.on("page", lambda p: hint_tasks.append(
                 asyncio.ensure_future(self.prepare_page(context, p, profile))))
             try:
@@ -517,13 +549,19 @@ class Browser:
             navigated = error is None or load_timeout
             if navigated:
                 await asyncio.sleep(self.settle_s)  # JS and meta-refresh redirects
+                if page.url.startswith("chrome-error:"):
+                    # It moved on to a navigation that failed: that is the outcome.
+                    error, load_timeout, navigated = nav.failure or "navigation failed", False, False
             deadline = loop.time() + self.nav_timeout_s
             bounded = functools.partial(self._bounded, deadline=deadline)
             if navigated:
                 await self._freeze(page, cdp, rec, deadline)
-            if not page.url.startswith(_BLANK):
+            if not page.url.startswith(BLANK):
                 final_url = page.url
-            if (resp := nav.response_for(final_url)) is not None:
+            doc_url = final_url
+            if doc_url is None and classify(error, None) == "download" and nav.chain:
+                doc_url = nav.chain[-1]  # the page stayed blank; the response is the download's
+            if (resp := nav.response_for(doc_url)) is not None:
                 status = resp.status
                 addr = await bounded(resp.server_addr())
                 server_ip = (addr or {}).get("ipAddress")
@@ -538,8 +576,7 @@ class Browser:
                 cert_chain = tuple(base64.b64decode(c) for c in (cert or {}).get("tableNames", ()))
             labels = []
             if click_through and navigated and dom is not None:
-                found = await bounded(
-                    page.evaluate(_LOGIN_JS, [LOGIN_PATTERN.pattern, -1, None]))
+                found = await bounded(self._login_labels(cdp))
                 labels = [str(x)[:MAX_LABEL] for x in found[:MAX_CLICKS]] if isinstance(
                     found, list) else []
             for n, label in enumerate(labels):
@@ -547,6 +584,7 @@ class Browser:
                 # left of the last one.
                 deadline = loop.time() + self.nav_timeout_s + self.settle_s
                 hop_started = _now()
+                pages_before, tasks_before = set(context.pages), len(rec.tasks)
                 try:
                     click = await self._click(context, rec, url, profile, n, label, deadline)
                 except Exception as e:  # one hop's bug never costs the landing or other hops
@@ -557,6 +595,8 @@ class Browser:
                         error=f"click failed: {_error_text(e)}",
                         started_at=_rfc3339(hop_started), finished_at=_rfc3339(_now())))
                 clicks.append(click)
+                await self._end_hop(rec, [p for p in context.pages if p not in pages_before],
+                                    rec.tasks[tasks_before:], deadline)
         except Exception as e:  # a crashed page or target; still a result
             log.warning("capture of %s failed", url, exc_info=True)
             error = error or _error_text(e)
@@ -571,11 +611,15 @@ class Browser:
                 t.cancel()
             await asyncio.gather(*hint_tasks, return_exceptions=True)
             try:
-                await context.close()
+                await asyncio.wait_for(context.close(), self.nav_timeout_s)
+            except TimeoutError:  # a wedged browser; the context stays open
+                log.warning("context of %s did not close within nav_timeout_s", url)
             except PlaywrightError:
                 log.debug("context close failed", exc_info=True)
         finished = _now()
-        outcome = classify(None if load_timeout else error, status)
+        # A load timeout is still "live" when the final URL's document arrived;
+        # without that document it is a timeout.
+        outcome = classify(None if load_timeout and status is not None else error, status)
         page_result = PageResult(
             profile=profile, outcome=outcome, http_status=status,
             final_url=final_url, server_ip=server_ip, redirects=tuple(nav.chain),

@@ -10,6 +10,11 @@ database_url = "postgresql://hakapik:hakapik@127.0.0.1:5432/hakapik"
 # Days to keep raw CT entries.
 raw_retention_days = 7
 
+# Hours before "prune" deletes a blob file that nothing references (left by
+# a failed or cancelled batch or a result never stored). At least 1 and
+# longer than lease_s.
+orphan_margin_hours = 24.0
+
 # Number of top Tranco-ranked domains to load.
 tranco_top_n = 100000
 
@@ -21,9 +26,6 @@ log_lists = [
   "https://www.gstatic.com/ct/log_list/v3/log_list.json",
   "https://valid.apple.com/ct/log_list/current_log_list.json",
 ]
-
-# Reserved for concurrent fetches per CT log; not used yet (one batch at a time).
-per_log_concurrency = 2
 
 # Entries fetched per get-entries batch.
 batch_size = 256
@@ -53,6 +55,11 @@ fetch_workers = 2
 # DNS servers for the resolver. Empty = system resolver.
 resolver_nameservers = []
 
+# Seconds one DNS query may take in total, across all nameservers (each server
+# is asked for at most the per-server timeout, within this deadline). Must be
+# finite and greater than 0.
+resolver_query_deadline_s = 10.0
+
 # Seconds after a job's creation at which each attempt runs. Must be
 # non-empty, start at 0 and strictly increase.
 retry_ladder_s = [0, 120, 600, 3600, 21600, 86400]
@@ -64,16 +71,27 @@ recheck_days = 30
 # Maximum open fetch jobs. Omitted = unlimited.
 # queue_cap = 100000
 
-# Open jobs older than this many hours are aged out.
+# Untried (step 0) jobs older than this many hours are aged out; beyond the
+# last retry_ladder_s step, every open job older than that step plus this
+# many hours is aged out too. Leased (running) jobs are spared.
 ageout_hours = 24.0
 
 # Per-navigation timeout in seconds.
 nav_timeout_s = 30.0
 
-# Seconds a worker holds a claimed job before it may be claimed again.
-# Must be at least 4 * nav_timeout_s + 60 (landing, up to 3 click hops and
-# the resolve), so a job is not claimed again while it still runs.
+# Seconds a claimed job stays leased; a running job's lease is extended every
+# lease_s / 3, and a crashed worker's job is claimed again once it expires.
+# Must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s + 60
+# (landing and up to 3 click hops; the resolve round and the PTR round; 60 s
+# margin), a sanity floor.
 lease_s = 600
+
+# Seconds one job may run (resolve, captures, blob writes) before it is given
+# up: nothing is stored and the job is retried after its lease expires. The
+# capture in progress then still drains and closes its context, so a run can
+# last up to job_timeout_s + 2 * nav_timeout_s + settle (about 3 s). Must be at
+# least the same floor as lease_s.
+job_timeout_s = 900.0
 
 # Path to a GeoLite2-ASN .mmdb you supply, for ASN enrichment. Omitted = no enrichment.
 # asn_mmdb = "/var/lib/hakapik/GeoLite2-ASN.mmdb"

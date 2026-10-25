@@ -16,6 +16,7 @@ from psycopg.rows import dict_row
 
 from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
+from hakapik.db import lock_blob
 from hakapik.jobs import advance_job
 from hakapik.protocol import BadEnvelope, canonical_json, open_envelope
 from hakapik.resolve import addresses
@@ -63,6 +64,9 @@ def _verify_blob(bs: BlobStore, sha256: str, size: int) -> None:
         raise ResultRejected(str(e)) from e
     h, n = hashlib.sha256(), 0
     try:
+        # Size first: a wrong size is rejected without reading the file.
+        if path.stat().st_size != size:
+            raise ResultRejected(f"blob {sha256} does not match its size")
         with open(path, "rb") as f:
             while chunk := f.read(1 << 20):
                 h.update(chunk)
@@ -86,6 +90,8 @@ async def store_result(
     leaves the database unchanged.
     """
     # open_envelope needs a synchronous key lookup, so the key is fetched first.
+    # That parses the envelope JSON twice (here and in open_envelope); it is a
+    # few hundred bytes plus a base64 payload, cheaper than a second API.
     pub = None
     node_id = _envelope_node_id(envelope)
     if node_id is not None:
@@ -97,9 +103,24 @@ async def store_result(
     except BadEnvelope as e:
         raise ResultRejected(str(e)) from e
 
+    # Blob locks first (db.lock_blob, sorted by digest): the orphan sweep
+    # cannot unlink a listed blob between its verification below and the
+    # commit of the rows referencing it. Every writer takes its blob locks
+    # before any row lock (ingest takes one, before its inserts), so blob and
+    # row locks cannot form a cycle. (Two digests sharing a 64-bit lock key
+    # could still order differently; Postgres then reports a deadlock and the
+    # job is retried after its lease, nothing hangs.) The manifest blob of
+    # write_manifest needs no lock: its bytes hold the candidate id and the
+    # new attempt's id, which comes from a sequence and is never reused, even
+    # after a rollback; so no earlier put wrote these bytes, and the file is
+    # new and young.
+    env_sha = hashlib.sha256(envelope).hexdigest()
+    for sha in sorted({env_sha, *(b.sha256 for b in r.blobs)}):
+        await lock_blob(conn, sha)
+
     # FOR UPDATE: a concurrent store of the same (job_id, step) waits here,
     # then sees the advanced step and returns None before writing anything.
-    # Lock order is job, then candidate (write_manifest).
+    # Lock order is blobs, job, then candidate (write_manifest).
     cur = await conn.execute(
         "SELECT candidate_id, fqdn FROM fetch_job WHERE id = %s AND step = %s AND state = 'open' "
         "FOR UPDATE",
@@ -115,7 +136,7 @@ async def store_result(
     for b in r.blobs:
         _verify_blob(bs, b.sha256, b.size)
 
-    env_sha = bs.put(envelope, "application/json")
+    bs.put(envelope, "application/json")
     blob_rows = [(env_sha, len(envelope), "application/json")]
     blob_rows += [(b.sha256, b.size, b.media_type) for b in r.blobs]
     async with conn.cursor() as c:
@@ -207,16 +228,20 @@ async def write_manifest(
             ct_raw_batch = row and row["blob_sha256"]
 
         await cur.execute(
-            """SELECT a.id, a.step, a.node_id, a.outcome, a.started_at, a.envelope_sha256,
-                      a.asn, a.asn_org, a.asn_db_sha256, b.size AS asn_db_size,
-                      b.media_type AS asn_db_media_type
+            """SELECT a.id, a.step, a.node_id, n.public_key, a.outcome, a.started_at,
+                      a.envelope_sha256, a.asn, a.asn_org, a.asn_db_sha256,
+                      b.size AS asn_db_size, b.media_type AS asn_db_media_type
                FROM attempt a JOIN fetch_job j ON j.id = a.job_id
+               JOIN node n ON n.node_id = a.node_id
                LEFT JOIN blob b ON b.sha256 = a.asn_db_sha256
                WHERE j.candidate_id = %s ORDER BY a.step, a.id""",
             (candidate_id,),
         )
         attempts = [
+            # The signing node's Ed25519 public key (hex): with it the
+            # manifest alone lets an auditor verify each envelope (spec 8).
             {"attempt_id": a["id"], "step": a["step"], "node_id": a["node_id"],
+             "node_public_key": _plain(a["public_key"]),
              "outcome": a["outcome"], "started_at": _plain(a["started_at"]),
              "envelope_sha256": a["envelope_sha256"],
              "asn": a["asn"], "asn_org": a["asn_org"],

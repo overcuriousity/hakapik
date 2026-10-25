@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -15,10 +16,10 @@ class Config:
     data_dir: Path
     database_url: str
     raw_retention_days: int = 7
+    orphan_margin_hours: float = 24.0
     tranco_top_n: int = 100_000
     public_apexes: tuple[str, ...] = ()
     log_lists: tuple[str, ...] = DEFAULT_LOG_LISTS
-    per_log_concurrency: int = 2  # reserved, not used yet
     batch_size: int = 256
     max_db_connections: int = 64
     fetch_workers: int = 2
@@ -27,13 +28,72 @@ class Config:
     fetch_proxy: str | None = None
     egress_address: str | None = None
     resolver_nameservers: tuple[str, ...] = ()  # empty = system resolver
+    resolver_query_deadline_s: float = 10.0  # one query, across all nameservers
     retry_ladder_s: tuple[int, ...] = (0, 120, 600, 3600, 21600, 86400)
     recheck_days: int = 30
     queue_cap: int | None = None
     ageout_hours: float = 24.0
     nav_timeout_s: float = 30.0
     lease_s: int = 600
+    # Overall bound on one job's run (resolve, spacing, captures, blob writes);
+    # the store is not included. On expiry the capture in progress still
+    # drains its in-flight exchanges and closes its context (each bounded by
+    # about nav_timeout_s), so a run can overrun by up to 2 * nav_timeout_s.
+    # The heartbeat keeps the lease during the overrun, so neither check below
+    # depends on it. 900 s: the real worst case at the defaults is
+    # 5 navigations (mobile, desktop, 3 click hops) * 30 s plus settles and
+    # screenshots, 2 * 10 s of DNS, spacer waits and blob writes, well under
+    # 900 s, which is 4.5 times the default lease floor (200 s).
+    job_timeout_s: float = 900.0
     asn_mmdb: Path | None = None  # GeoLite2-ASN .mmdb supplied by the operator
+
+
+# Minimum for each numeric key (None = no lower bound beyond the type).
+_INT_MIN = {
+    "raw_retention_days": 0, "tranco_top_n": 0, "batch_size": 1,
+    "max_db_connections": 1, "fetch_workers": 1, "fetch_daily_cap": 0,
+    "recheck_days": 0, "queue_cap": 0, "lease_s": 1,
+}
+_FLOAT_MIN = {
+    "fetch_per_ip_interval_s": 0.0, "ageout_hours": 0.0, "nav_timeout_s": 0.0,
+    "orphan_margin_hours": 1.0, "resolver_query_deadline_s": 0.0, "job_timeout_s": 0.0,
+}
+# Float keys that must be strictly greater than their minimum.
+_FLOAT_POSITIVE = ("resolver_query_deadline_s",)
+_STR_KEYS = ("database_url", "fetch_proxy", "egress_address")
+_STR_TUPLE_KEYS = ("public_apexes", "log_lists", "resolver_nameservers")
+
+
+def _validate_types(raw: dict) -> None:
+    """Reject wrong types and out-of-range numbers with a ValueError naming the key."""
+    for key in ("data_dir", "database_url"):
+        if key not in raw:
+            raise ValueError(f"missing required config key: {key}")
+    for key, value in raw.items():
+        if key in _INT_MIN:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+            kind, low = "an integer", _INT_MIN[key]
+        elif key in _FLOAT_MIN:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+            kind, low = "a number", _FLOAT_MIN[key]
+        elif key in _STR_KEYS or key in ("data_dir", "asn_mmdb"):
+            ok, kind, low = isinstance(value, str), "a string", None
+        elif key in _STR_TUPLE_KEYS:
+            ok = isinstance(value, tuple) and all(isinstance(v, str) for v in value)
+            kind, low = "a list of strings", None
+        elif key == "retry_ladder_s":
+            ok = isinstance(value, tuple) and all(
+                isinstance(v, int) and not isinstance(v, bool) for v in value
+            )
+            kind, low = "a list of integers", None
+        else:
+            continue
+        if not ok or (key in _FLOAT_MIN and not math.isfinite(value)):
+            raise ValueError(f"{key} must be {kind}" + (" (finite)" if ok else ""))
+        if low is not None and value < low:
+            raise ValueError(f"{key} must be at least {low}")
+        if key in _FLOAT_POSITIVE and value <= low:
+            raise ValueError(f"{key} must be greater than {low}")
 
 
 def load_config(path: Path) -> Config:
@@ -46,6 +106,7 @@ def load_config(path: Path) -> Config:
     for key, value in raw.items():
         if isinstance(value, list):
             raw[key] = tuple(value)
+    _validate_types(raw)
     for key in ("data_dir", "asn_mmdb"):
         if key in raw:
             raw[key] = Path(raw[key])
@@ -55,10 +116,25 @@ def load_config(path: Path) -> Config:
     ):
         raise ValueError("retry_ladder_s must be non-empty, start at 0 and strictly increase")
     cfg = Config(**raw)
-    if cfg.fetch_workers < 1:
-        raise ValueError("fetch_workers must be at least 1")
-    # Worst-case capture: landing plus up to 3 click hops, plus resolve. A
-    # shorter lease lets a running job be claimed again mid-run.
-    if cfg.lease_s < 4 * cfg.nav_timeout_s + 60:
-        raise ValueError("lease_s must be at least 4 * nav_timeout_s + 60")
+    # A sanity floor only: a lease shorter than one resolve and capture makes
+    # no sense. The formula: capture budget (4 * nav_timeout_s) + 2 *
+    # resolver_query_deadline_s (the resolve round, then the PTR round) + 60 s
+    # margin. It omits the per-IP spacer wait, blob writes and the full
+    # mobile + desktop + click capture; what keeps a running job from being
+    # claimed again is fetchloop's heartbeat, which extends the lease every
+    # lease_s / 3 while the job runs.
+    floor = 4 * cfg.nav_timeout_s + 2 * cfg.resolver_query_deadline_s + 60
+    if cfg.lease_s < floor:
+        raise ValueError(
+            "lease_s must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s + 60")
+    if cfg.job_timeout_s < floor:
+        raise ValueError(
+            "job_timeout_s must be at least 4 * nav_timeout_s + 2 * resolver_query_deadline_s"
+            " + 60")
+    # A worker's blobs are unreferenced until store_result locks and verifies
+    # them. A blob the sweep takes before that only gets the result rejected
+    # and the job retried (nothing dangling is committed); the margin makes
+    # that rare, and a margin within the lease would make it routine.
+    if cfg.orphan_margin_hours * 3600 <= cfg.lease_s:
+        raise ValueError("orphan_margin_hours must be longer than lease_s")
     return cfg

@@ -1,10 +1,12 @@
-import asyncio
+import time
 
+import dns.asyncresolver
 import dns.resolver
+import dns.reversename
 import pytest
 import pytest_asyncio
 
-from dnsserver import DnsServer
+from hakapik.protocol import DnsAnswer
 from hakapik.resolve import Resolver, addresses
 
 NAME = "login.example.com"
@@ -17,18 +19,18 @@ DATA = {
     ("example.com", "NS"): ("NOERROR", ["ns1.example.com."], 3600),
     ("4.3.2.1.in-addr.arpa", "PTR"): ("NOERROR", ["host.example.com."], 120),
     ("slow.example.com", "A"): ("NOERROR", ["1.2.3.4"], 300),
+    ("many.example.com", "A"): ("NOERROR", ["9.9.9.9", "1.1.1.1", "5.5.5.5"], 300),
+    ("v6.example.com", "AAAA"): ("NOERROR", ["2001:db8::1"], 300),
+    (dns.reversename.from_address("2001:db8::1").to_text(omit_final_dot=True), "PTR"):
+        ("NOERROR", ["v6host.example.com."], 120),
+    ("big.example.com", "A"): ("NOERROR", ["1.2.3.4"], 300),
 }
 
 
 @pytest_asyncio.fixture
-async def dns_server():
-    loop = asyncio.get_running_loop()
-    transport, server = await loop.create_datagram_endpoint(
-        lambda: DnsServer(DATA, drop={"slow.example.com"}), local_addr=("127.0.0.1", 0))
-    try:
-        yield server
-    finally:
-        transport.close()
+async def dns_server(dns_server_factory):
+    return await dns_server_factory(DATA, drop={"slow.example.com"},
+                                    truncate={"big.example.com"})
 
 
 async def test_records_every_type_and_ptr(dns_server):
@@ -68,12 +70,6 @@ async def test_empty_type_is_noerror(dns_server):
     assert aaaa.rcode == "NOERROR" and aaaa.answers == () and aaaa.ttl is None
 
 
-async def _start(data):
-    loop = asyncio.get_running_loop()
-    return await loop.create_datagram_endpoint(
-        lambda: DnsServer(data), local_addr=("127.0.0.1", 0))
-
-
 async def test_resolver_is_the_server_that_answered(dns_server):
     # Nothing listens on 127.0.0.2 at this port, so the second server answers.
     r = Resolver(("127.0.0.2", "127.0.0.1"), port=dns_server.port, timeout_s=0.5)
@@ -81,20 +77,15 @@ async def test_resolver_is_the_server_that_answered(dns_server):
     assert all(a.rcode == "NXDOMAIN" and a.resolver == "127.0.0.1" for a in ans)
 
 
-async def test_servfail_recorded_with_answering_server():
-    t, srv = await _start({(NAME, "A"): ("SERVFAIL", [], 0)})
-    try:
-        r = Resolver(("127.0.0.1",), port=srv.port)
-        ans = await r.resolve(NAME, NAME)
-        a = next(x for x in ans if x.rrtype == "A")
-        assert a.rcode == "SERVFAIL" and a.resolver == "127.0.0.1" and a.answers == ()
-    finally:
-        t.close()
+async def test_servfail_recorded_with_answering_server(dns_server_factory):
+    srv = await dns_server_factory({(NAME, "A"): ("SERVFAIL", [], 0)})
+    r = Resolver(("127.0.0.1",), port=srv.port)
+    ans = await r.resolve(NAME, NAME)
+    a = next(x for x in ans if x.rrtype == "A")
+    assert a.rcode == "SERVFAIL" and a.resolver == "127.0.0.1" and a.answers == ()
 
 
 async def test_unexpected_error_is_logged_and_recorded(dns_server, monkeypatch, caplog):
-    import dns.asyncresolver
-
     async def boom(self, *a, **k):
         raise RuntimeError("bug")
 
@@ -120,3 +111,72 @@ def test_no_nameservers_raises(monkeypatch):
     monkeypatch.setattr(dns.resolver, "Resolver", unconfigured)
     with pytest.raises(ValueError, match="no DNS nameservers configured"):
         Resolver(())
+
+
+async def test_multiple_addresses_are_sorted(dns_server):
+    r = Resolver(("127.0.0.1",), port=dns_server.port)
+    ans = await r.resolve("many.example.com", "example.com")
+    a = next(x for x in ans if x.rrtype == "A")
+    assert a.answers == ("1.1.1.1", "5.5.5.5", "9.9.9.9")
+    ptrs = [x.qname for x in ans if x.rrtype == "PTR"]
+    assert ptrs == sorted(ptrs) and len(ptrs) == 3
+
+
+async def test_ipv6_address_gets_an_ip6_arpa_ptr(dns_server):
+    r = Resolver(("127.0.0.1",), port=dns_server.port)
+    ans = await r.resolve("v6.example.com", "example.com")
+    assert addresses(ans, "v6.example.com") == ["2001:db8::1"]
+    [ptr] = [x for x in ans if x.rrtype == "PTR"]
+    assert ptr.qname.endswith(".8.b.d.0.1.0.0.2.ip6.arpa")
+    assert ptr.answers == ("v6host.example.com.",) and ptr.rcode == "NOERROR"
+
+
+async def test_truncated_udp_reply_falls_back_to_tcp(dns_server):
+    r = Resolver(("127.0.0.1",), port=dns_server.port)
+    ans = await r.resolve("big.example.com", "example.com")
+    a = next(x for x in ans if x.rrtype == "A")
+    assert a.rcode == "NOERROR" and a.answers == ("1.2.3.4",)
+    assert "big.example.com" in dns_server.tcp_queries
+
+
+async def test_qname_case_and_trailing_dot_are_normalised(dns_server):
+    r = Resolver(("127.0.0.1",), port=dns_server.port)
+    ans = await r.resolve("LOGIN.Example.COM.", "Example.COM.")
+    assert {a.qname for a in ans if a.rrtype != "PTR"} == {NAME, "example.com"}
+    assert addresses(ans, NAME) == ["1.2.3.4"]
+
+
+def test_addresses_matches_the_fqdn_in_any_case():
+    ans = (DnsAnswer(NAME, "A", "NOERROR", 60, ("1.2.3.4",), "x", "t"),
+           DnsAnswer(NAME, "AAAA", "NOERROR", 60, ("2001:db8::1",), "x", "t"))
+    assert addresses(ans, "LOGIN.Example.COM.") == ["1.2.3.4", "2001:db8::1"]
+
+
+async def _two_silent_resolver(dns_server_factory, timeout_s, deadline_s):
+    # Two servers on two ports of 127.0.0.1, both silent for "slow". Resolver
+    # has one port for all servers, so the second resolver's port is set here.
+    first = await dns_server_factory({}, drop={"slow.example.com"})
+    second = await dns_server_factory({}, drop={"slow.example.com"})
+    r = Resolver(("127.0.0.1", "127.0.0.1"), port=first.port, timeout_s=timeout_s,
+                 query_deadline_s=deadline_s)
+    r._resolvers[1].port = second.port
+    return r, first, second
+
+
+async def test_query_deadline_bounds_the_time_across_servers(dns_server_factory):
+    r, first, second = await _two_silent_resolver(dns_server_factory, 1.0, 1.2)
+    t = time.monotonic()
+    ans = await r.resolve("slow.example.com", "slow.example.com")
+    # Without the deadline each query takes 2 * timeout_s = 2.0 s.
+    assert time.monotonic() - t < 2 * 1.0 - 0.1
+    assert second.udp_queries  # the time left went to the second server
+    assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)
+
+
+async def test_query_deadline_below_timeout_asks_only_the_first(dns_server_factory):
+    r, first, second = await _two_silent_resolver(dns_server_factory, 1.0, 0.3)
+    t = time.monotonic()
+    ans = await r.resolve("slow.example.com", "slow.example.com")
+    assert time.monotonic() - t < 1.0 - 0.1  # less than one server's timeout
+    assert first.udp_queries and not second.udp_queries
+    assert all(a.rcode == "TIMEOUT" and a.resolver == "127.0.0.1" for a in ans)

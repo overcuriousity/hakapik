@@ -1,8 +1,12 @@
 import base64
+import errno
 import json
+import os
+import threading
 
 import pytest
 
+import hakapik.protocol as protocol
 from hakapik.protocol import (
     OUTCOMES,
     AttemptResult,
@@ -87,7 +91,7 @@ def test_unknown_node_rejected(tmp_path):
 
 def test_node_id_mismatch_rejected(tmp_path):
     k, env = _env(tmp_path, node_id="x" * 32)
-    with pytest.raises(BadEnvelope):
+    with pytest.raises(BadEnvelope, match="node_id does not match"):
         open_envelope(env, {k.node_id: k.public_key}.get)
 
 
@@ -113,7 +117,7 @@ def test_signed_garbage_payload_rejected(tmp_path):
     env = canonical_json({
         "node_id": k.node_id,
         "payload": base64.b64encode(payload).decode(),
-        "signature": base64.b64encode(k._sk.sign(payload)).decode(),
+        "signature": base64.b64encode(k.sign(payload)).decode(),
     })
     with pytest.raises(BadEnvelope):
         open_envelope(env, {k.node_id: k.public_key}.get)
@@ -121,6 +125,86 @@ def test_signed_garbage_payload_rejected(tmp_path):
 
 def test_canonical_json_is_stable():
     assert canonical_json({"b": 1, "a": "ü"}) == b'{"a":"\\u00fc","b":1}'
+
+
+@pytest.mark.parametrize("v", [float("nan"), float("inf"), float("-inf")])
+def test_canonical_json_rejects_non_finite_floats(v):
+    # NaN/Infinity are not JSON; a verifier in another language could not parse them.
+    with pytest.raises(ValueError):
+        canonical_json({"x": v})
+
+
+def test_new_key_is_synced_before_it_is_published(tmp_path, monkeypatch):
+    events = []
+    real_fsync, real_link = os.fsync, os.link
+    monkeypatch.setattr(protocol.os, "fsync",
+                        lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(protocol.os, "link",
+                        lambda a, b: (events.append("link"), real_link(a, b))[1])
+    NodeKey.load_or_create(tmp_path / "node.key")
+    # The key bytes reach the disk before the name appears; the directory
+    # entry is synced after.
+    assert events[:2] == ["fsync", "link"] and events[2:] == ["fsync"]
+
+
+def test_concurrent_creators_share_one_key(tmp_path):
+    # Several creators race; link() lets exactly one publish, the rest read it.
+    p = tmp_path / "node.key"
+    barrier = threading.Barrier(8)
+    ids = []
+
+    def create():
+        barrier.wait()
+        ids.append(NodeKey.load_or_create(p).node_id)
+
+    threads = [threading.Thread(target=create) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(ids) == 8 and len(set(ids)) == 1
+    assert ids[0] == NodeKey(p.read_bytes()).node_id
+    assert [x.name for x in tmp_path.iterdir()] == ["node.key"]
+
+
+@pytest.mark.parametrize("code", [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP,
+                                  errno.ENOSYS, errno.EMLINK])
+def test_no_hard_links_is_a_clear_error(tmp_path, monkeypatch, code):
+    def no_link(a, b):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(protocol.os, "link", no_link)
+    with pytest.raises(RuntimeError, match="must be on a filesystem that supports hard links"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    assert list(tmp_path.iterdir()) == []  # no temp file, no key
+
+
+def test_other_link_errors_are_raised(tmp_path, monkeypatch):
+    def full(a, b):
+        raise OSError(errno.ENOSPC, "no space")
+
+    monkeypatch.setattr(protocol.os, "link", full)
+    with pytest.raises(OSError, match="no space"):
+        NodeKey.load_or_create(tmp_path / "node.key")
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("size", [0, 31, 33])
+def test_key_of_wrong_length_names_the_file(tmp_path, size):
+    p = tmp_path / "node.key"
+    p.write_bytes(b"\x01" * size)
+    with pytest.raises(ValueError, match=f"node.key.*{size} bytes, expected 32"):
+        NodeKey.load_or_create(p)
+
+
+def test_key_readable_by_others_is_reported(tmp_path, caplog):
+    p = tmp_path / "node.key"
+    p.write_bytes(b"\x01" * 32)
+    p.chmod(0o644)
+    with caplog.at_level("WARNING", logger="hakapik.protocol"):
+        NodeKey.load_or_create(p)
+    assert any("node.key" in r.getMessage() and "0o644" in r.getMessage()
+               for r in caplog.records)
 
 
 def _signed(tmp_path, payload: bytes):

@@ -112,7 +112,10 @@ in the PoC they run on the head.
 ### 5.1 Ingest
 
 - Read the Google and Apple CT log lists; tail every log in state usable,
-  qualified or readonly-with-recent-entries. Support both RFC 6962
+  qualified or readonly-with-recent-entries; a log that either list marks
+  retired is not tailed, and a readonly log (which no longer grows) is not
+  tailed without a cursor, and with one only until its cursor reaches its
+  tree size. Support both RFC 6962
   get-entries logs and static-CT (Sunlight tile) logs. Per-log cursor in
   Postgres. Raw leaf, extra data, and the log's signed tree head at read time
   are stored in the blob store; an inclusion proof is fetched and stored
@@ -337,7 +340,10 @@ Server-rendered FastAPI with HTMX. No JavaScript framework.
   and resolved address per record.
 - Signed worker results carry node identity, egress address and time.
 - Evidence bundle export: manifest, blobs, timestamp tokens, and a
-  human-readable summary of the verdict chain.
+  human-readable summary of the verdict chain. The bundle carries the
+  Ed25519 public key of every node that signed one of its results (the
+  manifest lists it per attempt), so each signature verifies without the
+  database.
 - Known limit, stated for the PoC: immutability of the blob store rests on
   filesystem permissions and the external timestamp, not on object lock.
 - Retention defaults, all configurable: flagged-site evidence 2 years; benign

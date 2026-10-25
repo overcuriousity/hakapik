@@ -5,8 +5,10 @@ No function here commits; the caller owns the transaction.
 
 import logging
 import os
+import time
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import psycopg
 from psycopg.rows import dict_row
@@ -56,11 +58,6 @@ _SCHEMA = [
         candidates bigint NOT NULL DEFAULT 0,
         PRIMARY KEY (log_id, day)
     )""",
-    "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)",
-    "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)",
-    "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)",
-    # Stage two; the column changes to stage-one tables are in _UPGRADES.
-    "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)",
     """CREATE TABLE IF NOT EXISTS fetch_job (
         id bigserial PRIMARY KEY,
         candidate_id bigint NOT NULL REFERENCES candidate(id),
@@ -73,9 +70,6 @@ _SCHEMA = [
         claimed_until timestamptz,
         created_at timestamptz NOT NULL DEFAULT now()
     )""",
-    "CREATE UNIQUE INDEX IF NOT EXISTS fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'",
-    "CREATE INDEX IF NOT EXISTS fetch_job_due ON fetch_job (priority DESC, due_at DESC) WHERE state = 'open'",
-    "CREATE INDEX IF NOT EXISTS fetch_job_fqdn ON fetch_job (fqdn)",
     """CREATE TABLE IF NOT EXISTS node (
         node_id text PRIMARY KEY,
         public_key bytea NOT NULL,
@@ -133,6 +127,27 @@ _SCHEMA = [
         created_at timestamptz NOT NULL DEFAULT now(),
         UNIQUE (candidate_id, version)
     )""",
+]
+
+# (index name, DDL). CREATE INDEX IF NOT EXISTS takes a SHARE lock on the table
+# even when the index exists, which conflicts with writers, and migrate() runs
+# on every command start; so each runs only while pg_indexes lacks the index.
+# The statements still say IF NOT EXISTS: two first starts can both see the
+# index missing, and the loser must not fail.
+_INDEXES = [
+    ("candidate_log_index",
+     "CREATE INDEX IF NOT EXISTS candidate_log_index ON candidate (log_id, log_index)"),
+    ("raw_batch_created_at",
+     "CREATE INDEX IF NOT EXISTS raw_batch_created_at ON raw_batch (created_at)"),
+    ("raw_batch_blob_sha256",
+     "CREATE INDEX IF NOT EXISTS raw_batch_blob_sha256 ON raw_batch (blob_sha256)"),
+    ("candidate_fqdn", "CREATE INDEX IF NOT EXISTS candidate_fqdn ON candidate (fqdn)"),
+    ("fetch_job_open_fqdn",
+     "CREATE UNIQUE INDEX IF NOT EXISTS fetch_job_open_fqdn ON fetch_job (fqdn) WHERE state = 'open'"),
+    ("fetch_job_due",
+     "CREATE INDEX IF NOT EXISTS fetch_job_due ON fetch_job (priority DESC, due_at DESC) "
+     "WHERE state = 'open'"),
+    ("fetch_job_fqdn", "CREATE INDEX IF NOT EXISTS fetch_job_fqdn ON fetch_job (fqdn)"),
 ]
 
 # Changes to tables that may predate stage two, as (table, column, change, DDL).
@@ -202,6 +217,13 @@ async def migrate(conn: psycopg.AsyncConnection) -> None:
             needed = row is not None and row[0] == "NO"
         if needed:
             await conn.execute(stmt)
+    cur = await conn.execute(
+        "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+    )
+    existing = {r[0] for r in await cur.fetchall()}
+    for name, stmt in _INDEXES:
+        if name not in existing:
+            await conn.execute(stmt)
     await conn.commit()
 
 
@@ -225,9 +247,49 @@ async def set_cursor(conn: psycopg.AsyncConnection, log_id: str, next_index: int
     )
 
 
+async def advance_cursor(
+    conn: psycopg.AsyncConnection, log_id: str, expected: int, next_index: int
+) -> bool:
+    """Move the cursor from ``expected`` to ``next_index``; False if it is elsewhere.
+
+    A compare-and-set: of two writers that read the same cursor, the one
+    committing second updates nothing (it waits on the row lock, then sees
+    the new value) and must roll its batch back. A missing row is created.
+    """
+    cur = await conn.execute(
+        """INSERT INTO log_cursor (log_id, next_index) VALUES (%s, %s)
+           ON CONFLICT (log_id) DO UPDATE SET
+             next_index = EXCLUDED.next_index,
+             updated_at = now()
+           WHERE log_cursor.next_index = %s""",
+        (log_id, next_index, expected),
+    )
+    return cur.rowcount == 1
+
+
+async def init_cursor(
+    conn: psycopg.AsyncConnection, log_id: str, next_index: int
+) -> bool:
+    """Create the log's cursor row; True if created, False if one already exists.
+
+    Unlike ``set_cursor`` this never overwrites, so a log's first cursor cannot
+    clobber one written by another process in the meantime.
+    """
+    cur = await conn.execute(
+        """INSERT INTO log_cursor (log_id, next_index) VALUES (%s, %s)
+           ON CONFLICT (log_id) DO NOTHING""",
+        (log_id, next_index),
+    )
+    return cur.rowcount == 1
+
+
 async def add_candidates(
     conn: psycopg.AsyncConnection, rows: list[CandidateRow]
 ) -> None:
+    # Concurrent log tasks insert the same names (one certificate reaches
+    # several logs), and fetch_job's unique open-fqdn index makes them wait on
+    # each other. Inserting in one global order (by fqdn) rules out deadlocks.
+    rows = sorted(rows, key=lambda r: r.fqdn)
     async with conn.cursor() as cur:
         await cur.executemany(
             """WITH c AS (
@@ -254,6 +316,11 @@ async def add_raw_batch(
     entries: int,
     nbytes: int,
 ) -> None:
+    # No uniqueness on (log_id, start_index), on purpose: ingest commits this
+    # row together with advance_cursor's compare-and-set, so a range is stored
+    # twice only when an operator rewinds a cursor to re-read it; the second
+    # row then records that re-read. Both rows may share one blob; prune_raw
+    # keeps a blob while any row references it.
     await conn.execute(
         """INSERT INTO raw_batch
              (log_id, start_index, end_index, blob_sha256, entries, bytes)
@@ -265,7 +332,11 @@ async def add_raw_batch(
 async def bump_stat(
     conn: psycopg.AsyncConnection, log_id: str, day: date, **increments: int
 ) -> None:
-    """Add ``increments`` to the (log_id, day) row."""
+    """Add ``increments`` to the (log_id, day) row.
+
+    With no increments this does nothing, and in particular creates no row:
+    ``read_stat`` reports zeros for an absent row anyway.
+    """
     unknown = set(increments) - set(STAT_COLUMNS)
     if unknown:
         raise ValueError(f"unknown ingest_stat columns: {sorted(unknown)}")
@@ -312,14 +383,33 @@ async def sample_candidates(conn: psycopg.AsyncConnection, n: int) -> list[dict]
         return await cur.fetchall()
 
 
+async def lock_blob(conn: psycopg.AsyncConnection, sha256: str) -> None:
+    """Take a transaction-level advisory lock on a blob digest.
+
+    Held until commit or rollback. ``prune_raw`` takes it before deciding to
+    unlink a blob; ingest takes it before writing a raw blob and keeps it
+    until the row referencing that blob commits. So prune never unlinks a
+    blob that a concurrent batch has just found existing and is about to
+    reference (identical bytes, e.g. a re-read range). Distinct digests may
+    share a lock key; that only makes one wait for the other.
+    """
+    await conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (sha256,))
+
+
 async def prune_raw(
-    conn: psycopg.AsyncConnection, bs: BlobStore, older_than: date
+    conn: psycopg.AsyncConnection, bs: BlobStore, older_than: datetime
 ) -> int:
-    """Delete raw batches older than ``older_than`` that hold no candidate.
+    """Delete raw batches created before ``older_than`` that hold no candidate.
+
+    ``older_than`` is an aware timestamp, compared with ``created_at`` as is
+    (a date would be cast to midnight in the session's time zone).
 
     A batch is kept if any candidate on the same log has a log_index inside
     its [start_index, end_index]. Blob files are unlinked unless another
-    remaining batch still references the same (content-addressed) blob.
+    remaining batch still references the same (content-addressed) blob; each
+    check and unlink runs under ``lock_blob``. A blob that cannot be unlinked
+    (other than already gone) is logged and skipped: its row is deleted, so
+    later prunes do not retry it.
 
     This is the one db function that commits: file deletion must follow a
     durable delete, so the DELETE is committed before any blob is unlinked.
@@ -338,20 +428,105 @@ async def prune_raw(
     shas = {r[0] for r in await cur.fetchall()}
     count = cur.rowcount
     await conn.commit()
-    for sha in shas:
-        cur = await conn.execute(
-            "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)
-        )
-        if await cur.fetchone():
-            continue
+    for sha in sorted(shas):
         try:
             path = bs.path(sha)
         except ValueError:
             _log.warning("raw_batch row holds an invalid blob digest %r; not unlinking", sha)
             continue
         try:
-            os.chmod(path, 0o644)
-            path.unlink()
-        except FileNotFoundError:
-            pass
+            await lock_blob(conn, sha)
+            cur = await conn.execute(
+                "SELECT 1 FROM raw_batch WHERE blob_sha256 = %s LIMIT 1", (sha,)
+            )
+            if await cur.fetchone():
+                continue
+            try:
+                os.chmod(path, 0o644)
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink blob %s: %r; left in place", sha, e)
+        finally:
+            await conn.rollback()  # ends the read and releases the lock
     return count
+
+
+async def sweep_orphan_blobs(
+    conn: psycopg.AsyncConnection, bs: BlobStore, margin_s: float
+) -> tuple[int, int]:
+    """Unlink unreferenced blob files older than ``margin_s``; (blobs, temp files).
+
+    Orphans come from batches and results that wrote a blob but never
+    committed the row referencing it. A blob counts as referenced by a
+    raw_batch row or a blob row. The age is the time since the last put
+    (``BlobStore.put`` refreshes the mtime), so a writer still working on a
+    blob keeps it young. A worker's blob is unreferenced until
+    ``store_result`` locks and verifies it; if the sweep takes it first, the
+    result is rejected and the job retried, so the margin (longer than the
+    lease, see config) only has to make that rare. Each candidate is re-checked
+    and unlinked under ``lock_blob``, which ingest and ``store_result`` hold
+    from before they rely on an existing blob until they commit. Leftover
+    ``.tmp-*`` files of interrupted puts older than the margin go too.
+
+    Commits nothing; each blob's check runs in its own short transaction.
+    """
+    blobs = tmps = 0
+    try:
+        top = sorted(os.scandir(bs.root), key=lambda e: e.name)
+    except FileNotFoundError:
+        return 0, 0
+    files = [
+        Path(f.path)
+        for d1 in top if d1.is_dir(follow_symlinks=False)
+        for d2 in os.scandir(d1.path) if d2.is_dir(follow_symlinks=False)
+        for f in os.scandir(d2.path) if f.is_file(follow_symlinks=False)
+    ]
+
+    def old(path: Path) -> bool:
+        try:
+            return time.time() - path.stat().st_mtime > margin_s
+        except FileNotFoundError:
+            return False
+
+    for path in files:
+        if not old(path):
+            continue
+        if path.name.startswith(".tmp-"):
+            try:
+                path.unlink()
+                tmps += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink temp file %s: %r", path, e)
+            continue
+        sha = path.name
+        try:
+            if bs.path(sha) != path:
+                continue  # a digest in the wrong directory: not ours to judge
+        except ValueError:
+            continue  # not a blob name
+        try:
+            await lock_blob(conn, sha)
+            if not old(path):
+                continue  # put again meanwhile
+            cur = await conn.execute(
+                """SELECT EXISTS (SELECT 1 FROM raw_batch WHERE blob_sha256 = %s)
+                       OR EXISTS (SELECT 1 FROM blob WHERE sha256 = %s)""",
+                (sha, sha),
+            )
+            if (await cur.fetchone())[0]:
+                continue
+            try:
+                os.chmod(path, 0o644)
+                path.unlink()
+                blobs += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                _log.warning("cannot unlink orphan blob %s: %r; left in place", sha, e)
+        finally:
+            await conn.rollback()  # ends the read and releases the lock
+    return blobs, tmps

@@ -752,6 +752,8 @@ Run: `uv run pytest -W error` → all pass, browser tests not skipped on this ma
 
 ## Deferred after review (2026-10-24)
 
+Resolved 2026-10-25 on branch fix-tail-deadlock-tile404: every item fixed or shown obsolete; see docs/superpowers/plans/2026-10-25-deferred-fixes-record.md. The items stay below as the record of what was reviewed.
+
 Minor findings from the task and final reviews, triaged as not blocking the merge. Kept here so later plans can pick them up.
 
 - Task 1: minor (deferred): upgrade test asserts only no-raise (no legacy-row reason / nullability check); ladder validation gives TypeError for non-list/non-int values, no valid-custom-ladder test; ALTERs take ACCESS EXCLUSIVE on candidate at every migrate (could briefly block behind an ingest txn; consider info_schema guard or lock_timeout); example-config test checks only one key.

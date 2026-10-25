@@ -1,16 +1,22 @@
 import asyncio
+import gc
 import gzip
 import io
 import json
+import logging
 import time
 
 import pytest
 from warcio.archiveiterator import ArchiveIterator
 
-from hakapik.browser import PROFILES, Browser, _Recorder, classify
+from hakapik.blobstore import BlobStore
+from hakapik.browser import PROFILES, Browser, classify
+from hakapik.protocol import DnsAnswer, Job, NodeKey
+from hakapik.recorder import Recorder
+from hakapik.worker import IpSpacer, run_job
 
-# The shared browser fixture lives on the module loop; tests using it must too.
-module_loop = pytest.mark.asyncio(loop_scope="module")
+# The shared browser fixture lives on the session loop; tests using it must too.
+session_loop = pytest.mark.asyncio(loop_scope="session")
 
 
 def test_classify_table():
@@ -21,6 +27,7 @@ def test_classify_table():
     assert classify("net::ERR_CERT_DATE_INVALID", None) == "tls_error"
     assert classify("net::ERR_SSL_PROTOCOL_ERROR", None) == "tls_error"
     assert classify("TimeoutError: Timeout 10000ms exceeded.", None) == "timeout"
+    assert classify("load timeout", None) == "timeout"
     assert classify("Download is starting", None) == "download"
     assert classify("something odd", None) == "error"
     assert classify(None, 404) == "http_error" and classify(None, 200) == "live"
@@ -35,7 +42,7 @@ def test_profiles():
     assert not d["has_touch"] and "Windows" in d["user_agent"]
 
 
-@module_loop
+@session_loop
 async def test_capture_live_page(site, browser):
     c = await browser.capture(site.url("/redirect"), "mobile")
     assert c.page.outcome == "live" and c.page.http_status == 200
@@ -54,11 +61,58 @@ async def test_capture_live_page(site, browser):
     assert "/favicon.ico" not in site.paths_requested and "/robots.txt" not in site.paths_requested
 
 
+def _requests(warc: bytes) -> list[str]:
+    return [r.rec_headers.get_header("WARC-Target-URI")
+            for r in ArchiveIterator(io.BytesIO(warc)) if r.rec_type == "request"]
+
+
+@session_loop
+async def test_https_capture_returns_the_served_certificate(tls_site, site_cert, browser):
+    c = await browser.capture(tls_site.url("/"), "mobile")
+    assert c.page.outcome == "live" and c.page.final_url == tls_site.url("/")
+    assert c.cert_chain == (site_cert.der,)
+
+
+@session_loop
+async def test_production_browser_rejects_an_untrusted_certificate(tls_site):
+    # only the test fixture's browser trusts site_cert
+    async with Browser(proxy=None, nav_timeout_s=5, settle_s=0) as b:
+        c = await b.capture(tls_site.url("/"), "mobile")
+    assert c.page.outcome == "tls_error" and "ERR_CERT_AUTHORITY_INVALID" in c.page.error
+    assert c.cert_chain == ()
+
+
+@session_loop
+async def test_no_robots_txt_or_favicon_request_leaves_the_browser(site, tls_site, browser):
+    # The WARC holds every request the browser sent, to any host; the favicon
+    # the page asks for itself is aborted before it leaves.
+    for s in (site, tls_site):
+        c = await browser.capture(s.url("/icons"), "mobile")
+        assert c.page.outcome == "live" and b"icons" in c.dom
+        sent = _requests(c.warc)
+        assert s.url("/icons") in sent
+        assert not [u for u in sent if u.endswith(("/robots.txt", "/favicon.ico"))]
+        assert "/favicon.ico" not in s.paths_requested and "/robots.txt" not in s.paths_requested
+
+
+@session_loop
+async def test_a_body_over_max_body_is_never_read(site, browser):
+    # Chromium keeps a body for playwright only up to its own buffer, below
+    # MAX_BODY: a larger one is not handed over and the record says so.
+    c = await browser.capture(site.url("/fetch-big"), "mobile")
+    big = [r for r in ArchiveIterator(io.BytesIO(c.warc))
+           if r.rec_type == "response" and r.rec_headers.get_header("WARC-Target-URI")
+           == site.url("/big")]
+    assert len(big) == 1 and big[0].http_headers.get_statuscode() == "200"
+    assert big[0].rec_headers.get_header("WARC-Truncated") == "unspecified"
+    assert big[0].content_stream().read() == b""
+
+
 def _major(browser):
     return browser.version.split(".")[0]
 
 
-@module_loop
+@session_loop
 async def test_mobile_profile_claims_matching_browser(site, browser):
     await browser.capture(site.url("/"), "mobile")
     h = site.headers[-1]
@@ -70,7 +124,7 @@ async def test_mobile_profile_claims_matching_browser(site, browser):
     assert "Google Chrome" not in h["sec-ch-ua"] and "Headless" not in h["sec-ch-ua"]
 
 
-@module_loop
+@session_loop
 async def test_mobile_high_entropy_hints(site, browser):
     c = await browser.capture(site.url("/uad"), "mobile")
     text = c.dom.decode().split("<body>")[1].split("</body>")[0]
@@ -80,7 +134,7 @@ async def test_mobile_high_entropy_hints(site, browser):
     assert {"brand": "Chromium", "version": browser.version} in v["fullVersionList"]
 
 
-@module_loop
+@session_loop
 async def test_desktop_profile(site, browser):
     c = await browser.capture(site.url("/"), "desktop")
     assert c.page.outcome == "live" and c.page.profile == "desktop"
@@ -93,7 +147,7 @@ async def test_desktop_profile(site, browser):
     assert v["model"] == "" and v["architecture"] == "x86" and v["platform"] == "Windows"
 
 
-@module_loop
+@session_loop
 async def test_js_redirect_followed(site, browser):
     c = await browser.capture(site.url("/js"), "mobile")
     assert c.page.outcome == "live"
@@ -101,7 +155,7 @@ async def test_js_redirect_followed(site, browser):
     assert site.url("/js") in c.page.redirects
 
 
-@module_loop
+@session_loop
 async def test_meta_refresh_loop_terminates(site, browser):
     t0 = time.monotonic()
     c = await browser.capture(site.url("/loop"), "mobile")
@@ -111,13 +165,16 @@ async def test_meta_refresh_loop_terminates(site, browser):
     assert c.screenshot.startswith(b"\x89PNG") and b"loop" in c.dom
 
 
-@module_loop
+@session_loop
 async def test_download_is_refused(site, browser):
     c = await browser.capture(site.url("/apk"), "mobile")
     assert c.page.outcome == "download" and c.screenshot is None
+    # the page never left about:blank, but the download's response is known
+    assert c.page.final_url is None and c.page.redirects == (site.url("/apk"),)
+    assert c.page.http_status == 200 and c.page.server_ip == "127.0.0.1"
 
 
-@module_loop
+@session_loop
 async def test_http_error_and_dns_fail(site, browser):
     c = await browser.capture(site.url("/404"), "mobile")
     assert c.page.outcome == "http_error" and c.page.http_status == 404
@@ -126,7 +183,7 @@ async def test_http_error_and_dns_fail(site, browser):
     assert c.screenshot is None and "ERR_NAME_NOT_RESOLVED" in c.page.error
 
 
-@module_loop
+@session_loop
 async def test_load_timeout_with_committed_document(site, browser):
     # a dead tracker keeps "load" from firing; the document itself arrived
     async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
@@ -136,7 +193,25 @@ async def test_load_timeout_with_committed_document(site, browser):
     assert c.screenshot.startswith(b"\x89PNG") and b"stalled" in c.dom
 
 
-@module_loop
+@session_loop
+async def test_load_timeout_without_a_final_document_is_timeout(site, browser):
+    # the document arrived, but the final URL has no response of its own
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        c = await b.capture(site.url("/stall-push"), "mobile")
+    assert c.page.final_url == site.url("/pushed") and c.page.http_status is None
+    assert c.page.outcome == "timeout" and c.page.error == "load timeout"
+    assert c.screenshot.startswith(b"\x89PNG") and b"stalled push" in c.dom
+
+
+@session_loop
+async def test_landing_that_moves_to_a_dead_host_is_its_failure(site, browser):
+    c = await browser.capture(site.url("/to-dead"), "mobile")
+    assert c.page.outcome == "dns_fail" and c.page.final_url is None
+    assert "ERR_NAME_NOT_RESOLVED" in c.page.error and c.page.http_status is None
+    assert c.page.redirects[0] == site.url("/to-dead") and c.screenshot is None
+
+
+@session_loop
 async def test_status_belongs_to_final_url(site, browser):
     # pushState moves the URL without a response: no other document's status
     c = await browser.capture(site.url("/push"), "mobile")
@@ -144,7 +219,7 @@ async def test_status_belongs_to_final_url(site, browser):
     assert c.page.http_status is None and c.page.server_ip is None
 
 
-@module_loop
+@session_loop
 async def test_click_through_reaches_login_form(site, browser):
     c = await browser.capture(site.url("/"), "desktop", click_through=True)
     assert len(c.clicks) == 1 and c.clicks[0].label.lower() == "sign in"
@@ -159,7 +234,7 @@ async def test_click_through_reaches_login_form(site, browser):
     assert site.url("/login") in uris
 
 
-@module_loop
+@session_loop
 async def test_click_through_capped_at_three(site, browser):
     c = await browser.capture(site.url("/many"), "desktop", click_through=True)
     assert [k.page.profile for k in c.clicks] == ["desktop-click1", "desktop-click2",
@@ -168,21 +243,152 @@ async def test_click_through_capped_at_three(site, browser):
     assert all(k.label == "Log in" for k in c.clicks)
 
 
-@module_loop
-async def test_click_through_follows_popup(site, browser):
+@session_loop
+async def test_click_through_follows_popup(site, browser, caplog):
     c = await browser.capture(site.url("/popup"), "desktop", click_through=True)
     assert len(c.clicks) == 1 and c.clicks[0].page.final_url == site.url("/login")
     assert b'type="password"' in c.clicks[0].dom
+    # the popup's first request comes before its page exists; it still counts
+    assert c.clicks[0].page.http_status == 200 and c.clicks[0].page.server_ip == "127.0.0.1"
+    assert c.clicks[0].page.redirects == (site.url("/login"),)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    # the popup's exchanges share the WARC
+    responses = [(r.rec_headers.get_header("WARC-Target-URI"), r.content_stream().read())
+                 for r in ArchiveIterator(io.BytesIO(c.warc)) if r.rec_type == "response"]
+    assert any(u == site.url("/login") and b'type="password"' in body for u, body in responses)
 
 
-@module_loop
+@session_loop
+async def test_click_popup_is_the_clicks_not_the_pages_own(site, browser):
+    # The replayed page opens a popup of its own before the click; only a
+    # target that did not exist when the click started counts.
+    c = await browser.capture(site.url("/popup-own"), "desktop", click_through=True)
+    assert len(c.clicks) == 1 and c.clicks[0].page.final_url == site.url("/login")
+    assert c.clicks[0].page.http_status == 200
+
+
+@session_loop
+async def test_click_waits_for_a_navigation_that_commits_during_the_settle(
+        site, browser, monkeypatch):
+    # The click starts no navigation itself: a timer does, 0.3 s later. The
+    # new document's load (a 1.5 s image) ends after the settle; the evidence
+    # is taken after it.
+    monkeypatch.setattr(browser, "settle_s", 0.5)
+    c = await browser.capture(site.url("/late-nav"), "desktop", click_through=True)
+    click = c.clicks[0]
+    assert click.page.final_url == site.url("/onload") and click.page.outcome == "live"
+    assert b"image arrived" in click.dom and click.page.error is None
+
+
+@session_loop
+async def test_hop_budget_bounds_a_hanging_click_target(site, browser):
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        t = time.monotonic()
+        c = await b.capture(site.url("/hang-login"), "desktop", click_through=True)
+        elapsed = time.monotonic() - t
+    assert c.page.outcome == "live" and len(c.clicks) == 1
+    # landing: settle + evidence; the hop: nav_timeout_s + settle_s; drain floor
+    assert elapsed < 0.5 + 2 + (2 + 0.5) + 2 + 1
+    click = c.clicks[0]
+    assert click.page.outcome == "timeout" and "TimeoutError" in click.page.error
+    assert "/hang" in site.paths_requested
+
+
+@session_loop
+async def test_a_blocked_click_is_an_error_even_if_the_url_moves(site):
+    # Nothing is clicked (an overlay takes the pointer) while the page's timer
+    # moves its URL: no navigation of the click hangs, so no timeout.
+    async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
+        c = await b.capture(site.url("/overlay-push"), "desktop", click_through=True)
+    click = c.clicks[0]
+    assert click.page.outcome == "error" and click.page.error.startswith("click failed: ")
+    assert "/login" not in site.paths_requested
+
+
+@session_loop
+async def test_click_bound_stays_within_the_hop_deadline(site, browser, monkeypatch):
+    # with a small nav_timeout_s the reserve is below the 0.5 s click margin
+    monkeypatch.setattr(browser, "nav_timeout_s", 0.9)
+    loop = asyncio.get_running_loop()
+    deadlines, ends = [], []
+    real_click, real_wait_for = browser._click, asyncio.wait_for
+
+    async def click(context, rec, url, profile, n, label, deadline):
+        deadlines.append(deadline)
+        return await real_click(context, rec, url, profile, n, label, deadline)
+
+    def wait_for(aw, timeout):
+        if getattr(aw, "__qualname__", "").endswith(".click"):
+            ends.append(loop.time() + timeout)
+        return real_wait_for(aw, timeout)
+
+    monkeypatch.setattr(browser, "_click", click)
+    monkeypatch.setattr(asyncio, "wait_for", wait_for)
+    c = await browser.capture(site.url("/hang-login"), "desktop", click_through=True)
+    assert c.clicks[0].page.outcome == "timeout"
+    assert len(ends) == 1 and ends[0] <= deadlines[0] + 0.01  # left() ran a moment earlier
+
+
+@session_loop
+async def test_click_pages_are_closed_after_their_hop(site, browser, monkeypatch):
+    real = browser._click
+    open_pages = []
+
+    async def counting(context, *args):
+        open_pages.append(len(context.pages))
+        return await real(context, *args)
+
+    monkeypatch.setattr(browser, "_click", counting)
+    c = await browser.capture(site.url("/many"), "desktop", click_through=True)
+    assert open_pages == [1, 1, 1]  # only the landing page is open when a hop starts
+    bodies = {r.rec_headers.get_header("WARC-Target-URI"): r.content_stream().read()
+              for r in ArchiveIterator(io.BytesIO(c.warc)) if r.rec_type == "response"}
+    assert all(b'type="password"' in bodies[site.url(f"/login?n={i}")] for i in range(3))
+
+
+@session_loop
+async def test_popup_requests_agree_with_the_profile(site, browser):
+    # Pages the site opens get the profile's client hints once playwright
+    # reports them. Before that (browser.py, capture) only the UA string and
+    # the brands are certain; a request after it carries the full hints.
+    c = await browser.capture(site.url("/popup-hints"), "desktop", click_through=True)
+    assert c.clicks[0].page.final_url == site.url("/hinted")
+    sent = list(zip(site.paths_requested, site.headers))
+    replay = [h for p, h in sent if p == "/popup-hints"][-1]  # with the Accept-CH hints
+    first = next(h for p, h in sent if p == "/hinted")
+    later = next(h for p, h in sent if p == "/late-pic")
+    for name in ("user-agent", "sec-ch-ua", "sec-ch-ua-mobile"):
+        assert first[name] == replay[name]
+    hints = [n for n in replay if n.startswith("sec-ch-ua") or n == "user-agent"]
+    assert len(hints) == 8 and {n: later.get(n) for n in hints} == {n: replay[n] for n in hints}
+    assert later["sec-ch-ua-platform-version"] == '"15.0.0"'
+
+
+@session_loop
+async def test_login_matching_ignores_the_pages_own_javascript(site, browser):
+    # the page rewrites DOM and RegExp methods in its own world; the matcher
+    # runs in an isolated world, where they are untouched
+    c = await browser.capture(site.url("/evil-login"), "desktop", click_through=True)
+    assert [k.label for k in c.clicks] == ["Sign in"]
+    assert c.clicks[0].page.final_url == site.url("/login")
+    assert b'type="password"' in c.clicks[0].dom
+
+
+@session_loop
+async def test_login_label_cannot_reach_the_selector_syntax(site, browser):
+    c = await browser.capture(site.url("/odd-label"), "desktop", click_through=True)
+    assert [k.label for k in c.clicks] == ['Sign in >> "now" \u00fc']
+    assert c.clicks[0].page.final_url == site.url("/login")
+
+
+@session_loop
 async def test_no_click_through_by_default(site, browser):
     c = await browser.capture(site.url("/"), "desktop")
     assert c.clicks == ()
     assert "/login" not in site.paths_requested
 
 
-@module_loop
+@session_loop
 async def test_click_through_element_gone_is_error(site, browser):
     # the login link is only there on the first visit of this context
     c = await browser.capture(site.url("/once"), "desktop", click_through=True)
@@ -192,14 +398,14 @@ async def test_click_through_element_gone_is_error(site, browser):
     assert c.clicks[0].dom is None
 
 
-@module_loop
+@session_loop
 async def test_click_through_to_dead_host(site, browser):
     c = await browser.capture(site.url("/dead"), "desktop", click_through=True)
     assert c.clicks[0].page.outcome == "dns_fail" and c.clicks[0].page.final_url is None
     assert "ERR_NAME_NOT_RESOLVED" in c.clicks[0].page.error
 
 
-@module_loop
+@session_loop
 async def test_click_through_after_landing_load_timeout(site, browser):
     # a dead tracker keeps "load" from firing on the landing page and every replay
     async with Browser(proxy=None, nav_timeout_s=2, settle_s=0.5) as b:
@@ -209,21 +415,21 @@ async def test_click_through_after_landing_load_timeout(site, browser):
     assert b'type="password"' in c.clicks[0].dom
 
 
-@module_loop
+@session_loop
 async def test_click_through_label_changed_is_error(site, browser):
     c = await browser.capture(site.url("/relabel"), "desktop", click_through=True)
     assert c.clicks[0].label == "Sign in" and c.clicks[0].page.outcome == "error"
     assert c.clicks[0].page.error == "click failed: element changed"
 
 
-@module_loop
+@session_loop
 async def test_click_through_finds_moved_label(site, browser):
     c = await browser.capture(site.url("/swap"), "desktop", click_through=True)
     assert [(k.label, k.page.final_url) for k in c.clicks] == [
         ("Log in", site.url("/login?via=log")), ("Sign in", site.url("/login?via=sign"))]
 
 
-@module_loop
+@session_loop
 async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
     real = browser._click
 
@@ -240,11 +446,43 @@ async def test_click_hop_failure_is_isolated(site, browser, monkeypatch):
     assert c.clicks[0].page.profile == "desktop-click1" and c.clicks[0].label == "Log in"
 
 
-@module_loop
+class _FakeRoute:
+    def __init__(self, request):
+        self.request = request
+        self.calls = []
+
+    async def abort(self, *args):
+        self.calls.append("abort")
+
+    async def fallback(self):
+        self.calls.append("fallback")
+
+
+async def test_freeze_hold_resolves_a_route_it_cannot_judge():
+    # A route handler that raises leaves its request hanging: an unexpected
+    # error in judging a request lets it through instead.
+    class Page:
+        main_frame = object()
+
+        async def route(self, pattern, handler):
+            self.hold = handler
+
+    class Request:
+        def is_navigation_request(self):
+            raise RuntimeError("unexpected")
+
+    page = Page()
+    await Browser._freeze(page, None, Recorder(), asyncio.get_running_loop().time() + 5)
+    route = _FakeRoute(Request())
+    await page.hold(route)
+    assert route.calls == ["fallback"]
+
+
+@session_loop
 async def test_freeze_holds_against_later_meta_refresh(site, browser):
     # a refresh already scheduled at the freeze must not fire afterwards
     context = await browser._browser.new_context()
-    rec = _Recorder()
+    rec = Recorder()
     try:
         rec.watch(context)
         page = await context.new_page()
@@ -259,7 +497,7 @@ async def test_freeze_holds_against_later_meta_refresh(site, browser):
         await context.close()
 
 
-@module_loop
+@session_loop
 async def test_freeze_stops_a_refresh_loop(site, browser):
     # The /loop flake: Page.stopLoading landing between a commit and the
     # document's load let its 0-second refresh be scheduled after the freeze,
@@ -267,7 +505,7 @@ async def test_freeze_stops_a_refresh_loop(site, browser):
     # The race hits about every second freeze; five in a row must all hold.
     for _ in range(5):
         context = await browser._browser.new_context()
-        rec = _Recorder()
+        rec = Recorder()
         try:
             rec.watch(context)
             page = await context.new_page()
@@ -283,3 +521,126 @@ async def test_freeze_stops_a_refresh_loop(site, browser):
         finally:
             await rec.exchanges(1)
             await context.close()
+
+
+async def _hang(*args, **kwargs):
+    await asyncio.sleep(3600)
+
+
+@session_loop
+async def test_a_wedged_browser_before_navigation_is_bounded(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 1)
+    monkeypatch.setattr(browser, "prepare_page", _hang)
+    t = time.monotonic()
+    c = await browser.capture(site.url("/"), "mobile")
+    # setup gets nav_timeout_s, the drain at most nav_timeout_s more
+    assert time.monotonic() - t < 2 * 1 + 2
+    assert c.page.outcome == "timeout" and "browser setup" in c.page.error
+    assert "/" not in site.paths_requested and browser._browser.contexts == []
+
+
+@session_loop
+async def test_a_context_that_never_closes_does_not_hang_the_capture(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 2)
+    contexts = []
+    real_new_context = browser._browser.new_context
+
+    async def new_context(**kwargs):
+        ctx = await real_new_context(**kwargs)
+        contexts.append((ctx, ctx.close))
+        ctx.close = _hang
+        return ctx
+
+    monkeypatch.setattr(browser._browser, "new_context", new_context)
+    try:
+        t = time.monotonic()
+        c = await browser.capture(site.url("/"), "mobile")
+        assert c.page.outcome == "live" and c.page.http_status == 200
+        # navigation, settle, a drain floor and the close's own nav_timeout_s
+        assert time.monotonic() - t < 2 + 1 + 2 + 2 + 2
+    finally:
+        for _, close in contexts:
+            await close()
+
+
+@session_loop
+async def test_a_context_created_after_the_setup_timeout_is_closed(site, browser, monkeypatch):
+    monkeypatch.setattr(browser, "nav_timeout_s", 0.5)
+    real_new_context = browser._browser.new_context
+    made = []
+
+    async def slow_new_context(**kwargs):
+        await asyncio.sleep(1.5)  # the browser recovers after the capture gave up
+        made.append(await real_new_context(**kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(browser._browser, "new_context", slow_new_context)
+    with pytest.raises(TimeoutError, match="browser setup"):
+        await browser.capture(site.url("/"), "mobile")
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if made and not browser._browser.contexts:
+            break
+    assert len(made) == 1 and browser._browser.contexts == []
+
+
+@session_loop
+async def test_a_context_created_after_a_cancelled_capture_is_closed(
+        site, browser, monkeypatch, caplog):
+    # e.g. job_timeout_s cancels the capture while the browser is slow
+    real_new_context = browser._browser.new_context
+    made = []
+
+    async def slow_new_context(**kwargs):
+        await asyncio.sleep(1)
+        made.append(await real_new_context(**kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(browser._browser, "new_context", slow_new_context)
+    task = asyncio.ensure_future(browser.capture(site.url("/"), "mobile"))
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    for _ in range(50):
+        await asyncio.sleep(0.1)
+        if made and not browser._browser.contexts:
+            break
+    assert len(made) == 1 and browser._browser.contexts == []
+    gc.collect()
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+async def test_exit_cancels_pending_late_closes():
+    async with Browser(proxy=None, nav_timeout_s=5, settle_s=0) as b:
+        pending = asyncio.ensure_future(asyncio.sleep(3600))  # a close that hangs
+        b._late_closes.add(pending)
+    assert pending.cancelled()
+
+
+class _LocalResolver:
+    async def resolve(self, fqdn, registrable):
+        return (DnsAnswer(fqdn, "A", "NOERROR", 60, ("127.0.0.1",), "local",
+                          "2026-10-24T10:00:00Z"),)
+
+
+@session_loop
+async def test_job_timeout_cancels_a_hanging_capture_and_the_browser_still_works(
+        site, browser, tmp_path):
+    # The fetch loop's bound: asyncio.timeout around run_job. The landing
+    # never answers; the cancelled capture drains (up to nav_timeout_s) and
+    # closes its context; the same Browser then captures a normal page.
+    job = Job(1, 1, "127.0.0.1", "127.0.0.1", 0, site.url("/hang"))
+    t = time.monotonic()
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(1.0):
+            await run_job(job, resolver=_LocalResolver(), browser=browser,
+                          bs=BlobStore(tmp_path / "blobs"),
+                          key=NodeKey.load_or_create(tmp_path / "key"),
+                          egress_address=None, spacer=IpSpacer(None))
+    # job_timeout + at most one drain (nav_timeout_s = 10, settle 1) + margin
+    assert time.monotonic() - t < 1.0 + 10 + 1 + 5
+    assert "/hang" in site.paths_requested
+    assert browser._browser.contexts == []  # the cancelled capture's context is closed
+    c = await browser.capture(site.url("/"), "mobile")
+    assert c.page.outcome == "live" and c.page.http_status == 200

@@ -1,14 +1,22 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
-from hakapik.db import CandidateRow, add_candidates
+from conftest import _test_db_url
+
+from hakapik.config import Config
+from hakapik.db import CandidateRow, add_candidates, connect
 from hakapik.jobs import (
     advance_job,
     attempts_today,
     claim_jobs,
     enqueue_manual,
+    extend_lease,
     last_fetched,
     sweep,
 )
+
+
+LADDER = Config.retry_ladder_s  # the default; its last step is 86400 s
 
 
 def _row(fqdn):
@@ -43,9 +51,11 @@ async def test_claim_newest_first(conn):
     await _add(conn, "a.example.com", 30)
     await _add(conn, "b.example.com", 20)
     newest = await _add(conn, "c.example.com", 10)
-    jobs = await claim_jobs(conn, 1, 60)
-    assert [j.job_id for j in jobs] == [newest]
-    assert jobs[0].url == "https://c.example.com/" and jobs[0].step == 0
+    claims = await claim_jobs(conn, 1, 60)
+    assert [c.job.job_id for c in claims] == [newest]
+    assert claims[0].job.url == "https://c.example.com/" and claims[0].job.step == 0
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (newest,))
+    assert claims[0].claimed_until == (await cur.fetchone())[0]
 
 
 async def test_claim_respects_due_and_lease(conn):
@@ -53,15 +63,15 @@ async def test_claim_respects_due_and_lease(conn):
     await conn.execute("UPDATE fetch_job SET due_at = now() + interval '1 hour'")
     assert await claim_jobs(conn, 5, 60) == []
     await conn.execute("UPDATE fetch_job SET due_at = now()")
-    assert [j.job_id for j in await claim_jobs(conn, 5, 60)] == [future]
+    assert [c.job.job_id for c in await claim_jobs(conn, 5, 60)] == [future]
     assert await claim_jobs(conn, 5, 60) == []
 
 
 async def test_expired_lease_is_reclaimed(conn):
     jid = await _add(conn, "a.example.com")
-    assert [j.job_id for j in await claim_jobs(conn, 1, 1)] == [jid]
+    assert [c.job.job_id for c in await claim_jobs(conn, 1, 1)] == [jid]
     await conn.execute("UPDATE fetch_job SET claimed_until = now() - interval '1 second'")
-    assert [j.job_id for j in await claim_jobs(conn, 1, 1)] == [jid]
+    assert [c.job.job_id for c in await claim_jobs(conn, 1, 1)] == [jid]
 
 
 async def _job(conn, jid):
@@ -92,7 +102,7 @@ async def test_sweep_ages_out_old_and_excess(conn):
     retry = await _add(conn, "retry.example.com", 7200)
     await conn.execute("UPDATE fetch_job SET step = 1 WHERE id = %s", (retry,))
     fresh = [await _add(conn, f"f{i}.example.com", 40 - i) for i in range(4)]
-    assert await sweep(conn, 1, 2) == 3
+    assert await sweep(conn, 1, 2, LADDER) == 3
     states = {
         r[0]: r[1] for r in await (await conn.execute("SELECT id, state FROM fetch_job")).fetchall()
     }
@@ -129,18 +139,18 @@ async def test_last_fetched_and_attempts_today(conn):
 async def test_sweep_spares_leased_jobs(conn):
     leased = await _add(conn, "leased.example.com", 7200)
     await claim_jobs(conn, 1, 600)
-    assert await sweep(conn, 1, None) == 0
+    assert await sweep(conn, 1, None, LADDER) == 0
     assert (await _job(conn, leased))[1] == "open"
     # leased jobs do not count toward the cap either
     await _add(conn, "a.example.com", 20)
     await _add(conn, "b.example.com", 10)
-    assert await sweep(conn, 1, 2) == 0
-    assert await sweep(conn, 1, 1) == 1
+    assert await sweep(conn, 1, 2, LADDER) == 0
+    assert await sweep(conn, 1, 1, LADDER) == 1
 
 
 async def test_advance_is_noop_on_closed_jobs(conn):
     aged = await _add(conn, "a.example.com", 7200)
-    await sweep(conn, 1, None)
+    await sweep(conn, 1, None, LADDER)
     await advance_job(conn, aged, 0, (0, 120))
     assert (await _job(conn, aged))[:2] == (0, "aged_out")
     done = await _add(conn, "b.example.com")
@@ -149,26 +159,127 @@ async def test_advance_is_noop_on_closed_jobs(conn):
     assert (await _job(conn, done))[:2] == (0, "done")
 
 
-async def test_manual_lost_race_leaves_no_orphan(conn, monkeypatch):
-    # Simulate by making the pre-check blind: open job exists but SELECT says no.
-    await _add(conn, "race.example.com")
-    orig = conn.execute
-
-    async def blind(sql, *a, **k):
-        if sql.startswith("SELECT 1 FROM fetch_job"):
-            return await orig("SELECT 1 WHERE false")
-        return await orig(sql, *a, **k)
-
-    monkeypatch.setattr(conn, "execute", blind, raising=False)
-    assert await enqueue_manual(conn, ["race.example.com"]) == [("race.example.com", "already_open")]
-    monkeypatch.undo()
+async def test_manual_lost_race_leaves_no_orphan(conn):
+    # A real concurrent transaction: ``conn`` holds an uncommitted open job, so
+    # the other enqueue's pre-check sees nothing and its insert waits on the
+    # unique open-job index, then loses when ``conn`` commits.
+    await conn.commit()
+    assert await enqueue_manual(conn, ["race.example.com"]) == [("race.example.com", "queued")]
+    other = await connect(_test_db_url())
+    try:
+        task = asyncio.create_task(enqueue_manual(other, ["race.example.com"]))
+        for _ in range(200):
+            cur = await conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND datname = current_database()")
+            if (await cur.fetchone())[0]:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("the second enqueue never waited on the first")
+        assert not task.done()
+        await conn.commit()
+        assert await asyncio.wait_for(task, 10) == [("race.example.com", "already_open")]
+        await other.commit()
+    finally:
+        await other.close()
     assert await _count(conn, "candidate") == 1
     assert await _count(conn, "fetch_job") == 1
+
+
+async def test_claim_orders_by_priority_then_newest(conn):
+    # Inserted in the reverse of the claim order, so neither the physical row
+    # order nor RETURNING's order happens to match: the re-sort in claim_jobs
+    # is what orders the list.
+    ids = {}
+    for fqdn, prio, age in [("lo-old.example.com", 0, 30), ("lo-new.example.com", 0, 10),
+                            ("hi-old.example.com", 5, 40), ("hi-new.example.com", 5, 20)]:
+        ids[fqdn] = await _add(conn, fqdn, age)
+        await conn.execute("UPDATE fetch_job SET priority = %s WHERE id = %s",
+                           (prio, ids[fqdn]))
+    claims = await claim_jobs(conn, 4, 60)
+    assert [c.job.fqdn for c in claims] == ["hi-new.example.com", "hi-old.example.com",
+                                      "lo-new.example.com", "lo-old.example.com"]
+    # The limit takes the highest priority first, not the newest.
+    await conn.execute("UPDATE fetch_job SET claimed_until = NULL")
+    assert [c.job.fqdn for c in await claim_jobs(conn, 1, 60)] == ["hi-new.example.com"]
 
 
 async def test_sweep_takes_fractional_ageout_hours(conn):
     old = await _add(conn, "old.example.com", 2000)  # older than 0.5 h
     young = await _add(conn, "young.example.com", 1000)
-    assert await sweep(conn, 0.5, None) == 1
+    assert await sweep(conn, 0.5, None, LADDER) == 1
     assert (await _job(conn, old))[1] == "aged_out"
     assert (await _job(conn, young))[1] == "open"
+
+
+async def test_extend_lease_only_for_the_holder_of_the_token(conn):
+    jid = await _add(conn, "a.example.com")
+    [claim] = await claim_jobs(conn, 1, 1)
+    token = await extend_lease(conn, jid, 0, 600, claim.claimed_until)
+    assert token is not None and token > claim.claimed_until
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (jid,))
+    assert (await cur.fetchone())[0] == token
+    # The old token no longer holds the lease; nor does a stale step.
+    assert await extend_lease(conn, jid, 0, 600, claim.claimed_until) is None
+    assert await extend_lease(conn, jid, 1, 600, token) is None
+    await conn.execute("UPDATE fetch_job SET state = 'done' WHERE id = %s", (jid,))
+    assert await extend_lease(conn, jid, 0, 600, token) is None  # closed
+
+
+async def test_extend_lease_after_another_claim_is_a_noop(conn):
+    jid = await _add(conn, "a.example.com")
+    [old] = await claim_jobs(conn, 1, 1)
+    await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() - interval '1 second' WHERE id = %s",
+        (jid,))
+    await conn.commit()
+    [new] = await claim_jobs(conn, 1, 60)  # a second holder after expiry
+    assert await extend_lease(conn, jid, 0, 600, old.claimed_until) is None
+    cur = await conn.execute("SELECT claimed_until FROM fetch_job WHERE id = %s", (jid,))
+    assert (await cur.fetchone())[0] == new.claimed_until
+
+
+async def test_extend_lease_after_the_result_was_stored_is_a_noop(conn):
+    # store_result advances the job (advance_job) and commits; a heartbeat
+    # tick that fires after that changes nothing.
+    jid = await _add(conn, "a.example.com")
+    [claim] = await claim_jobs(conn, 1, 60)
+    await advance_job(conn, jid, 0, (0, 120))
+    await conn.commit()
+    assert await extend_lease(conn, jid, 0, 600, claim.claimed_until) is None
+    assert (await _job(conn, jid))[:3] == (1, "open", None)
+
+
+async def test_enqueue_manual_inserts_in_fqdn_order_and_reports_in_input_order(conn):
+    # One global insert order (by fqdn, as add_candidates) rules out deadlocks
+    # with a concurrent tail or enqueue; the output still follows the input.
+    names = ["c.example.com", "*.x.com", "b.example.com", "bad..name", "a.example.com"]
+    res = await enqueue_manual(conn, names)
+    assert res == [("c.example.com", "queued"), ("*.x.com", "wildcard"),
+                   ("b.example.com", "queued"), ("bad..name", "invalid"),
+                   ("a.example.com", "queued")]
+    cur = await conn.execute("SELECT fqdn FROM candidate ORDER BY id")
+    assert [r[0] for r in await cur.fetchall()] == [
+        "a.example.com", "b.example.com", "c.example.com"]
+    cur = await conn.execute("SELECT fqdn FROM fetch_job ORDER BY id")
+    assert [r[0] for r in await cur.fetchall()] == [
+        "a.example.com", "b.example.com", "c.example.com"]
+
+
+async def test_sweep_ages_out_retried_jobs_past_the_last_ladder_step(conn):
+    # Beyond the last ladder step plus ageout_hours every open job goes, not
+    # only untried ones; a leased job is still spared.
+    ladder = (0, 120, 600, 3600)
+    limit = ladder[-1] + 3600  # ageout_hours = 1
+    stale = await _add(conn, "stale.example.com", limit + 60)
+    young = await _add(conn, "young.example.com", limit - 60)
+    leased = await _add(conn, "leased.example.com", limit + 60)
+    await conn.execute("UPDATE fetch_job SET step = 3, due_at = now() + interval '1 hour'")
+    await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() + interval '10 minutes' WHERE id = %s",
+        (leased,))
+    assert await sweep(conn, 1, None, ladder) == 1
+    assert (await _job(conn, stale))[1] == "aged_out"
+    assert (await _job(conn, young))[1] == "open"
+    assert (await _job(conn, leased))[1] == "open"

@@ -5,11 +5,8 @@ from typing import Protocol
 import httpx
 
 from hakapik.ct.loglist import LogInfo
-
-
-def base_url(url: str) -> str:
-    """Return url with exactly one trailing slash."""
-    return url.rstrip("/") + "/"
+from hakapik.ct.rfc6962 import Rfc6962Log
+from hakapik.ct.static_ct import StaticCtLog
 
 
 class LogSource(Protocol):
@@ -21,10 +18,8 @@ class LogSource(Protocol):
 
 
 def make_source(info: LogInfo, client: httpx.AsyncClient) -> LogSource:
-    # Imported here: both client modules import base_url from this module.
-    from hakapik.ct.rfc6962 import Rfc6962Log
-    from hakapik.ct.static_ct import StaticCtLog
-
     if info.kind == "tiled":
         return StaticCtLog(info, client)
-    return Rfc6962Log(info, client)
+    if info.kind == "rfc6962":
+        return Rfc6962Log(info, client)
+    raise ValueError(f"unknown log kind {info.kind!r} for {info.log_id}")

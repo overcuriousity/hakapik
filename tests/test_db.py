@@ -1,3 +1,4 @@
+import asyncio
 import os
 from datetime import date
 
@@ -7,9 +8,11 @@ from hakapik.db import (
     CandidateRow,
     add_candidates,
     add_raw_batch,
+    advance_cursor,
     connect,
     bump_stat,
     get_cursor,
+    init_cursor,
     migrate,
     read_stat,
     read_stats,
@@ -117,11 +120,35 @@ async def test_migrate_upgrades_old_candidate_table(conn):
     # a stage-one candidate table (NOT NULL log columns, no reason) is upgraded in place
     await conn.execute("DROP TABLE candidate CASCADE")
     await conn.execute(STAGE_ONE_CANDIDATE_DDL)
+    await conn.execute(
+        "INSERT INTO candidate (fqdn, registrable, log_id, log_index, cert_key, first_seen_ms) "
+        "VALUES ('old.example.com','example.com','L',1,'\\x01',5)"
+    )
     await migrate(conn)
     await conn.execute(
         "INSERT INTO candidate (fqdn, registrable, reason) "
         "VALUES ('a.example.com','example.com','manual')"
     )
+    cur = await conn.execute("SELECT fqdn, reason, log_id FROM candidate ORDER BY id")
+    # the legacy row gets reason 'first_seen' and keeps its values; the manual one has NULL log columns
+    assert await cur.fetchall() == [
+        ("old.example.com", "first_seen", "L"),
+        ("a.example.com", "manual", None),
+    ]
+    cur = await conn.execute(
+        "SELECT column_name, is_nullable FROM information_schema.columns "
+        "WHERE table_name = 'candidate' AND column_name IN "
+        "('log_id','log_index','cert_key','first_seen_ms','reason')"
+    )
+    assert dict(await cur.fetchall()) == {
+        "log_id": "YES", "log_index": "YES", "cert_key": "YES",
+        "first_seen_ms": "YES", "reason": "NO",
+    }
+    cur = await conn.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'ingest_stat' AND column_name = 'candidates_recheck'"
+    )
+    assert await cur.fetchone()
 
 
 async def test_migrate_is_idempotent(conn):
@@ -138,3 +165,122 @@ async def test_second_migrate_takes_no_exclusive_lock(conn):
         await migrate(conn)
     finally:
         await other.close()
+
+
+async def test_concurrent_overlapping_candidates_do_not_deadlock(conn):
+    # The same certificate reaches several logs, so concurrent log tasks insert
+    # the same names; fetch_job's unique open-fqdn index makes them wait on each
+    # other, which deadlocks unless every batch inserts in one global order.
+    url = os.environ["HAKAPIK_TEST_DB"]
+
+    async def batch(names):
+        c = await connect(url)
+        try:
+            rows = [CandidateRow(n, "example.com", "L", i, b"k", 0) for i, n in enumerate(names)]
+            await add_candidates(c, rows)
+            await c.commit()
+        finally:
+            await c.close()
+
+    for r in range(3):
+        names = [f"h{r}-{i}.example.com" for i in range(2000)]
+        await asyncio.gather(batch(names), batch(names[::-1]))
+    assert await _count(conn, "fetch_job") == 6000
+
+
+async def test_init_cursor_never_overwrites(conn):
+    assert await init_cursor(conn, "L", 5) is True
+    assert await init_cursor(conn, "L", 99) is False
+    assert await get_cursor(conn, "L") == 5
+
+
+async def test_advance_cursor_is_a_compare_and_set(conn):
+    assert await advance_cursor(conn, "L", 0, 4) is True  # no row: created
+    assert await advance_cursor(conn, "L", 0, 8) is False  # not at 0 any more
+    assert await get_cursor(conn, "L") == 4
+    assert await advance_cursor(conn, "L", 4, 8) is True
+    assert await get_cursor(conn, "L") == 8
+
+
+async def test_concurrent_cursor_advance_lets_one_writer_win(conn):
+    await set_cursor(conn, "L", 0)
+    await conn.commit()
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        assert await advance_cursor(conn, "L", 0, 4) is True
+        # The second writer waits on the row lock, then sees the new value.
+        second = asyncio.create_task(advance_cursor(other, "L", 0, 4))
+        await asyncio.sleep(0.1)
+        assert not second.done()
+        await conn.commit()
+        assert await second is False
+        await other.rollback()
+    finally:
+        await other.close()
+    assert await get_cursor(conn, "L") == 4
+
+
+async def test_second_migrate_takes_no_share_lock(conn):
+    # CREATE INDEX IF NOT EXISTS takes SHARE even for an existing index; a
+    # writer's ROW EXCLUSIVE lock conflicts with it, so migrate must skip it.
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        await other.execute(
+            "LOCK TABLE candidate, raw_batch, fetch_job IN ROW EXCLUSIVE MODE"
+        )
+        await conn.execute("SET lock_timeout = '1s'")
+        await migrate(conn)
+    finally:
+        await other.close()
+
+
+async def test_migrate_recreates_a_missing_index(conn):
+    await conn.execute("DROP INDEX candidate_fqdn")
+    await migrate(conn)
+    cur = await conn.execute("SELECT to_regclass('candidate_fqdn')")
+    assert (await cur.fetchone())[0] is not None
+
+
+async def test_bump_stat_several_columns_accumulate(conn):
+    d = date(2026, 10, 23)
+    await bump_stat(conn, "L", d, entries=5, bytes=100, candidates=2)
+    await bump_stat(conn, "L", d, entries=1, bytes=10, candidates_recheck=3)
+    stat = await read_stat(conn, "L", d)
+    assert (stat["entries"], stat["bytes"], stat["candidates"], stat["candidates_recheck"]) == (6, 110, 2, 3)
+
+
+async def test_bump_stat_without_increments_creates_no_row(conn):
+    await bump_stat(conn, "L", date(2026, 10, 23))
+    assert await _count(conn, "ingest_stat") == 0
+
+
+async def test_db_functions_do_not_commit(conn):
+    await set_cursor(conn, "L", 3)
+    await bump_stat(conn, "L", date(2026, 10, 23), entries=1)
+    await add_raw_batch(conn, "L", 0, 1, "ab" * 32, 2, 10)
+    await add_candidates(conn, [CandidateRow("a.example.com", "example.com", "L", 0, b"k", 0)])
+    other = await connect(os.environ["HAKAPIK_TEST_DB"])
+    try:
+        for table in ("log_cursor", "ingest_stat", "raw_batch", "candidate", "fetch_job"):
+            cur = await other.execute(f"SELECT count(*) FROM {table}")
+            assert (await cur.fetchone())[0] == 0, table
+    finally:
+        await other.close()
+    await conn.rollback()
+    assert await _count(conn, "candidate") == 0
+
+
+async def test_add_candidates_empty_list(conn):
+    await add_candidates(conn, [])
+    assert await _count(conn, "candidate") == 0
+    assert await _count(conn, "fetch_job") == 0
+
+
+async def test_index_statements_survive_losing_the_creation_race(conn):
+    # Two first starts can both see an index missing; the loser then runs the
+    # CREATE for an index that exists. Every statement must tolerate that.
+    from hakapik.db import _INDEXES
+
+    for name, stmt in _INDEXES:
+        assert "IF NOT EXISTS" in stmt, name
+        await conn.execute(stmt)

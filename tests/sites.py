@@ -1,12 +1,23 @@
-"""A small local test site and a shared Browser, as pytest fixtures."""
+"""A small local test site (plain and TLS) and a shared Browser, as pytest fixtures."""
 
+import base64
+import datetime
+import hashlib
+import ipaddress
+import ssl
 import threading
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 import pytest_asyncio
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from hakapik.browser import Browser
+from hakapik.warc import MAX_BODY
 
 PAGES = {
     "/": (200, [], b'<html><head><title>Home</title></head><body><h1>Welcome</h1>'
@@ -45,21 +56,68 @@ PAGES = {
                        b' b = \'<a href="/login?via=sign">Sign in</a>\';'
                        b'document.write(document.cookie.includes("seen") ? b + a : a + b);'
                        b'document.cookie = "seen=1";</script></body></html>'),
+    # load never fires and the URL moves without a response of its own
+    "/stall-push": (200, [], b'<html><body>stalled push<img src="/never"><script>'
+                             b'history.pushState({}, "", "/pushed");</script></body></html>'),
+    # loads, then sends itself to a host that does not resolve
+    "/to-dead": (200, [], b'<html><body>going<script>setTimeout(() => { location.href = '
+                          b'"http://nonexistent.invalid/"; }, 100);</script></body></html>'),
+    # the login link navigates from a timer (0.3 s); the target's load waits on a slow image
+    "/late-nav": (200, [], b'<html><body><a href="#" onclick="setTimeout(() => { location.href'
+                           b' = \'/onload\'; }, 300); return false;">Sign in</a></body></html>'),
+    # says on load whether its image arrived or loading was stopped first
+    "/onload": (200, [], b'<html><body>form<img src="/slow-img"><script>addEventListener("load",'
+                         b' () => document.body.append("image " + (document.images[0].naturalWidth'
+                         b' ? "arrived" : "stopped")));</script></body></html>'),
+    "/slow-img": (200, [("Content-Type", "image/gif")],
+                  b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01"
+                  b"\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"),
+    # opens a popup of its own on every visit; the login link opens another
+    "/popup-own": (200, [], b'<html><body><script>window.open("/?own");</script>'
+                            b'<a href="/login" target="_blank">Login</a></body></html>'),
+    # the login link is under an overlay; a timer keeps moving the URL
+    "/overlay-push": (200, [], b'<html><body><a href="/login">Sign in</a><div style="position:'
+                               b'fixed; inset: 0; background: #fff"></div><script>let i = 0;'
+                               b'setInterval(() => history.pushState({}, "", "/moved" + i++), 50);'
+                               b'</script></body></html>'),
+    "/hang-login": (200, [], b'<html><body><a href="/hang">Sign in</a></body></html>'),
+    # asks for high-entropy client hints; its login popup loads an image
+    "/popup-hints": (200, [("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version, "
+                                         "Sec-CH-UA-Arch, Sec-CH-UA-Full-Version-List")],
+                     b'<html><body><a href="/hinted" target="_blank">Login</a></body></html>'),
+    "/hinted": (200, [], b'<html><body>hinted<script>setTimeout(() => fetch("/late-pic"), 300);'
+                         b'</script></body></html>'),
+    # hides its login link from any matcher that runs in the page's own JS world
+    "/evil-login": (200, [], b'<html><body><a href="/login">Sign in</a><script>'
+                             b'Document.prototype.querySelectorAll = () => [];'
+                             b'Object.defineProperty(HTMLElement.prototype, "innerText",'
+                             b' {get() { return ""; }});'
+                             b'RegExp.prototype.test = () => false;'
+                             b'Element.prototype.checkVisibility = () => false;'
+                             b'</script></body></html>'),
+    # a label with playwright selector syntax, quotes and non-ASCII in it
+    "/odd-label": (200, [], '<html><body><a href="/login">Sign in &gt;&gt; "now" \u00fc</a>'
+                            '</body></html>'.encode()),
+    "/fetch-big": (200, [], b'<html><body>big<script>fetch("/big");</script></body></html>'),
+    # a favicon the page asks for itself, as a link and as an image
+    "/icons": (200, [], b'<html><head><link rel="icon" href="/favicon.ico"></head>'
+                        b'<body>icons<img src="/favicon.ico"></body></html>'),
     "/apk": (200, [("Content-Type", "application/vnd.android.package-archive"),
                    ("Content-Disposition", 'attachment; filename="app.apk"')], b"PK\x03\x04" * 64),
 }
 
 
 class Site:
-    def __init__(self, port: int):
+    def __init__(self, port: int, scheme: str = "http"):
         self.port = port
+        self.scheme = scheme
         self.paths_requested: list[str] = []
         self.user_agents: list[str] = []
         self.headers: list[dict[str, str]] = []  # lower-cased names, per request
         self.release = threading.Event()  # lets /never return
 
     def url(self, path: str) -> str:
-        return f"http://127.0.0.1:{self.port}{path}"
+        return f"{self.scheme}://127.0.0.1:{self.port}{path}"
 
 
 def _handler(site: Site):
@@ -68,10 +126,19 @@ def _handler(site: Site):
             site.paths_requested.append(self.path)
             site.user_agents.append(self.headers.get("User-Agent", ""))
             site.headers.append({k.lower(): v for k, v in self.headers.items()})
-            if self.path == "/never":  # a dead tracker: no answer until teardown
+            # /never: a dead tracker; /hang: a page that never answers. Both
+            # hold the request until teardown.
+            if self.path in ("/never", "/hang"):
                 site.release.wait(30)
                 return
-            status, headers, body = PAGES.get(self.path.split("?")[0], (404, [], b"<html>not found</html>"))
+            if self.path == "/slow-img":  # a 1x1 GIF after 1.5 s
+                site.release.wait(1.5)
+            if self.path == "/big":  # one byte over the WARC's cap, made per request
+                status, headers, body = 200, [("Content-Type", "application/octet-stream")], \
+                    b"x" * (MAX_BODY + 1)
+            else:
+                status, headers, body = PAGES.get(self.path.split("?")[0],
+                                                  (404, [], b"<html>not found</html>"))
             self.send_response(status)
             if not any(n == "Content-Type" for n, _ in headers):
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -89,10 +156,11 @@ def _handler(site: Site):
     return Handler
 
 
-@pytest.fixture
-def site():
+def _serve(tls: ssl.SSLContext | None = None):
     server = ThreadingHTTPServer(("127.0.0.1", 0), None)
-    s = Site(server.server_address[1])
+    if tls is not None:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
+    s = Site(server.server_address[1], "https" if tls else "http")
     server.RequestHandlerClass = _handler(s)
     server.daemon_threads = True
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -106,10 +174,64 @@ def site():
         thread.join()
 
 
-@pytest_asyncio.fixture(scope="module", loop_scope="module")
-async def browser():
-    """One Chromium per test module; tests using it need loop_scope="module"."""
-    b = Browser(proxy=None, nav_timeout_s=10, settle_s=1)
+@pytest.fixture
+def site():
+    yield from _serve()
+
+
+@dataclass(frozen=True)
+class SiteCert:
+    der: bytes
+    cert_file: str
+    key_file: str
+    spki_sha256: str  # base64, the form --ignore-certificate-errors-spki-list takes
+
+
+@pytest.fixture(scope="session")
+def site_cert(tmp_path_factory) -> SiteCert:
+    """A self-signed certificate for 127.0.0.1, made for this test session."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - datetime.timedelta(days=1))
+            .not_valid_after(now + datetime.timedelta(days=7))
+            .add_extension(x509.SubjectAlternativeName(
+                [x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+            .sign(key, hashes.SHA256()))
+    d = tmp_path_factory.mktemp("tls")
+    (d / "cert.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    (d / "key.pem").write_bytes(key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()))
+    spki = cert.public_key().public_bytes(serialization.Encoding.DER,
+                                          serialization.PublicFormat.SubjectPublicKeyInfo)
+    return SiteCert(der=cert.public_bytes(serialization.Encoding.DER),
+                    cert_file=str(d / "cert.pem"), key_file=str(d / "key.pem"),
+                    spki_sha256=base64.b64encode(hashlib.sha256(spki).digest()).decode())
+
+
+@pytest.fixture
+def tls_site(site_cert):
+    """The same site over HTTPS with ``site_cert``."""
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(site_cert.cert_file, site_cert.key_file)
+    yield from _serve(tls)
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def browser(site_cert):
+    """One Chromium per test session; tests using it need loop_scope="session".
+
+    It trusts ``site_cert`` by its key (a test-only launch argument); every
+    other certificate is checked as in production.
+    """
+    class TrustingBrowser(Browser):
+        LAUNCH_ARGS = (*Browser.LAUNCH_ARGS,
+                       f"--ignore-certificate-errors-spki-list={site_cert.spki_sha256}")
+
+    b = TrustingBrowser(proxy=None, nav_timeout_s=10, settle_s=1)
     try:
         await b.__aenter__()
     except Exception as e:  # no Chromium installed, no display libs, ...

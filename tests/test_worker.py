@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import time
 
 from hakapik.blobstore import BlobStore
 from hakapik.browser import Capture, ClickCapture
@@ -109,33 +108,155 @@ async def test_mobile_exception_becomes_error_result(tmp_path):
     assert r.pages == () and r.blobs == () and r.dns
 
 
+class FakeClock:
+    """A monotonic clock that only moves when a sleep is awaited."""
+
+    def __init__(self):
+        self.t = 1000.0
+        self.sleeps = []
+
+    def __call__(self):
+        return self.t
+
+    async def sleep(self, d):
+        self.sleeps.append(round(d, 6))
+        await asyncio.sleep(0)
+        self.t += d
+
+
 async def test_ip_spacer_waits():
-    s = IpSpacer(0.2)
-    t = time.monotonic()
+    c = FakeClock()
+    s = IpSpacer(0.2, clock=c, sleep=c.sleep)
     await s.wait("1.1.1.1")
     await s.wait("2.2.2.2")
-    assert time.monotonic() - t < 0.1
+    assert c.sleeps == []
     await s.wait("1.1.1.1")
-    assert time.monotonic() - t >= 0.2
+    assert c.sleeps == [0.2]
+    c.t += 1.0
+    await s.wait("1.1.1.1")
+    assert c.sleeps == [0.2]
 
 
 async def test_ip_spacer_concurrent_waits_are_spaced():
-    s = IpSpacer(0.2)
-    done = []
-
-    async def w():
-        await s.wait("1.1.1.1")
-        done.append(time.monotonic())
-
-    t = time.monotonic()
-    await asyncio.gather(w(), w(), w())
-    done.sort()
-    assert done[1] - done[0] >= 0.19 and done[2] - done[1] >= 0.19
-    assert done[2] - t >= 0.39
+    c = FakeClock()
+    s = IpSpacer(0.2, clock=c, sleep=c.sleep)
+    await asyncio.gather(s.wait("1.1.1.1"), s.wait("1.1.1.1"), s.wait("1.1.1.1"))
+    assert c.sleeps == [0.2, 0.4]
 
 
 async def test_ip_spacer_none_returns_at_once():
-    s = IpSpacer(None)
-    t = time.monotonic()
+    c = FakeClock()
+    s = IpSpacer(None, clock=c, sleep=c.sleep)
     await asyncio.gather(s.wait("1.1.1.1"), s.wait("1.1.1.1"))
-    assert time.monotonic() - t < 0.05
+    assert c.sleeps == []
+
+
+async def test_ip_spacer_forgets_passed_slots():
+    c = FakeClock()
+    s = IpSpacer(0.2, clock=c, sleep=c.sleep)
+    for i in range(50):
+        await s.wait(f"192.0.2.{i}")
+    c.t += 0.2
+    await s.wait("198.51.100.1")
+    assert list(s._next) == ["198.51.100.1"]
+
+
+async def test_ip_spacer_cancelled_waiter_keeps_its_slot():
+    c = FakeClock()
+    sleeps = []
+
+    async def blocking_sleep(d):
+        sleeps.append(round(d, 6))
+        await asyncio.Event().wait()
+
+    s = IpSpacer(0.2, clock=c, sleep=blocking_sleep)
+    await s.wait("1.1.1.1")  # first slot, no sleep
+    waiter = asyncio.create_task(s.wait("1.1.1.1"))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.gather(waiter, return_exceptions=True)
+    late = asyncio.create_task(s.wait("1.1.1.1"))
+    await asyncio.sleep(0)
+    late.cancel()
+    await asyncio.gather(late, return_exceptions=True)
+    # The cancelled waiter's slot (0.2..0.4) stays reserved: spacing only lengthens.
+    assert sleeps == [0.2, 0.4]
+
+
+class RecordingSpacer(IpSpacer):
+    def __init__(self):
+        super().__init__(None)
+        self.ips = []
+
+    async def wait(self, ip):
+        self.ips.append(ip)
+
+
+async def test_spacer_waits_on_the_first_address(tmp_path):
+    answers = (DnsAnswer("a.example.com", "AAAA", "NOERROR", 60, ("2001:db8::1",), "fake", T),
+               DnsAnswer("a.example.com", "A", "NOERROR", 60, ("192.0.2.5", "192.0.2.1"),
+                         "fake", T))
+    key = NodeKey.load_or_create(tmp_path / "key")
+    spacer = RecordingSpacer()
+    await run_job(JOB, resolver=FakeResolver(answers), browser=FakeBrowser(),
+                  bs=BlobStore(tmp_path / "blobs"), key=key, egress_address=None,
+                  spacer=spacer)
+    # addresses() lists A before AAAA, in answer order.
+    assert spacer.ips == ["192.0.2.5"]
+
+
+async def test_resolver_exception_becomes_error_result(tmp_path):
+    class Broken:
+        async def resolve(self, fqdn, registrable):
+            raise RuntimeError("resolver down")
+
+    b = FakeBrowser()
+    r, _ = await run(tmp_path, Broken(), b)
+    assert r.outcome == "error" and r.error == repr(RuntimeError("resolver down"))
+    assert r.dns == () and r.pages == () and r.blobs == () and b.calls == []
+
+
+class FailingStore(BlobStore):
+    """A blob store whose put of one given payload raises."""
+
+    def __init__(self, root, fail_on):
+        super().__init__(root)
+        self.fail_on = fail_on
+
+    def put(self, data, media_type):
+        if data == self.fail_on:
+            raise OSError("disk full")
+        return super().put(data, media_type)
+
+
+async def _run_store(tmp_path, bs, browser):
+    key = NodeKey.load_or_create(tmp_path / "key")
+    env = await run_job(JOB, resolver=FakeResolver(dns()), browser=browser, bs=bs, key=key,
+                        egress_address=None, spacer=IpSpacer(None))
+    return open_envelope(env, {key.node_id: key.public_key}.get)
+
+
+async def test_failed_mobile_blob_write_records_no_mobile_page(tmp_path):
+    # The screenshot write fails after the WARC was written: the mobile pass is
+    # not recorded at all, so no page claims an outcome its artefacts miss.
+    r = await _run_store(tmp_path, FailingStore(tmp_path / "blobs", b"png-m"), FakeBrowser())
+    assert r.outcome == "error" and r.error == repr(OSError("disk full"))
+    assert r.pages == () and r.blobs == () and r.dns
+
+
+async def test_failed_desktop_blob_write_keeps_the_whole_mobile_pass(tmp_path):
+    r = await _run_store(tmp_path, FailingStore(tmp_path / "blobs", b"<d>"), FakeBrowser())
+    assert r.outcome == "live" and r.error == repr(OSError("disk full"))
+    assert [p.profile for p in r.pages] == ["mobile"]
+    assert {(x.profile, x.kind) for x in r.blobs} == {
+        ("mobile", "warc"), ("mobile", "screenshot"), ("mobile", "dom"),
+        ("mobile", "certchain")}
+
+
+async def test_failed_click_blob_write_drops_the_desktop_pass(tmp_path):
+    # The click screenshot is the desktop capture's last write: the whole
+    # desktop pass (its page, its click page and their blobs) is dropped.
+    r = await _run_store(tmp_path, FailingStore(tmp_path / "blobs", b"png-c"), FakeBrowser())
+    assert r.outcome == "live" and r.error == repr(OSError("disk full"))
+    assert [p.profile for p in r.pages] == ["mobile"]
+    assert {x.profile for x in r.blobs} == {"mobile"}

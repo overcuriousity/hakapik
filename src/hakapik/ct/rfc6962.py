@@ -6,7 +6,7 @@ import httpx
 
 from hakapik.ct._retry import retry_get
 from hakapik.ct.loglist import LogInfo
-from hakapik.ct.source import base_url
+from hakapik.ct._url import base_url
 
 
 class Rfc6962Log:
@@ -20,7 +20,10 @@ class Rfc6962Log:
         return int(resp.json()["tree_size"])
 
     async def entries(self, start: int, end: int) -> list[tuple[int, bytes, bytes]]:
-        """Fetch entries start..end inclusive; the log may return fewer."""
+        """Fetch entries start..end inclusive; the log may return fewer.
+
+        A response longer than asked for is cut to the requested range.
+        """
         resp = await retry_get(
             self._client,
             f"{self._base}ct/v1/get-entries",
@@ -32,5 +35,5 @@ class Rfc6962Log:
                 base64.b64decode(e["leaf_input"]),
                 base64.b64decode(e["extra_data"]),
             )
-            for i, e in enumerate(resp.json()["entries"])
+            for i, e in enumerate(resp.json()["entries"][: end - start + 1])
         ]
