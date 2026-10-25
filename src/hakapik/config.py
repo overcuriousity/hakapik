@@ -37,10 +37,10 @@ class Config:
     lease_s: int = 600
     # Overall bound on one job's run (resolve, spacing, captures, blob writes);
     # the store is not included. On expiry the capture in progress still
-    # drains its in-flight exchanges (at most nav_timeout_s + the browser's
-    # settle time, 3 s) and closes its context, so a run can overrun by that
-    # much. The heartbeat keeps the lease during the overrun, so neither
-    # check below depends on it. 900 s: the real worst case at the defaults is
+    # drains its in-flight exchanges and closes its context (each bounded by
+    # about nav_timeout_s), so a run can overrun by up to 2 * nav_timeout_s.
+    # The heartbeat keeps the lease during the overrun, so neither check below
+    # depends on it. 900 s: the real worst case at the defaults is
     # 5 navigations (mobile, desktop, 3 click hops) * 30 s plus settles and
     # screenshots, 2 * 10 s of DNS, spacer waits and blob writes, well under
     # 900 s, which is 4.5 times the default lease floor (200 s).
