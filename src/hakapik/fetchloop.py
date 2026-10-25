@@ -4,9 +4,9 @@ Each iteration sweeps the queue, checks the optional daily cap, leases due
 jobs up to the free worker slots and runs each as its own task:
 ``run_job`` -> ``store_result`` in a borrowed connection -> commit. The claim
 and sweep transactions are committed at once (jobs use the transaction's
-fixed now()). While a task runs, a heartbeat extends its job's lease every
-lease_s / 3, so a running job is never claimed again; ``job_timeout_s`` bounds
-the run. A task that fails or times out leaves its job leased; it is claimed
+fixed now()). While ``run_job`` runs, a heartbeat extends its job's lease
+every lease_s / 3, so a running job is never claimed again; it ends when
+``run_job`` returns, before the store. ``job_timeout_s`` bounds the run. A task that fails or times out leaves its job leased; it is claimed
 again after the lease expires. Signal handling belongs to the caller: setting
 ``stop`` ends claiming, and running tasks finish before ``run_fetch`` returns.
 """
@@ -19,7 +19,6 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import maxminddb
-import psycopg
 
 from hakapik.asn import MMDB_MEDIA_TYPE, AsnDb
 from hakapik.blobstore import BlobStore
@@ -65,14 +64,14 @@ async def _load_asn(cfg: Config, bs: BlobStore, conn) -> AsnDb | None:
     return asn
 
 
-async def _heartbeat(pool: ConnPool, claim: Claim, lease_s: int,
-                     stored: asyncio.Event) -> None:
+async def _heartbeat(pool: ConnPool, claim: Claim, lease_s: int) -> None:
     """Extend the claim's lease every lease_s / 3 until cancelled or the claim is lost.
 
     Each extension is guarded by the token it last wrote, so it never extends
-    another holder's claim. A row locked by this job's own store_result skips
-    the tick instead of waiting; any other failure is logged and tried again
-    at the next tick. Neither ends the job.
+    another holder's claim. A failed extension is logged and tried again at
+    the next tick; it does not end the job. The job task cancels the
+    heartbeat as soon as run_job returns, before the store, so a tick never
+    meets the job's own store_result.
     """
     job, token = claim
     while True:
@@ -81,17 +80,14 @@ async def _heartbeat(pool: ConnPool, claim: Claim, lease_s: int,
             async with pool.borrow() as c:
                 new = await extend_lease(c, job.job_id, job.step, lease_s, token)
                 await c.commit()
-        except psycopg.errors.LockNotAvailable:
-            continue  # the row is busy (store_result): skip this tick
         except Exception:
             log.warning("job %d %s: lease extension failed; retrying next tick",
                         job.job_id, job.fqdn, exc_info=True)
             continue
         if new is None:
-            if not stored.is_set():
-                # store_result's stale check decides what becomes of the result.
-                log.warning("job %d %s: lease lost to another claim; heartbeat stops",
-                            job.job_id, job.fqdn)
+            # store_result's stale check decides what becomes of the result.
+            log.warning("job %d %s: lease lost to another claim; heartbeat stops",
+                        job.job_id, job.fqdn)
             return
         token = new
 
@@ -135,8 +131,13 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                 # Never raises: a failed job stays leased until its lease expires.
                 job = claim.job
                 log.info("claimed job %d %s step %d", job.job_id, job.fqdn, job.step)
-                stored = asyncio.Event()
-                beat = asyncio.create_task(_heartbeat(pool, claim, cfg.lease_s, stored))
+                beat = asyncio.create_task(_heartbeat(pool, claim, cfg.lease_s))
+
+                async def end_beat() -> None:
+                    beat.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await beat
+
                 try:
                     bound = asyncio.timeout(cfg.job_timeout_s)
                     try:
@@ -151,6 +152,10 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                         log.error("job %d %s timed out after %s s; nothing stored",
                                   job.job_id, job.fqdn, cfg.job_timeout_s)
                         return
+                    # The lease has at least 2/3 of lease_s left (the last tick
+                    # was under lease_s / 3 ago) and the store takes seconds, so
+                    # the heartbeat ends here, before store_result locks the row.
+                    await end_beat()
                     # Read before storing: after the commit only the log line
                     # runs, so a job logged as failed below was never stored.
                     outcome = open_envelope(env, {key.node_id: key.public_key}.get).outcome
@@ -158,15 +163,7 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                         try:
                             attempt_id = await store_result(
                                 c, bs, env, cfg.retry_ladder_s, asn_db=asn_db)
-                            # Set before the commit: a heartbeat tick that runs
-                            # after the commit but before this task resumes
-                            # must already see it, or it warns "lease lost".
-                            stored.set()
-                            try:
-                                await c.commit()
-                            except BaseException:
-                                stored.clear()
-                                raise
+                            await c.commit()
                         except ResultRejected as e:
                             await c.rollback()
                             log.error("job %d %s: result rejected: %s",
@@ -178,9 +175,7 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                 except Exception:
                     log.exception("job %d %s failed", job.job_id, job.fqdn)
                 finally:
-                    beat.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await beat
+                    await end_beat()
 
             await _loop(cfg, stop, once, pool, one)
     finally:

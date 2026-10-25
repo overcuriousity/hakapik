@@ -1,9 +1,6 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
-import psycopg
-import pytest
-
 from conftest import _test_db_url
 
 from hakapik.config import Config
@@ -252,22 +249,6 @@ async def test_extend_lease_after_the_result_was_stored_is_a_noop(conn):
     await conn.commit()
     assert await extend_lease(conn, jid, 0, 600, claim.claimed_until) is None
     assert (await _job(conn, jid))[:3] == (1, "open", None)
-
-
-async def test_extend_lease_does_not_wait_for_a_locked_row(conn):
-    jid = await _add(conn, "a.example.com")
-    [claim] = await claim_jobs(conn, 1, 60)
-    await conn.commit()
-    other = await connect(_test_db_url())
-    try:
-        await other.execute("SELECT 1 FROM fetch_job WHERE id = %s FOR UPDATE", (jid,))
-        t = asyncio.get_running_loop().time()
-        with pytest.raises(psycopg.errors.LockNotAvailable):
-            await extend_lease(conn, jid, 0, 600, claim.claimed_until)
-        assert asyncio.get_running_loop().time() - t < 2
-        await conn.rollback()
-    finally:
-        await other.close()
 
 
 async def test_enqueue_manual_inserts_in_fqdn_order_and_reports_in_input_order(conn):

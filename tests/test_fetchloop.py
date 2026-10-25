@@ -11,7 +11,6 @@ from hakapik import fetchloop
 from hakapik.asn import AsnDb
 from hakapik.config import Config
 from hakapik.fetchloop import run_fetch
-from hakapik.db import connect
 from hakapik.jobs import claim_jobs, enqueue_manual
 from hakapik.protocol import DnsAnswer, NodeKey
 from hakapik.store import ResultRejected
@@ -453,31 +452,6 @@ async def test_heartbeat_stops_when_another_holder_claims(conn, tmp_path, monkey
     await asyncio.wait_for(task, 10)
 
 
-async def test_heartbeat_skips_a_locked_row_instead_of_waiting(conn, tmp_path,
-                                                               monkeypatch, caplog):
-    calls = _count_extends(monkeypatch)
-    b = GatedBrowser()
-    cfg = _cfg(tmp_path, lease_s=1)
-    await _queue(conn, "a.example.com")
-    task = asyncio.create_task(run_fetch(cfg, stop=asyncio.Event(), resolver=FakeResolver(),
-                                         browser=b, once=True))
-    await asyncio.wait_for(b.started.wait(), 10)
-    locker = await connect(_test_db_url())
-    try:
-        await locker.execute("SELECT 1 FROM fetch_job FOR UPDATE")
-        n = len(calls)
-        await _until(lambda: len(calls) >= n + 2)  # ticks keep coming
-        assert all(d < 1.0 for d in calls)  # none waited for the lock
-    finally:
-        await locker.close()
-    n = len(calls)
-    await _until(lambda: len(calls) >= n + 1)
-    assert "lease extension failed" not in caplog.text and "lease lost" not in caplog.text
-    b.gate.set()
-    await asyncio.wait_for(task, 10)
-    assert await _count(conn, "attempt") == 1
-
-
 async def test_timeout_raised_inside_run_job_is_a_plain_failure(conn, tmp_path, monkeypatch,
                                                                 caplog):
     async def inner_timeout(job, **kw):
@@ -492,28 +466,22 @@ async def test_timeout_raised_inside_run_job_is_a_plain_failure(conn, tmp_path, 
     assert "from inside" in caplog.text
 
 
-async def test_tick_between_commit_and_resume_does_not_warn(conn, tmp_path, monkeypatch,
-                                                            caplog):
-    # A heartbeat tick runs after the store's commit but before the job task
-    # resumes: it finds the job advanced and must stay silent.
+async def test_heartbeat_ends_before_the_store(conn, tmp_path, monkeypatch, caplog):
+    # run_job has returned: no tick runs while store_result holds the row,
+    # even when the store outlasts several ticks.
     calls = _count_extends(monkeypatch)
     real_store = fetchloop.store_result
+    during = []
 
-    async def store_then_slow_commit(c, *a, **k):
-        attempt_id = await real_store(c, *a, **k)
-        real_commit = c.commit
+    async def slow_store(*a, **k):
+        n = len(calls)
+        await asyncio.sleep(1.0)  # three ticks at lease_s = 1
+        during.append(len(calls) - n)
+        return await real_store(*a, **k)
 
-        async def commit():
-            await real_commit()
-            n = len(calls)
-            await _until(lambda: len(calls) > n)  # a tick after the commit
-            del c.commit
-
-        c.commit = commit
-        return attempt_id
-
-    monkeypatch.setattr(fetchloop, "store_result", store_then_slow_commit)
+    monkeypatch.setattr(fetchloop, "store_result", slow_store)
     await _queue(conn, "a.example.com")
     await asyncio.wait_for(_once(_cfg(tmp_path, lease_s=1)), 10)
+    assert during == [0]
     assert await _count(conn, "attempt") == 1
     assert "lease lost" not in caplog.text
