@@ -264,3 +264,19 @@ async def test_extend_lease_does_not_wait_for_a_locked_row(conn):
         await conn.rollback()
     finally:
         await other.close()
+
+
+async def test_enqueue_manual_inserts_in_fqdn_order_and_reports_in_input_order(conn):
+    # One global insert order (by fqdn, as add_candidates) rules out deadlocks
+    # with a concurrent tail or enqueue; the output still follows the input.
+    names = ["c.example.com", "*.x.com", "b.example.com", "bad..name", "a.example.com"]
+    res = await enqueue_manual(conn, names)
+    assert res == [("c.example.com", "queued"), ("*.x.com", "wildcard"),
+                   ("b.example.com", "queued"), ("bad..name", "invalid"),
+                   ("a.example.com", "queued")]
+    cur = await conn.execute("SELECT fqdn FROM candidate ORDER BY id")
+    assert [r[0] for r in await cur.fetchall()] == [
+        "a.example.com", "b.example.com", "c.example.com"]
+    cur = await conn.execute("SELECT fqdn FROM fetch_job ORDER BY id")
+    assert [r[0] for r in await cur.fetchall()] == [
+        "a.example.com", "b.example.com", "c.example.com"]

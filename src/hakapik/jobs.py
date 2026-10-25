@@ -11,7 +11,7 @@ from typing import NamedTuple
 
 import psycopg
 
-from hakapik.names import normalize
+from hakapik.names import NameRecord, normalize
 from hakapik.protocol import Job
 
 
@@ -162,47 +162,57 @@ async def open_job_fqdns(conn: psycopg.AsyncConnection, fqdns: list[str]) -> set
 async def enqueue_manual(
     conn: psycopg.AsyncConnection, names: list[str]
 ) -> list[tuple[str, str]]:
-    """Queue names by hand: (input, queued | already_open | invalid | wildcard)."""
-    out: list[tuple[str, str]] = []
-    for name in names:
+    """Queue names by hand: (input, queued | already_open | invalid | wildcard).
+
+    Results come back in input order.
+    """
+    status: dict[int, str] = {}
+    valid = []
+    for i, name in enumerate(names):
         rec = normalize(name)
         if rec.wildcard:
-            out.append((name, "wildcard"))
-            continue
-        if not rec.valid:
-            out.append((name, "invalid"))
-            continue
-        cur = await conn.execute(
-            "SELECT 1 FROM fetch_job WHERE fqdn = %s AND state = 'open'", (rec.fqdn,)
-        )
-        if await cur.fetchone():
-            out.append((name, "already_open"))
-            continue
-        # The SELECT above is only a fast path. A concurrent enqueue can still win
-        # the unique open-job index, so the job insert reports whether it created a
-        # row; if not, the savepoint rolls the candidate back (no orphan).
-        try:
-            async with conn.transaction():
-                cur = await conn.execute(
-                    """INSERT INTO candidate (fqdn, registrable, reason)
-                       VALUES (%s, %s, 'manual') RETURNING id""",
-                    (rec.fqdn, rec.registrable),
-                )
-                cid = (await cur.fetchone())[0]
-                cur = await conn.execute(
-                    """INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
-                       VALUES (%s, %s, %s, now())
-                       ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING
-                       RETURNING id""",
-                    (cid, rec.fqdn, rec.registrable),
-                )
-                if await cur.fetchone() is None:
-                    raise _LostRace
-        except _LostRace:
-            out.append((name, "already_open"))
-            continue
-        out.append((name, "queued"))
-    return out
+            status[i] = "wildcard"
+        elif not rec.valid:
+            status[i] = "invalid"
+        else:
+            valid.append((i, rec))
+    # Insert in one global order by fqdn, as db.add_candidates does: a
+    # concurrent tail or enqueue waits on the same unique open-job index, and
+    # one order for everyone rules out deadlocks.
+    for i, rec in sorted(valid, key=lambda v: v[1].fqdn):
+        status[i] = await _enqueue_one(conn, rec)
+    return [(name, status[i]) for i, name in enumerate(names)]
+
+
+async def _enqueue_one(conn: psycopg.AsyncConnection, rec: NameRecord) -> str:
+    cur = await conn.execute(
+        "SELECT 1 FROM fetch_job WHERE fqdn = %s AND state = 'open'", (rec.fqdn,)
+    )
+    if await cur.fetchone():
+        return "already_open"
+    # The SELECT above is only a fast path. A concurrent enqueue can still win
+    # the unique open-job index, so the job insert reports whether it created a
+    # row; if not, the savepoint rolls the candidate back (no orphan).
+    try:
+        async with conn.transaction():
+            cur = await conn.execute(
+                """INSERT INTO candidate (fqdn, registrable, reason)
+                   VALUES (%s, %s, 'manual') RETURNING id""",
+                (rec.fqdn, rec.registrable),
+            )
+            cid = (await cur.fetchone())[0]
+            cur = await conn.execute(
+                """INSERT INTO fetch_job (candidate_id, fqdn, registrable, due_at)
+                   VALUES (%s, %s, %s, now())
+                   ON CONFLICT (fqdn) WHERE state = 'open' DO NOTHING
+                   RETURNING id""",
+                (cid, rec.fqdn, rec.registrable),
+            )
+            if await cur.fetchone() is None:
+                raise _LostRace
+    except _LostRace:
+        return "already_open"
+    return "queued"
 
 
 async def show_fqdn(conn: psycopg.AsyncConnection, fqdn: str) -> list[dict]:
