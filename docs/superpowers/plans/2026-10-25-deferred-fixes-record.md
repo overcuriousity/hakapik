@@ -161,6 +161,10 @@ Commits ff29699, d6176c6, bb66841, 36a9a07, 657f597, fc22eb8; fix rounds
 - P2T11 default Browser/Resolver construction untested: FIXED fc22eb8.
 - P2 final: mobile blob write fails after the page is recorded: FIXED 36a9a07 (page recorded only with all its blobs).
 - P2 final: node public key in the evidence bundle: FIXED 657f597 (manifest; spec 8).
+- Review round 1: two-node manifest test: FIXED 39e489e (`test_manifest_names_each_attempts_own_node_key`).
+- Review round 1: click-blob failure test: FIXED 39e489e (`test_failed_click_blob_write_drops_the_desktop_pass`).
+- Review round 2: missing-link errnos (EPERM, ENOTSUP, EOPNOTSUPP, ENOSYS, EMLINK): FIXED 9e0c4cb (now raise the clear hard-link error since 4603933).
+- Review round 2: resolver test portability and timing: FIXED 9e0c4cb (one address, separate ports; upper bounds only).
 - Review: lease too short for a slow job: FIXED 9e0c4cb (heartbeat), 913f0d0 (job_timeout_s, claim token); simplified 2f9c2ed (see Rulings).
 - Review: spurious "lease lost" and heartbeat waiting on the store's row lock: FIXED 913f0d0, a233c04; superseded 2f9c2ed (heartbeat ends before the store).
 - Review: timeout log conflates an inner TimeoutError: FIXED a233c04 (`expired()`).
@@ -213,7 +217,7 @@ Commits b8688d9, 6983a2e, d8826ce, a90091f, 589459a, d5727f7; fix rounds 3ebbbff
 - Orphan blobs: prune sweeps unreferenced blobs older than orphan_margin_hours (24, longer than the lease), under lock_blob with a re-check; put() refreshes mtime on reuse; the ASN snapshot gets its blob row at load; store_result takes sorted blob locks before verifying. Cost if wrong: one extra lock per blob in store_result.
 - DNS: one total deadline per query across all servers (resolver_query_deadline_s, default 10), folded into the lease floor. Cost if wrong: a slow last-resort server is not asked after the deadline.
 - Lease heartbeat: extend claimed_until every lease_s / 3 while the job runs; the lease check stays as a sanity floor. Cost if wrong: one UPDATE per running job per lease_s / 3.
-- job_timeout_s bounds a run; the claim token is the claimed_until value (the protocol Job is unchanged). Cost if wrong: a job hitting job_timeout_s is retried rather than finished.
+- job_timeout_s bounds a run; the claim token is the claimed_until value (the protocol Job is unchanged); the heartbeat UPDATE was to skip a locked row (SKIP LOCKED), which became lock_timeout in 913f0d0 and was removed in 2f9c2ed (the heartbeat now ends before the store). Cost if wrong: a job hitting job_timeout_s is retried rather than finished.
 - Key lock via flock (later removed with the fallback). Cost if wrong: none on Linux; advisory only on NFS.
 - No hard-link fallback for the node key: a filesystem without hard links is a clear error, and the README states the requirement. Cost if wrong: hakapik cannot run with data_dir on such a filesystem (some FUSE or SMB mounts).
 - Simplifications: the heartbeat ends when run_job returns, before store_result (no stored event, no lock_timeout, no skip branch); a cancelled IpSpacer waiter keeps its slot; extend_lease keeps the step guard as a belt. The late-context cleanup and isolated-world login matching stay. Cost if wrong: none material (a cancelled waiter may leave one unused spacing gap).

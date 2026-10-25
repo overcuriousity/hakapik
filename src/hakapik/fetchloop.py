@@ -6,8 +6,9 @@ jobs up to the free worker slots and runs each as its own task:
 and sweep transactions are committed at once (jobs use the transaction's
 fixed now()). While ``run_job`` runs, a heartbeat extends its job's lease
 every lease_s / 3, so a running job is never claimed again; it ends when
-``run_job`` returns, before the store. ``job_timeout_s`` bounds the run. A task that fails or times out leaves its job leased; it is claimed
-again after the lease expires. Signal handling belongs to the caller: setting
+``run_job`` returns, before the store. ``job_timeout_s`` bounds the run. A
+task that fails or times out leaves its job leased; it is claimed again after
+the lease expires. Signal handling belongs to the caller: setting
 ``stop`` ends claiming, and running tasks finish before ``run_fetch`` returns.
 """
 
@@ -152,9 +153,14 @@ async def run_fetch(cfg: Config, *, stop: asyncio.Event,
                         log.error("job %d %s timed out after %s s; nothing stored",
                                   job.job_id, job.fqdn, cfg.job_timeout_s)
                         return
-                    # The lease has at least 2/3 of lease_s left (the last tick
-                    # was under lease_s / 3 ago) and the store takes seconds, so
-                    # the heartbeat ends here, before store_result locks the row.
+                    # If the last tick succeeded, the lease has at least 2/3 of
+                    # lease_s left (that tick was under lease_s / 3 ago) and the
+                    # store takes seconds, so the heartbeat ends here, before
+                    # store_result locks the row. A store stalled past the lease
+                    # can let another worker claim and fetch the job again (a
+                    # duplicate fetch), but never a duplicate stored attempt:
+                    # the job row's FOR UPDATE and the step check in
+                    # store_result serialise both stores.
                     await end_beat()
                     # Read before storing: after the commit only the log line
                     # runs, so a job logged as failed below was never stored.
