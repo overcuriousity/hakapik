@@ -6,6 +6,7 @@ import pytest
 
 from conftest import _test_db_url
 
+from hakapik.config import Config
 from hakapik.db import CandidateRow, add_candidates, connect
 from hakapik.jobs import (
     advance_job,
@@ -16,6 +17,9 @@ from hakapik.jobs import (
     last_fetched,
     sweep,
 )
+
+
+LADDER = Config.retry_ladder_s  # the default; its last step is 86400 s
 
 
 def _row(fqdn):
@@ -101,7 +105,7 @@ async def test_sweep_ages_out_old_and_excess(conn):
     retry = await _add(conn, "retry.example.com", 7200)
     await conn.execute("UPDATE fetch_job SET step = 1 WHERE id = %s", (retry,))
     fresh = [await _add(conn, f"f{i}.example.com", 40 - i) for i in range(4)]
-    assert await sweep(conn, 1, 2) == 3
+    assert await sweep(conn, 1, 2, LADDER) == 3
     states = {
         r[0]: r[1] for r in await (await conn.execute("SELECT id, state FROM fetch_job")).fetchall()
     }
@@ -138,18 +142,18 @@ async def test_last_fetched_and_attempts_today(conn):
 async def test_sweep_spares_leased_jobs(conn):
     leased = await _add(conn, "leased.example.com", 7200)
     await claim_jobs(conn, 1, 600)
-    assert await sweep(conn, 1, None) == 0
+    assert await sweep(conn, 1, None, LADDER) == 0
     assert (await _job(conn, leased))[1] == "open"
     # leased jobs do not count toward the cap either
     await _add(conn, "a.example.com", 20)
     await _add(conn, "b.example.com", 10)
-    assert await sweep(conn, 1, 2) == 0
-    assert await sweep(conn, 1, 1) == 1
+    assert await sweep(conn, 1, 2, LADDER) == 0
+    assert await sweep(conn, 1, 1, LADDER) == 1
 
 
 async def test_advance_is_noop_on_closed_jobs(conn):
     aged = await _add(conn, "a.example.com", 7200)
-    await sweep(conn, 1, None)
+    await sweep(conn, 1, None, LADDER)
     await advance_job(conn, aged, 0, (0, 120))
     assert (await _job(conn, aged))[:2] == (0, "aged_out")
     done = await _add(conn, "b.example.com")
@@ -207,7 +211,7 @@ async def test_claim_orders_by_priority_then_newest(conn):
 async def test_sweep_takes_fractional_ageout_hours(conn):
     old = await _add(conn, "old.example.com", 2000)  # older than 0.5 h
     young = await _add(conn, "young.example.com", 1000)
-    assert await sweep(conn, 0.5, None) == 1
+    assert await sweep(conn, 0.5, None, LADDER) == 1
     assert (await _job(conn, old))[1] == "aged_out"
     assert (await _job(conn, young))[1] == "open"
 
@@ -280,3 +284,21 @@ async def test_enqueue_manual_inserts_in_fqdn_order_and_reports_in_input_order(c
     cur = await conn.execute("SELECT fqdn FROM fetch_job ORDER BY id")
     assert [r[0] for r in await cur.fetchall()] == [
         "a.example.com", "b.example.com", "c.example.com"]
+
+
+async def test_sweep_ages_out_retried_jobs_past_the_last_ladder_step(conn):
+    # Beyond the last ladder step plus ageout_hours every open job goes, not
+    # only untried ones; a leased job is still spared.
+    ladder = (0, 120, 600, 3600)
+    limit = ladder[-1] + 3600  # ageout_hours = 1
+    stale = await _add(conn, "stale.example.com", limit + 60)
+    young = await _add(conn, "young.example.com", limit - 60)
+    leased = await _add(conn, "leased.example.com", limit + 60)
+    await conn.execute("UPDATE fetch_job SET step = 3, due_at = now() + interval '1 hour'")
+    await conn.execute(
+        "UPDATE fetch_job SET claimed_until = now() + interval '10 minutes' WHERE id = %s",
+        (leased,))
+    assert await sweep(conn, 1, None, ladder) == 1
+    assert (await _job(conn, stale))[1] == "aged_out"
+    assert (await _job(conn, young))[1] == "open"
+    assert (await _job(conn, leased))[1] == "open"

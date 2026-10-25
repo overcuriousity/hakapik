@@ -199,7 +199,8 @@ async def _loop(cfg: Config, stop: asyncio.Event, once: bool, pool: ConnPool,
             # The sweep has its own try: a failing sweep must not stop claims.
             try:
                 async with pool.borrow() as conn:
-                    aged = await sweep(conn, cfg.ageout_hours, cfg.queue_cap)
+                    aged = await sweep(conn, cfg.ageout_hours, cfg.queue_cap,
+                                       cfg.retry_ladder_s)
                     await conn.commit()
                 if aged:
                     log.info("aged out %d jobs", aged)

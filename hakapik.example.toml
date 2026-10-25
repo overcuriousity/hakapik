@@ -71,7 +71,9 @@ recheck_days = 30
 # Maximum open fetch jobs. Omitted = unlimited.
 # queue_cap = 100000
 
-# Open jobs older than this many hours are aged out.
+# Untried (step 0) jobs older than this many hours are aged out; beyond the
+# last retry_ladder_s step, every open job older than that step plus this
+# many hours is aged out too. Leased (running) jobs are spared.
 ageout_hours = 24.0
 
 # Per-navigation timeout in seconds.

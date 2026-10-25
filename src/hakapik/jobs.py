@@ -98,15 +98,24 @@ async def advance_job(
 
 
 async def sweep(
-    conn: psycopg.AsyncConnection, ageout_hours: float, queue_cap: int | None
+    conn: psycopg.AsyncConnection, ageout_hours: float, queue_cap: int | None,
+    ladder: tuple[int, ...],
 ) -> int:
-    """Age out stale untried jobs, then the lowest-ranked excess over the cap."""
+    """Age out stale jobs, then the lowest-ranked untried excess over the cap.
+
+    Stale: an untried (step 0) job older than ageout_hours, or any open job
+    older than the last ladder step plus ageout_hours (a job whose retries
+    keep failing to store would otherwise stay open for ever). Leased jobs
+    are spared.
+    """
     cur = await conn.execute(
         """UPDATE fetch_job SET state = 'aged_out'
-           WHERE state = 'open' AND step = 0
+           WHERE state = 'open'
              AND (claimed_until IS NULL OR claimed_until <= now())
-             AND created_at < now() - make_interval(secs => %s * 3600)""",
-        (ageout_hours,),
+             AND (
+               (step = 0 AND created_at < now() - make_interval(secs => %s * 3600))
+               OR created_at < now() - make_interval(secs => %s + %s * 3600))""",
+        (ageout_hours, ladder[-1], ageout_hours),
     )
     count = cur.rowcount
     if queue_cap is not None:
