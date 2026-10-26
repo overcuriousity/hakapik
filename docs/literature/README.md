@@ -15,7 +15,7 @@ sources are given per entry.
 - Also: placeholder and empty pages far outnumber live phish at detection time; re-query needed. Screenshotting via Selenium, no retries.
 - Verdict: evaluate only on the live stream at fixed FPR; keep a rule layer; expect placeholders; certificate-only features are a prefilter at best.
 
-### AlSabah, Nabeel, Choo, Boshmaf. Content-Agnostic Detection of Phishing Domains using CT and Passive DNS. RAID 2022. No code; Farsight pDNS
+### AlSabah, Nabeel, Choo, Boshmaf. Content-Agnostic Detection of Phishing Domains using CT and Passive DNS. RAID 2022. DOI 10.1145/3545948.3545958. No code; Farsight pDNS. Related patent US 11546377 (granted 2023-01-03), claims not reviewed
 - Data: 10.8 K phishing domains (PhishTank, VT-confirmed), benign sampled from 35 M CT domains with VT 0 over a year; balanced experiments; fresh April 2021 set of 12 K/12 K.
 - 20 features: CT temporal (lifetime, cert inter-arrival, cert count), CT cert (SAN size, issuers, DV/OV/EV, validity), pDNS (duration, IPs, queries, NS, SOA), lexical.
 - Findings: 30 percent of phishing domains had near-zero cert inter-arrival vs 0.3 percent benign; 60 percent of phishing certs issued within two distinct months; issuer alone not discriminative; 30 percent of phishing certs 1-year validity vs over 90 percent benign at 90 days.

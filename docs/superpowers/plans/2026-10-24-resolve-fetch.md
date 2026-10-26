@@ -748,7 +748,21 @@ Run: `uv run pytest -W error` → all pass, browser tests not skipped on this ma
 - Parked and hosting-default classification: an attempt reaching such a page is `live` here. The fingerprint stage appends the classification as new rows.
 - Quorum across vantages (spec 5.4): with one vantage the head's answer stands. The quorum function comes with the remote worker transport (HTTP/2, mTLS) in the worker-protocol plan; `dns_answer.node_id` already keys answers per vantage.
 - Inclusion proofs, STH at read time, and RFC 3161 anchoring of manifest hashes go to the evidence plan.
+- External passive DNS (spec 5.4a): this plan stores every resolution per vantage in `dns_answer`, which is the private pDNS. The provider interface for an external history source (CIRCL first) goes to the pDNS plan.
 - NATS JetStream: this plan has one producer (ingest or enqueue) and one in-process consumer, both meeting in Postgres, which spec 11 already makes the queue. NATS enters with the first downstream stage (embed), which consumes "attempt stored" events.
+
+## Outlook: distributed fetch infrastructure (owner, 2026-10-26)
+
+Fetching from one datacenter address is a PoC limit, not the target. A fleet of remote fetch nodes is the intended direction, because:
+
+- cloaking keys on IP type, geography and device (PhishFarm; Oest et al. 2020: geo-translated kits, IP-keyed paths), so residential, mobile and per-country egress see pages one datacenter address cannot;
+- one fixed address is enumerated and blocked by kits that fingerprint CT bots (Kondracki et al.);
+- several vantages give the DNS quorum of spec 5.4 and richer private pDNS (spec 5.4a);
+- fetch capacity grows by adding nodes instead of a bigger head.
+
+Already in place: the worker role is a separate function (`run_job`) returning an Ed25519-signed envelope; the head verifies node key, signature and every blob hash before storing; `node`, `egress_address` and `dns_answer.node_id` key every result to its vantage; all egress goes through `fetch_proxy` and `resolver_nameservers`.
+
+Still to build (worker-protocol plan): HTTP/2 mutual-TLS transport with job pull and blob upload; node enrolment and key revocation; routing a job's ladder steps to chosen vantages (e.g. mobile egress for the first attempt, a second country on a cloaked result); per-vantage rate limits and daily caps; clock-skew checks on node timestamps; and the quorum function.
 
 ## Deferred after review (2026-10-24)
 

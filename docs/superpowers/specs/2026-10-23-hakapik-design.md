@@ -52,6 +52,8 @@ Goals:
 - Every active CT log tailed, raw entries mirrored locally with inclusion
   proofs.
 - Any FQDN that is new to us, or re-check-due, becomes a candidate.
+- Passive DNS is a core signal (section 5.4a): our own resolutions plus an
+  external provider's history feed T0, T2 and campaign clustering.
 - Rendered evidence, embeddings, campaign clustering, calibrated risk bands.
 - Site-first feed with campaign column, filters, evidence drawer, labels.
 - Head node runs every role itself; a worker node can be added without
@@ -62,12 +64,11 @@ Non-goals for the PoC:
 
 - Building our own brand recognition. PhishIntention's shipped reference list
   and models are reused as a black box.
-- Passive DNS enrichment from CIRCL (not available for the PoC; interface is
-  designed so it plugs in for production).
 - Residential or mobile egress. The PoC fetches from the head node's
   datacenter address with a mobile browser profile.
 - Running distributed workers. The protocol and interface exist; only the
-  head runs them.
+  head runs them. A distributed fetch fleet is the intended next step (see
+  section 6 and the outlook in the resolve-fetch plan).
 - CZDS zone files, fake-shop detection, compromised-domain focus, a
   production UI.
 
@@ -167,26 +168,29 @@ queue and decides retry priority. It never produces a verdict.
 
 Feature families and their evidence-backed weight:
 
-1. **Domain history** (strongest): number of certificates for the
+1. **Passive DNS** (strongest, with domain history): see 5.4a. AlSabah et
+   al.'s ablation: pDNS alone 5.9 percent FPR, CT alone 9.8, lexical alone
+   24, all combined 0.3; pDNS was the best single family.
+2. **Domain history**: number of certificates for the
    registrable domain in our mirror, inter-arrival time of certificates,
    number of distinct issuance months, lifetime first-to-last, SAN count and
    SAN 2LD-match ratio. (AlSabah et al.: 30 percent of phishing domains had
    near-zero cert inter-arrival vs 0.3 percent benign; 60 percent of phishing
    certs issued within two distinct months.)
-2. **Registration** via RDAP: domain age, registration period, registrar,
+3. **Registration** via RDAP: domain age, registration period, registrar,
    privacy proxy. (Beyond Phish and Scamdog Millionaire: domain age and
    registration period among the top features and costly to evade.)
-3. **Brand keyword and TLD rules**: the Phishing Catcher keyword and TLD
+4. **Brand keyword and TLD rules**: the Phishing Catcher keyword and TLD
    lists, inner-TLD pattern (`.com-`), deep nesting, hyphen count, entropy.
    (Drichel et al.: on live CT at a fixed FPR, hand-made rules beat RF and
    RNN.) Keyword hits alone never trigger a fetch, because 63 percent of CT
    bots do exactly that and kits cloak on it (Kondracki et al.).
-4. **Generic lexical** features get little weight (AlSabah ablation: 24
+5. **Generic lexical** features get little weight (AlSabah ablation: 24
    percent FPR alone).
-5. **Issuer** is not a feature of any weight (AlSabah).
+6. **Issuer** is not a feature of any weight (AlSabah).
 
-Passive DNS features are declared in the feature schema with a null provider
-in the PoC so CIRCL can be added without schema change.
+Until an external pDNS provider is connected, the pDNS features come from
+our own resolutions only (5.4a) and the gap is stated beside every metric.
 
 ### 5.4 Resolve
 
@@ -196,6 +200,35 @@ stored. Reverse DNS for each address. When several vantages exist, the
 peephole quorum rule applies: an answer stands when more than half of the
 responding vantages agree, and disagreement is recorded as a feature. Every
 resolution at every retry is kept; this is the PoC's private passive DNS.
+
+### 5.4a Passive DNS
+
+Passive DNS is a required input, not an optional enrichment (owner,
+2026-10-26). It is the strongest single feature family on CT candidates
+(AlSabah et al., RAID 2022) and the only way to see a name's DNS past
+before our first lookup.
+
+- **Two sources behind one provider interface.** (1) Private pDNS: every
+  answer the resolve role stores (5.4), keyed by vantage. It starts empty
+  and sees a name only from our first query on. (2) An external provider
+  with history: CIRCL Passive DNS first (access on request, for vetted
+  users), a commercial feed such as DNSDB as an alternative. Each feature
+  row records which source and query time it came from.
+- **Features** (AlSabah's pDNS family plus our own): first and last seen in
+  DNS, days between first DNS sighting and certificate issuance, number of
+  distinct IPs, ASNs and name-server sets over time, NS and SOA changes,
+  query volume where the provider exposes it, and co-hosting (other names
+  on the same IPs, known-bad neighbours).
+- **Uses beyond T0**: shared IP and NS sets are edges in the shared-key
+  graph (11a); under a wildcard certificate, pDNS lists subdomains that CT
+  cannot show, which become candidates (section 10).
+- **Training rows** take the pDNS state at detection time, never a later
+  query (11a).
+- **Open risk**: US 11546377 ("Phishing domain detection systems and
+  methods", granted 2023-01-03) comes from AlSabah et al.'s group and
+  concerns CT plus pDNS phishing detection. Assignee and claims are not
+  reviewed here; legal review is needed before production use, at least
+  in the US.
 
 ### 5.5 Fetch and render
 
@@ -369,7 +402,8 @@ per retry step; share of candidates suppressed by each filter.
 - Concept drift: monthly retraining, time-ordered validation.
 - CT merge delay: entries usually appear well before the 24 h bound
   (Pletinckx et al.); the tailer measures lag per log.
-- Wildcards and no-cert registrations: invisible; documented.
+- Wildcards and no-cert registrations: invisible to CT; external pDNS
+  recovers subdomains under a wildcard (5.4a); the rest is documented.
 - IDN and homoglyphs: IDNA normalisation plus a confusables feature in T0.
 - Our crawler being enumerated: real browser fingerprint, varied egress
   later; consider running a small CT honeypot to measure our own footprint.
@@ -420,6 +454,15 @@ Answered by the owner (2026-10-24):
    code change.
 7. **Fetcher rate limits** (concurrency, per-address spacing, daily cap)
    are configuration with no shipped defaults; unset means unlimited.
+
+Answered by the owner (2026-10-26):
+
+8. **Passive DNS is vital**: it moves from non-goal to a core input
+   (5.4a). Private pDNS from our own resolutions is the baseline; an
+   external provider (CIRCL first) is to be connected as soon as access
+   exists.
+9. **Distributed fetching** is the intended direction: the worker protocol
+   (section 6) is to be used by remote fetch nodes with varied egress.
 
 ## 11a. Additions from the sibling fake-shop design (2026-10-13)
 
