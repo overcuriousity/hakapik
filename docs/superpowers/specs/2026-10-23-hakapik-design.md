@@ -225,10 +225,10 @@ before our first lookup.
 - **Training rows** take the pDNS state at detection time, never a later
   query (11a).
 - **Open risk**: US 11546377 ("Phishing domain detection systems and
-  methods", granted 2023-01-03) comes from AlSabah et al.'s group and
-  concerns CT plus pDNS phishing detection. Assignee and claims are not
-  reviewed here; legal review is needed before production use, at least
-  in the US.
+  methods", granted 2023-01-03) appears related to AlSabah et al.'s work
+  and concerns CT plus pDNS phishing detection. Inventors, assignee and
+  claims are not checked here; legal review is needed before production
+  use, at least in the US.
 
 ### 5.5 Fetch and render
 
